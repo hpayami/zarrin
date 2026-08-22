@@ -1,0 +1,94 @@
+// Zarrin comprehensive feature test
+// Tests: functions, structs, enums, traits, impl, macros, extern fns, match, if/while/break
+
+macro double(x) {
+    return x + x;
+}
+
+struct Point {
+    x: int,
+    y: int
+}
+
+trait Show {
+    fn show(self) -> string;
+}
+
+impl Show for Point {
+    fn show(self) -> string {
+        return "Point";
+    }
+}
+
+impl Point {
+    fn distance(self) -> float {
+        return 5.0;
+    }
+}
+
+enum Color {
+    Red,
+    Green,
+    Blue,
+    Rgb(int, int, int)
+}
+
+fn add(x: int, y: int) -> int {
+    return x + y;
+}
+
+fn main() {
+    print("=== Zarrin Feature Test ===");
+
+    // Functions + arithmetic
+    let a = add(3, 4);
+    print(a);
+
+    // Macro
+    let b = double(10);
+    print(b);
+
+    // Struct + field access
+    let p = Point { x: 10, y: 20 };
+    print(p.x);
+
+    // Trait method
+    print(p.show());
+
+    // Inherent impl method
+    let d = p.distance();
+    print(d);
+
+    // Enum variants
+    let c = Blue;
+    print(c);
+    let c2 = Rgb(255, 128, 0);
+    print(c2);
+
+    // Match
+    let v = match c {
+        Red => 1,
+        Green => 2,
+        Blue => 3,
+        _ => 0,
+    };
+    print(v);
+
+    // String concat
+    let s = "hello " + "world";
+    print(s);
+
+    // If expression
+    let x = 5;
+    let r = if x > 3 { 100 } else { 0 };
+    print(r);
+
+    // While loop
+    let i = 0;
+    while i < 5 {
+        i = i + 1;
+    }
+    print(i);
+
+    print("=== All features passed! ===");
+}

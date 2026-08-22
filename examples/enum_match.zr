@@ -1,0 +1,22 @@
+// Zarrin: enum + pattern matching
+enum Shape {
+    Circle(float),
+    Rect(float, float),
+    Triangle(float, float, float)
+}
+
+fn area(s: Shape) -> float {
+    return match s {
+        Circle(r) => 3.14 * r * r,
+        Rect(w, h) => w * h,
+        Triangle(a, b, c) => a + b + c,
+    };
+}
+
+fn main() {
+    let c = Circle(5.0);
+    print(area(c));
+
+    let r = Rect(3.0, 4.0);
+    print(area(r));
+}

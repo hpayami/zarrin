@@ -8,11 +8,12 @@ pub enum TypeError {
     UndefinedVariable(String),
     UndefinedFunction(String),
     UndefinedType(String),
+    UndefinedTrait(String),
     TypeMismatch { expected: String, found: String },
     NotAFunction(String),
     WrongArity { name: String, expected: usize, found: usize },
     UnknownField { ty: String, field: String },
-    CantInfer(String),
+    MissingImpl { trait_name: String, type_name: String, method: String },
 }
 
 impl std::fmt::Display for TypeError {
@@ -21,36 +22,24 @@ impl std::fmt::Display for TypeError {
             TypeError::UndefinedVariable(n) => write!(f, "undefined variable: `{}`", n),
             TypeError::UndefinedFunction(n) => write!(f, "undefined function: `{}`", n),
             TypeError::UndefinedType(n) => write!(f, "undefined type: `{}`", n),
-            TypeError::TypeMismatch { expected, found } => {
-                write!(f, "type mismatch: expected `{}`, found `{}`", expected, found)
-            }
+            TypeError::UndefinedTrait(n) => write!(f, "undefined trait: `{}`", n),
+            TypeError::TypeMismatch { expected, found } => write!(f, "type mismatch: expected `{}`, found `{}`", expected, found),
             TypeError::NotAFunction(n) => write!(f, "`{}` is not a function", n),
-            TypeError::WrongArity { name, expected, found } => {
-                write!(f, "`{}` expects {} args, found {}", name, expected, found)
-            }
-            TypeError::UnknownField { ty, field } => {
-                write!(f, "type `{}` has no field `{}`", ty, field)
-            }
-            TypeError::CantInfer(msg) => write!(f, "cannot infer type: {}", msg),
+            TypeError::WrongArity { name, expected, found } => write!(f, "`{}` expects {} args, found {}", name, expected, found),
+            TypeError::UnknownField { ty, field } => write!(f, "type `{}` has no field `{}`", ty, field),
+            TypeError::MissingImpl { trait_name, type_name, method } => write!(f, "trait `{}` for `{}` missing method `{}`", trait_name, type_name, method),
         }
     }
-}
-
-#[derive(Debug, Clone)]
-struct StructDef {
-    fields: Vec<(String, Type)>,
-}
-
-#[derive(Debug, Clone)]
-struct EnumDef {
-    variants: Vec<(String, Vec<Type>)>,
 }
 
 struct TypeEnv {
     scopes: Vec<HashMap<String, Type>>,
     functions: HashMap<String, (Vec<Type>, Type)>,
-    structs: HashMap<String, StructDef>,
-    enums: HashMap<String, EnumDef>,
+    structs: HashMap<String, Vec<(String, Type)>>,
+    enums: HashMap<String, Vec<(String, Vec<Type>)>>,
+    traits: HashMap<String, Vec<TraitMethod>>,
+    impls: Vec<(String, String, Vec<Stmt>)>,
+    extern_fns: HashMap<String, (Vec<Type>, Type)>,
     current_return: Option<Type>,
 }
 
@@ -61,17 +50,15 @@ impl TypeEnv {
             functions: HashMap::new(),
             structs: HashMap::new(),
             enums: HashMap::new(),
+            traits: HashMap::new(),
+            impls: Vec::new(),
+            extern_fns: HashMap::new(),
             current_return: None,
         }
     }
 
-    fn push_scope(&mut self) {
-        self.scopes.push(HashMap::new());
-    }
-
-    fn pop_scope(&mut self) {
-        self.scopes.pop();
-    }
+    fn push_scope(&mut self) { self.scopes.push(HashMap::new()); }
+    fn pop_scope(&mut self) { self.scopes.pop(); }
 
     fn define(&mut self, name: &str, ty: Type) {
         self.scopes.last_mut().unwrap().insert(name.to_string(), ty);
@@ -79,38 +66,20 @@ impl TypeEnv {
 
     fn lookup(&self, name: &str) -> Option<Type> {
         for scope in self.scopes.iter().rev() {
-            if let Some(t) = scope.get(name) {
-                return Some(t.clone());
-            }
+            if let Some(t) = scope.get(name) { return Some(t.clone()); }
         }
         None
     }
 
-    fn define_function(&mut self, name: &str, params: Vec<Type>, ret: Type) {
-        self.functions.insert(name.to_string(), (params, ret));
-    }
-
-    fn lookup_function(&self, name: &str) -> Option<&(Vec<Type>, Type)> {
-        self.functions.get(name)
-    }
-
-    fn define_struct(&mut self, name: &str, fields: Vec<(String, Type)>) {
-        self.structs.insert(name.to_string(), StructDef { fields });
-    }
-
-    fn lookup_struct(&self, name: &str) -> Option<&StructDef> {
-        self.structs.get(name)
-    }
-
-    fn define_enum(&mut self, name: &str, variants: Vec<(String, Vec<Type>)>) {
-        self.enums.insert(name.to_string(), EnumDef { variants });
-    }
-
-    fn lookup_enum_variant(&self, variant_name: &str) -> Option<(&str, &Vec<Type>)> {
-        for (enum_name, def) in &self.enums {
-            for (vname, args) in &def.variants {
-                if vname == variant_name {
-                    return Some((enum_name, args));
+    fn lookup_method(&self, type_name: &str, method_name: &str) -> Option<(Vec<(String, Type)>, Type)> {
+        for (_, type_name_impl, methods) in &self.impls {
+            if type_name_impl == type_name {
+                for m in methods {
+                    if let Stmt::Fn { name, params, ret, .. } = m {
+                        if name == method_name {
+                            return Some((params.clone(), ret.clone()));
+                        }
+                    }
                 }
             }
         }
@@ -124,28 +93,56 @@ impl TypeChecker {
     pub fn check(program: &Program) -> Result<(), TypeError> {
         let mut env = TypeEnv::new();
 
-        // First pass: register all definitions.
         for s in &program.stmts {
             match s {
                 Stmt::Fn { name, params, ret, .. } => {
                     let param_tys: Vec<Type> = params.iter().map(|(_, t)| t.clone()).collect();
-                    env.define_function(name, param_tys, ret.clone());
+                    env.functions.insert(name.clone(), (param_tys, ret.clone()));
                 }
-                Stmt::Struct { name, fields } => {
-                    env.define_struct(name, fields.clone());
+                Stmt::Struct { name, fields, .. } => {
+                    env.structs.insert(name.clone(), fields.clone());
                 }
                 Stmt::Enum { name, variants } => {
-                    env.define_enum(name, variants.clone());
+                    env.enums.insert(name.clone(), variants.clone());
                 }
+                Stmt::Trait { name, methods } => {
+                    env.traits.insert(name.clone(), methods.clone());
+                }
+                Stmt::ExternFn { name, params, ret } => {
+                    let param_tys: Vec<Type> = params.iter().map(|(_, t)| t.clone()).collect();
+                    env.extern_fns.insert(name.clone(), (param_tys, ret.clone()));
+                }
+                Stmt::Impl { .. } => {}
+                Stmt::Macro { .. } => {}
                 _ => {}
             }
         }
 
-        // Second pass: check each statement.
+        for s in &program.stmts {
+            if let Stmt::Impl { trait_name, type_name, methods } = s {
+                if !env.traits.contains_key(trait_name) {
+                    return Err(TypeError::UndefinedTrait(trait_name.clone()));
+                }
+                let trait_methods = env.traits.get(trait_name).unwrap().clone();
+                for tm in &trait_methods {
+                    let found = methods.iter().any(|m| {
+                        if let Stmt::Fn { name, .. } = m { name == &tm.name } else { false }
+                    });
+                    if !found {
+                        return Err(TypeError::MissingImpl {
+                            trait_name: trait_name.clone(),
+                            type_name: type_name.clone(),
+                            method: tm.name.clone(),
+                        });
+                    }
+                }
+                env.impls.push((trait_name.clone(), type_name.clone(), methods.clone()));
+            }
+        }
+
         for s in &program.stmts {
             Self::check_stmt(s, &mut env)?;
         }
-
         Ok(())
     }
 
@@ -154,50 +151,49 @@ impl TypeChecker {
             Stmt::Let { name, ty, value } => {
                 let val_ty = Self::check_expr(value, env)?;
                 if *ty != Type::Inferred && *ty != val_ty {
-                    return Err(TypeError::TypeMismatch {
-                        expected: format!("{:?}", ty),
-                        found: format!("{:?}", val_ty),
-                    });
+                    return Err(TypeError::TypeMismatch { expected: format!("{:?}", ty), found: format!("{:?}", val_ty) });
                 }
                 env.define(name, val_ty);
             }
             Stmt::Fn { params, ret, body, .. } => {
                 env.push_scope();
-                let prev_return = env.current_return.clone();
+                let prev = env.current_return.clone();
                 env.current_return = Some(ret.clone());
-                for (pname, pty) in params {
-                    env.define(pname, pty.clone());
-                }
-                for s in body {
-                    Self::check_stmt(s, env)?;
-                }
-                env.current_return = prev_return;
+                for (pname, pty) in params { env.define(pname, pty.clone()); }
+                for s in body { Self::check_stmt(s, env)?; }
+                env.current_return = prev;
                 env.pop_scope();
             }
-            Stmt::Struct { .. } | Stmt::Enum { .. } => {
-                // Already registered in first pass.
+            Stmt::Struct { .. } | Stmt::Enum { .. } | Stmt::Trait { .. } | Stmt::Macro { .. } | Stmt::ExternFn { .. } | Stmt::Impl { .. } => {}
+            Stmt::While { cond, body } => {
+                Self::check_expr(cond, env)?;
+                for s in body { Self::check_stmt(s, env)?; }
             }
-            Stmt::Expr(e) => {
-                Self::check_expr(e, env)?;
+            Stmt::Break => {}
+            Stmt::Assign { name, value } => {
+                let _ = name;
+                Self::check_expr(value, env)?;
             }
+            Stmt::If { cond, then_body, else_body } => {
+                Self::check_expr(cond, env)?;
+                for s in then_body { Self::check_stmt(s, env)?; }
+                if let Some(eb) = else_body {
+                    for s in eb { Self::check_stmt(s, env)?; }
+                }
+            }
+            Stmt::Expr(e) => { Self::check_expr(e, env)?; }
             Stmt::Return(e) => {
                 let ret_ty = env.current_return.clone().unwrap_or(Type::Unit);
                 match e {
                     Some(expr) => {
                         let expr_ty = Self::check_expr(expr, env)?;
                         if ret_ty != expr_ty {
-                            return Err(TypeError::TypeMismatch {
-                                expected: format!("{:?}", ret_ty),
-                                found: format!("{:?}", expr_ty),
-                            });
+                            return Err(TypeError::TypeMismatch { expected: format!("{:?}", ret_ty), found: format!("{:?}", expr_ty) });
                         }
                     }
                     None => {
                         if ret_ty != Type::Unit {
-                            return Err(TypeError::TypeMismatch {
-                                expected: format!("{:?}", ret_ty),
-                                found: "Unit".into(),
-                            });
+                            return Err(TypeError::TypeMismatch { expected: format!("{:?}", ret_ty), found: "Unit".into() });
                         }
                     }
                 }
@@ -213,25 +209,20 @@ impl TypeChecker {
             Expr::Bool(_) => Ok(Type::Bool),
             Expr::Str(_) => Ok(Type::String),
             Expr::Ident(name) => {
-                // Check if it's an enum variant constructor (no args).
-                if let Some((enum_name, _)) = env.lookup_enum_variant(name) {
-                    return Ok(Type::Named(enum_name.to_string()));
+                if let Some((_, variants)) = env.enums.iter().find(|(_, v)| v.iter().any(|(vn, _)| vn == name)) {
+                    let enum_name = env.enums.iter().find(|(_, v)| v.iter().any(|(vn, _)| vn == name)).map(|(n, _)| n.clone()).unwrap();
+                    let _ = variants;
+                    return Ok(Type::Named(enum_name));
                 }
-                env.lookup(name)
-                    .ok_or_else(|| TypeError::UndefinedVariable(name.clone()))
+                env.lookup(name).ok_or_else(|| TypeError::UndefinedVariable(name.clone()))
             }
             Expr::Binary(l, op, r) => {
                 let lt = Self::check_expr(l, env)?;
                 let rt = Self::check_expr(r, env)?;
-                if lt != rt {
-                    return Err(TypeError::TypeMismatch {
-                        expected: format!("{:?}", lt),
-                        found: format!("{:?}", rt),
-                    });
-                }
+                if lt != rt { return Err(TypeError::TypeMismatch { expected: format!("{:?}", lt), found: format!("{:?}", rt) }); }
                 match op {
                     BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div => Ok(lt),
-                    BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Gt => Ok(Type::Bool),
+                    BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge => Ok(Type::Bool),
                 }
             }
             Expr::Call(callee, args) => {
@@ -239,108 +230,70 @@ impl TypeChecker {
                     Expr::Ident(n) => n,
                     _ => return Err(TypeError::NotAFunction("non-identifier call".into())),
                 };
-
-                // Builtin: print accepts any type.
                 if func_name == "print" {
-                    if args.len() != 1 {
-                        return Err(TypeError::WrongArity {
-                            name: "print".into(),
-                            expected: 1,
-                            found: args.len(),
-                        });
-                    }
+                    if args.len() != 1 { return Err(TypeError::WrongArity { name: "print".into(), expected: 1, found: args.len() }); }
                     Self::check_expr(&args[0], env)?;
                     return Ok(Type::Unit);
                 }
-
-                // Check if it's an enum variant constructor.
-                if let Some((enum_name, variant_args)) = env.lookup_enum_variant(func_name).map(|(a, b)| (a.to_string(), b.clone())) {
-                    if variant_args.len() != args.len() {
-                        return Err(TypeError::WrongArity {
-                            name: func_name.clone(),
-                            expected: variant_args.len(),
-                            found: args.len(),
-                        });
-                    }
+                if let Some(variant_args) = env.enums.values().find_map(|v| v.iter().find(|(vn, _)| vn == func_name).map(|(_, a)| a.clone())) {
+                    let enum_name = env.enums.iter().find(|(_, v)| v.iter().any(|(vn, _)| vn == func_name)).map(|(n, _)| n.clone()).unwrap();
+                    if variant_args.len() != args.len() { return Err(TypeError::WrongArity { name: func_name.clone(), expected: variant_args.len(), found: args.len() }); }
                     for (arg, expected) in args.iter().zip(variant_args.iter()) {
                         let arg_ty = Self::check_expr(arg, env)?;
-                        if arg_ty != *expected {
-                            return Err(TypeError::TypeMismatch {
-                                expected: format!("{:?}", expected),
-                                found: format!("{:?}", arg_ty),
-                            });
-                        }
+                        if arg_ty != *expected { return Err(TypeError::TypeMismatch { expected: format!("{:?}", expected), found: format!("{:?}", arg_ty) }); }
                     }
-                    return Ok(Type::Named(enum_name.to_string()));
+                    return Ok(Type::Named(enum_name));
                 }
-
-                let (param_tys, ret_ty) = env
-                    .lookup_function(func_name)
-                    .ok_or_else(|| TypeError::UndefinedFunction(func_name.clone()))?
-                    .clone();
-
-                if param_tys.len() != args.len() {
-                    return Err(TypeError::WrongArity {
-                        name: func_name.clone(),
-                        expected: param_tys.len(),
-                        found: args.len(),
-                    });
-                }
-                for (arg, expected) in args.iter().zip(param_tys.iter()) {
-                    let arg_ty = Self::check_expr(arg, env)?;
-                    if arg_ty != *expected {
-                        return Err(TypeError::TypeMismatch {
-                            expected: format!("{:?}", expected),
-                            found: format!("{:?}", arg_ty),
-                        });
+                if let Some((param_tys, ret_ty)) = env.functions.get(func_name).cloned().or_else(|| env.extern_fns.get(func_name).cloned()) {
+                    if param_tys.len() != args.len() { return Err(TypeError::WrongArity { name: func_name.clone(), expected: param_tys.len(), found: args.len() }); }
+                    for (arg, expected) in args.iter().zip(param_tys.iter()) {
+                        let arg_ty = Self::check_expr(arg, env)?;
+                        if arg_ty != *expected { return Err(TypeError::TypeMismatch { expected: format!("{:?}", expected), found: format!("{:?}", arg_ty) }); }
                     }
+                    return Ok(ret_ty);
                 }
-                Ok(ret_ty)
+                Err(TypeError::UndefinedFunction(func_name.clone()))
+            }
+            Expr::MethodCall(obj, method, args) => {
+                let obj_ty = Self::check_expr(obj, env)?;
+                let type_name = match &obj_ty {
+                    Type::Named(n) => n.clone(),
+                    _ => return Err(TypeError::UnknownField { ty: format!("{:?}", obj_ty), field: method.clone() }),
+                };
+                if let Some((params, ret)) = env.lookup_method(&type_name, method) {
+                    let self_count = if params.first().map(|(n, _)| n == "self" || n == "&self" || n == "&mut self").unwrap_or(false) { 1 } else { 0 };
+                    let expected_args = params.len() - self_count;
+                    if expected_args != args.len() { return Err(TypeError::WrongArity { name: method.clone(), expected: expected_args, found: args.len() }); }
+                    for (arg, (_, pty)) in args.iter().zip(params[self_count..].iter()) {
+                        let arg_ty = Self::check_expr(arg, env)?;
+                        if arg_ty != *pty { return Err(TypeError::TypeMismatch { expected: format!("{:?}", pty), found: format!("{:?}", arg_ty) }); }
+                    }
+                    return Ok(ret);
+                }
+                Err(TypeError::UnknownField { ty: type_name, field: method.clone() })
             }
             Expr::FieldAccess(obj, field) => {
                 let obj_ty = Self::check_expr(obj, env)?;
                 match &obj_ty {
                     Type::Named(name) => {
-                        if let Some(sdef) = env.lookup_struct(name) {
-                            sdef.fields.iter()
-                                .find(|(fname, _)| fname == field)
+                        if let Some(fields) = env.structs.get(name) {
+                            fields.iter().find(|(fname, _)| fname == field)
                                 .map(|(_, fty)| fty.clone())
-                                .ok_or_else(|| TypeError::UnknownField {
-                                    ty: name.clone(),
-                                    field: field.clone(),
-                                })
+                                .ok_or_else(|| TypeError::UnknownField { ty: name.clone(), field: field.clone() })
                         } else {
-                            Err(TypeError::UnknownField {
-                                ty: name.clone(),
-                                field: field.clone(),
-                            })
+                            Err(TypeError::UnknownField { ty: name.clone(), field: field.clone() })
                         }
                     }
-                    _ => Err(TypeError::UnknownField {
-                        ty: format!("{:?}", obj_ty),
-                        field: field.clone(),
-                    }),
+                    _ => Err(TypeError::UnknownField { ty: format!("{:?}", obj_ty), field: field.clone() }),
                 }
             }
             Expr::StructLit { name, fields } => {
-                let sdef = env.lookup_struct(name)
-                    .ok_or_else(|| TypeError::UndefinedType(name.clone()))?
-                    .clone();
-                if sdef.fields.len() != fields.len() {
-                    return Err(TypeError::WrongArity {
-                        name: name.clone(),
-                        expected: sdef.fields.len(),
-                        found: fields.len(),
-                    });
-                }
-                for ((fname, fty), (_, expr)) in sdef.fields.iter().zip(fields.iter()) {
+                let sdef = env.structs.get(name).cloned()
+                    .ok_or_else(|| TypeError::UndefinedType(name.clone()))?;
+                if sdef.len() != fields.len() { return Err(TypeError::WrongArity { name: name.clone(), expected: sdef.len(), found: fields.len() }); }
+                for ((_, fty), (_, expr)) in sdef.iter().zip(fields.iter()) {
                     let expr_ty = Self::check_expr(expr, env)?;
-                    if *fty != expr_ty {
-                        return Err(TypeError::TypeMismatch {
-                            expected: format!("{:?}", fty),
-                            found: format!("{:?}", expr_ty),
-                        });
-                    }
+                    if *fty != expr_ty { return Err(TypeError::TypeMismatch { expected: format!("{:?}", fty), found: format!("{:?}", expr_ty) }); }
                 }
                 Ok(Type::Named(name.clone()))
             }
@@ -351,17 +304,23 @@ impl TypeChecker {
                     Self::check_pattern(pattern, &scrutinee_ty, env)?;
                     let body_ty = Self::check_expr(body, env)?;
                     if let Some(prev) = &result_ty {
-                        if *prev != body_ty {
-                            return Err(TypeError::TypeMismatch {
-                                expected: format!("{:?}", prev),
-                                found: format!("{:?}", body_ty),
-                            });
-                        }
+                        if *prev != body_ty { return Err(TypeError::TypeMismatch { expected: format!("{:?}", prev), found: format!("{:?}", body_ty) }); }
                     } else {
                         result_ty = Some(body_ty);
                     }
                 }
                 Ok(result_ty.unwrap_or(Type::Unit))
+            }
+            Expr::If { cond, then_body, else_body } => {
+                Self::check_expr(cond, env)?;
+                let then_ty = Self::check_expr(then_body, env)?;
+                if let Some(eb) = else_body {
+                    let else_ty = Self::check_expr(eb, env)?;
+                    if then_ty != else_ty { return Err(TypeError::TypeMismatch { expected: format!("{:?}", then_ty), found: format!("{:?}", else_ty) }); }
+                    Ok(then_ty)
+                } else {
+                    Ok(Type::Unit)
+                }
             }
         }
     }
@@ -370,34 +329,17 @@ impl TypeChecker {
         match pattern {
             Pattern::Literal(expr) => {
                 let pat_ty = Self::check_expr(expr, env)?;
-                if pat_ty != *expected_ty {
-                    return Err(TypeError::TypeMismatch {
-                        expected: format!("{:?}", expected_ty),
-                        found: format!("{:?}", pat_ty),
-                    });
-                }
+                if pat_ty != *expected_ty { return Err(TypeError::TypeMismatch { expected: format!("{:?}", expected_ty), found: format!("{:?}", pat_ty) }); }
                 Ok(())
             }
-            Pattern::Variable(name) => {
-                env.define(name, expected_ty.clone());
-                Ok(())
-            }
+            Pattern::Variable(name) => { env.define(name, expected_ty.clone()); Ok(()) }
             Pattern::Wildcard => Ok(()),
             Pattern::EnumVariant { name, inner } => {
-                if let Some((enum_name, variant_args)) = env.lookup_enum_variant(name).map(|(a, b)| (a.to_string(), b.clone())) {
-                    if *expected_ty != Type::Named(enum_name.clone()) {
-                        return Err(TypeError::TypeMismatch {
-                            expected: format!("{:?}", expected_ty),
-                            found: format!("{:?}", Type::Named(enum_name)),
-                        });
-                    }
-                    if variant_args.len() != inner.len() {
-                        return Err(TypeError::WrongArity {
-                            name: name.clone(),
-                            expected: variant_args.len(),
-                            found: inner.len(),
-                        });
-                    }
+                let enum_name = env.enums.iter().find(|(_, v)| v.iter().any(|(vn, _)| vn == name)).map(|(n, _)| n.clone());
+                if let Some(en) = enum_name {
+                    if *expected_ty != Type::Named(en) { return Err(TypeError::TypeMismatch { expected: format!("{:?}", expected_ty), found: format!("Enum {}", name) }); }
+                    let variant_args = env.enums.iter().find_map(|(_, v)| v.iter().find(|(vn, _)| vn == name).map(|(_, a)| a.clone())).unwrap();
+                    if variant_args.len() != inner.len() { return Err(TypeError::WrongArity { name: name.clone(), expected: variant_args.len(), found: inner.len() }); }
                     for (pat, arg_ty) in inner.iter().zip(variant_args.iter()) {
                         Self::check_pattern(pat, arg_ty, env)?;
                     }

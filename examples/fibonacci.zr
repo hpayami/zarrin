@@ -1,0 +1,23 @@
+// Zarrin: recursive functions + if/while
+fn fib(n: int) -> int {
+    if n <= 1 {
+        return n;
+    }
+    return fib(n - 1) + fib(n - 2);
+}
+
+fn main() {
+    print(fib(10));
+
+    // iterative version
+    let a = 0;
+    let b = 1;
+    let i = 0;
+    while i < 10 {
+        let temp = b;
+        b = a + b;
+        a = temp;
+        i = i + 1;
+    }
+    print(a);
+}

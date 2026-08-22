@@ -15,6 +15,15 @@ pub enum Token {
     Struct,
     Enum,
     Match,
+    Trait,
+    Impl,
+    For,
+    Extern,
+    Macro,
+    If,
+    Else,
+    While,
+    Break,
     // symbols
     Colon,
     ColonColon,
@@ -26,7 +35,9 @@ pub enum Token {
     Eq,
     Ne,
     Lt,
+    Le,
     Gt,
+    Ge,
     Assign,
     LParen,
     RParen,
@@ -116,8 +127,22 @@ impl<'a> Lexer<'a> {
                         Token::Ident("!".into())
                     }
                 }
-                '<' => Token::Lt,
-                '>' => Token::Gt,
+                '<' => {
+                    if self.chars.peek() == Some(&'=') {
+                        self.chars.next();
+                        Token::Le
+                    } else {
+                        Token::Lt
+                    }
+                }
+                '>' => {
+                    if self.chars.peek() == Some(&'=') {
+                        self.chars.next();
+                        Token::Ge
+                    } else {
+                        Token::Gt
+                    }
+                }
                 ':' => {
                     if self.chars.peek() == Some(&':') {
                         self.chars.next();
@@ -179,9 +204,17 @@ impl<'a> Lexer<'a> {
                         "struct" => Token::Struct,
                         "enum" => Token::Enum,
                         "match" => Token::Match,
+                        "trait" => Token::Trait,
+                        "impl" => Token::Impl,
+                        "for" => Token::For,
+                        "extern" => Token::Extern,
+                        "macro" => Token::Macro,
+                        "if" => Token::If,
+                        "else" => Token::Else,
+                        "while" => Token::While,
+                        "break" => Token::Break,
                         "true" => Token::Bool(true),
                         "false" => Token::Bool(false),
-                        _ => Token::Ident(id),
                         _ => Token::Ident(id),
                     }
                 }
