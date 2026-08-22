@@ -10,6 +10,9 @@ mod codegen;
 mod lexer;
 mod parser;
 
+#[cfg(feature = "llvm")]
+mod codegen_llvm;
+
 use std::fs;
 use std::process::exit;
 
@@ -43,6 +46,20 @@ fn main() {
         }
         "check" => {
             println!("parsed OK: {} top-level statements", program.stmts.len());
+        }
+        #[cfg(feature = "llvm")]
+        "build" => {
+            let out = if args.get(3).map(|s| s.as_str()) == Some("-o") {
+                args.get(4).cloned().unwrap_or_else(|| "a.out".into())
+            } else {
+                args.get(3).cloned().unwrap_or_else(|| "a.out".into())
+            };
+            codegen_llvm::compile_to_executable(&program, &out);
+        }
+        #[cfg(not(feature = "llvm"))]
+        "build" => {
+            eprintln!("LLVM backend not compiled. Rebuild with: cargo build --features llvm");
+            exit(1);
         }
         other => {
             eprintln!("unknown command: {}", other);
