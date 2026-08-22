@@ -46,6 +46,8 @@ pub struct Codegen<'ctx> {
     struct_fields: HashMap<String, Vec<String>>,
     var_struct_type: HashMap<String, String>,
     enum_variants: HashMap<String, Vec<(String, Vec<Type>)>>,
+    loop_exit: Vec<BasicBlock<'ctx>>,
+    loop_continue: Vec<BasicBlock<'ctx>>,
     i64: IntType<'ctx>,
     i8: IntType<'ctx>,
     f64: FloatType<'ctx>,
@@ -75,6 +77,8 @@ impl<'ctx> Codegen<'ctx> {
             struct_fields: HashMap::new(),
             var_struct_type: HashMap::new(),
             enum_variants: HashMap::new(),
+            loop_exit: Vec::new(),
+            loop_continue: Vec::new(),
             i64,
             i8: context.i8_type(),
             f64,
@@ -151,8 +155,17 @@ impl<'ctx> Codegen<'ctx> {
                 let lv = self.gen_expr(l);
                 let rv = self.gen_expr(r);
                 if matches!(op, BinOp::Add) {
-                    if let (CgValue::Str(a), CgValue::Str(b)) = (&lv, &rv) {
-                        return self.gen_string_concat(*a, *b);
+                    match (&lv, &rv) {
+                        (CgValue::Str(a), CgValue::Str(b)) => return self.gen_string_concat(*a, *b),
+                        (CgValue::Str(a), CgValue::Int(b)) => {
+                            let b_str = self.gen_int_to_str(*b);
+                            return self.gen_string_concat(*a, b_str);
+                        }
+                        (CgValue::Int(a), CgValue::Str(b)) => {
+                            let a_str = self.gen_int_to_str(*a);
+                            return self.gen_string_concat(a_str, *b);
+                        }
+                        _ => {}
                     }
                 }
                 match (&lv, &rv, op) {
@@ -217,12 +230,75 @@ impl<'ctx> Codegen<'ctx> {
                 if name == "len" {
                     let v = self.gen_expr(&args[0]);
                     return match v {
-                        CgValue::Str(_) => CgValue::Int(self.i64.const_int(0, false)),
-                        _ => panic!("len only supports strings in LLVM backend"),
+                        CgValue::Str(ptr) => {
+                            let strlen_type = self.i64.fn_type(&[self.context.ptr_type(AddressSpace::default()).into()], false);
+                            let strlen_fn = self.module.get_function("strlen").unwrap_or_else(|| self.module.add_function("strlen", strlen_type, None));
+                            let len_val = self.builder.build_call(strlen_fn, &[ptr.into()], "len_call").unwrap().try_as_basic_value().left().unwrap().into_int_value();
+                            CgValue::Int(len_val)
+                        }
+                        CgValue::Int(ptr_val) => {
+                            let arr_ptr = self.builder.build_int_to_ptr(ptr_val, self.i64.ptr_type(AddressSpace::default()), "arr_ptr").unwrap();
+                            let len = self.builder.build_load(self.i64, arr_ptr, "arr_len").unwrap().into_int_value();
+                            CgValue::Int(len)
+                        }
+                        _ => panic!("len supports strings and arrays"),
                     };
                 }
                 if name == "to_string" {
                     return CgValue::Int(self.i64.const_int(0, false));
+                }
+                if name == "int_to_str" {
+                    return CgValue::Int(self.i64.const_int(0, false));
+                }
+                if name == "panic" {
+                    return CgValue::Int(self.i64.const_int(0, false));
+                }
+                if name == "array_len" {
+                    let arr_val = self.gen_expr(&args[0]);
+                    let arr_ptr_val = self.value_to_int(&arr_val);
+                    let arr_ptr = self.builder.build_int_to_ptr(arr_ptr_val, self.i64.ptr_type(AddressSpace::default()), "arr_ptr").unwrap();
+                    let len = self.builder.build_load(self.i64, arr_ptr, "arr_len").unwrap().into_int_value();
+                    return CgValue::Int(len);
+                }
+                if name == "array_get" {
+                    let arr_val = self.gen_expr(&args[0]);
+                    let arr_ptr_val = self.value_to_int(&arr_val);
+                    let arr_ptr = self.builder.build_int_to_ptr(arr_ptr_val, self.i64.ptr_type(AddressSpace::default()), "arr_ptr").unwrap();
+                    let idx_val = self.gen_expr(&args[1]);
+                    let idx_int = self.value_to_int(&idx_val);
+                    let elem_off = self.builder.build_int_add(idx_int, self.i64.const_int(1, false), "elem_off").unwrap();
+                    let elem_ptr = unsafe {
+                        self.builder.build_gep(self.i64, arr_ptr, &[elem_off], "elem_ptr").unwrap()
+                    };
+                    return CgValue::Int(self.builder.build_load(self.i64, elem_ptr, "arr_elem").unwrap().into_int_value());
+                }
+                if name == "array_set" {
+                    let arr_val = self.gen_expr(&args[0]);
+                    let arr_ptr_val = self.value_to_int(&arr_val);
+                    let arr_ptr = self.builder.build_int_to_ptr(arr_ptr_val, self.i64.ptr_type(AddressSpace::default()), "arr_ptr").unwrap();
+                    let idx_val = self.gen_expr(&args[1]);
+                    let idx_int = self.value_to_int(&idx_val);
+                    let new_val = self.gen_expr(&args[2]);
+                    let new_int = self.value_to_int(&new_val);
+                    let malloc_type = self.context.ptr_type(AddressSpace::default()).fn_type(&[self.i64.into()], false);
+                    let malloc_fn = self.module.get_function("malloc").unwrap_or_else(|| self.module.add_function("malloc", malloc_type, None));
+                    let memcpy_type = self.context.void_type().fn_type(&[
+                        self.context.ptr_type(AddressSpace::default()).into(),
+                        self.context.ptr_type(AddressSpace::default()).into(),
+                        self.i64.into(),
+                    ], false);
+                    let memcpy_fn = self.module.get_function("memcpy").unwrap_or_else(|| self.module.add_function("memcpy", memcpy_type, None));
+                    let old_len = self.builder.build_load(self.i64, arr_ptr, "old_len").unwrap().into_int_value();
+                    let new_len = self.builder.build_int_add(old_len, self.i64.const_int(1, false), "new_len").unwrap();
+                    let buf = self.builder.build_call(malloc_fn, &[new_len.into()], "new_arr").unwrap().try_as_basic_value().left().unwrap().into_pointer_value();
+                    let byte_count = self.builder.build_int_mul(new_len, self.i64.const_int(8, false), "bytes").unwrap();
+                    self.builder.build_call(memcpy_fn, &[buf.into(), arr_ptr_val.into(), byte_count.into()], "cp").unwrap();
+                    let elem_off = self.builder.build_int_add(idx_int, self.i64.const_int(1, false), "elem_off").unwrap();
+                    let elem_ptr = unsafe {
+                        self.builder.build_gep(self.i64, buf, &[elem_off], "elem_ptr").unwrap()
+                    };
+                    self.builder.build_store(elem_ptr, new_int).unwrap();
+                    return CgValue::Int(self.builder.build_ptr_to_int(buf, self.i64, "new_arr_ptr").unwrap());
                 }
                 if let Some((_, variants)) = self.enum_variants.iter().find(|(_, v)| v.iter().any(|(vn, _)| vn == name)) {
                     let tag = variants.iter().position(|(vn, _)| vn == name).unwrap();
@@ -582,6 +658,63 @@ Expr::Match { scrutinee, arms } => {
         CgValue::Str(buf)
     }
 
+    fn gen_int_to_str(&self, val: IntValue<'ctx>) -> PointerValue<'ctx> {
+        let malloc_type = self.context.ptr_type(AddressSpace::default()).fn_type(&[self.i64.into()], false);
+        let malloc_fn = self.module.get_function("malloc").unwrap_or_else(|| self.module.add_function("malloc", malloc_type, None));
+        let buf = self.builder.build_call(malloc_fn, &[self.i64.const_int(32, false).into()], "int_buf").unwrap().try_as_basic_value().left().unwrap().into_pointer_value();
+
+        let fn_val = self.builder.get_insert_block().unwrap().get_parent().unwrap();
+        let loop_bb = self.context.append_basic_block(fn_val, "itoa_loop");
+        let done_bb = self.context.append_basic_block(fn_val, "itoa_done");
+
+        let idx_ptr = self.builder.build_alloca(self.i64, "itoa_idx").unwrap();
+        self.builder.build_store(idx_ptr, self.i64.const_int(30, false)).unwrap();
+        let val_ptr = self.builder.build_alloca(self.i64, "itoa_val").unwrap();
+        self.builder.build_store(val_ptr, val).unwrap();
+
+        let zero = self.i64.const_int(0, false);
+        let ten = self.i64.const_int(10, false);
+
+        self.builder.build_unconditional_branch(loop_bb).unwrap();
+        self.builder.position_at_end(loop_bb);
+        let cur_idx = self.builder.build_load(self.i64, idx_ptr, "cur_idx").unwrap().into_int_value();
+        let cur_val = self.builder.build_load(self.i64, val_ptr, "cur_val").unwrap().into_int_value();
+        let digit = self.builder.build_int_signed_rem(cur_val, ten, "digit").unwrap();
+        let ascii = self.builder.build_int_add(digit, self.i64.const_int(48, false), "ascii").unwrap();
+
+        let byte_ptr_ty = self.i8.ptr_type(AddressSpace::default());
+        let buf_byte_ptr = self.builder.build_bit_cast(buf, byte_ptr_ty, "buf_byte").unwrap().into_pointer_value();
+        let char_ptr = unsafe {
+            self.builder.build_gep(self.i8, buf_byte_ptr, &[cur_idx], "char_ptr").unwrap()
+        };
+        let trunc_ascii = self.builder.build_int_truncate(ascii, self.i8, "ascii8").unwrap();
+        self.builder.build_store(char_ptr, trunc_ascii).unwrap();
+
+        let next_idx = self.builder.build_int_sub(cur_idx, self.i64.const_int(1, false), "next_idx").unwrap();
+        self.builder.build_store(idx_ptr, next_idx).unwrap();
+        let next_val = self.builder.build_int_signed_div(cur_val, ten, "next_val").unwrap();
+        self.builder.build_store(val_ptr, next_val).unwrap();
+
+        let is_done = self.builder.build_int_compare(inkwell::IntPredicate::SLT, next_idx, zero, "is_done").unwrap();
+        let is_val_zero = self.builder.build_int_compare(inkwell::IntPredicate::EQ, next_val, zero, "val_zero").unwrap();
+        let should_exit = self.builder.build_or(is_done, is_val_zero, "should_exit").unwrap();
+        self.builder.build_conditional_branch(should_exit, done_bb, loop_bb).unwrap();
+
+        self.builder.position_at_end(done_bb);
+        let null_term_idx = self.builder.build_load(self.i64, idx_ptr, "null_idx").unwrap().into_int_value();
+        let first_digit = self.builder.build_int_add(null_term_idx, self.i64.const_int(1, false), "first_digit").unwrap();
+        let buf_byte_ptr2 = self.builder.build_bit_cast(buf, byte_ptr_ty, "buf_byte2").unwrap().into_pointer_value();
+        let null_ptr = unsafe {
+            self.builder.build_gep(self.i8, buf_byte_ptr2, &[self.i64.const_int(31, false)], "null_ptr").unwrap()
+        };
+        self.builder.build_store(null_ptr, self.i8.const_int(0, false)).unwrap();
+
+        let result_ptr = unsafe {
+            self.builder.build_gep(self.i8, buf_byte_ptr2, &[first_digit], "result_ptr").unwrap()
+        };
+        result_ptr
+    }
+
     fn value_to_int(&self, v: &CgValue<'ctx>) -> IntValue<'ctx> {
         match v {
             CgValue::Int(val) => *val,
@@ -723,6 +856,9 @@ Expr::Match { scrutinee, arms } => {
                 let cond_bool = self.to_i1(&cond_val);
                 self.builder.build_conditional_branch(cond_bool, body_bb, after_bb).unwrap();
 
+                self.loop_exit.push(after_bb);
+                self.loop_continue.push(loop_bb);
+
                 self.builder.position_at_end(body_bb);
                 let mut body_terminated = false;
                 for s in body {
@@ -733,10 +869,24 @@ Expr::Match { scrutinee, arms } => {
                     self.builder.build_unconditional_branch(loop_bb).unwrap();
                 }
 
+                self.loop_exit.pop();
+                self.loop_continue.pop();
+
                 self.builder.position_at_end(after_bb);
             }
-            Stmt::Break | Stmt::Continue => {
-                // TODO: proper break/continue with labels
+            Stmt::Break => {
+                if let Some(exit_bb) = self.loop_exit.last().cloned() {
+                    self.builder.build_unconditional_branch(exit_bb).unwrap();
+                    let dead_bb = self.context.append_basic_block(self.builder.get_insert_block().unwrap().get_parent().unwrap(), "dead");
+                    self.builder.position_at_end(dead_bb);
+                }
+            }
+            Stmt::Continue => {
+                if let Some(cont_bb) = self.loop_continue.last().cloned() {
+                    self.builder.build_unconditional_branch(cont_bb).unwrap();
+                    let dead_bb = self.context.append_basic_block(self.builder.get_insert_block().unwrap().get_parent().unwrap(), "dead");
+                    self.builder.position_at_end(dead_bb);
+                }
             }
             Stmt::For { var, iter, body } => {
                 if let Expr::Range(start_expr, end_expr) = iter {
@@ -759,6 +909,8 @@ Expr::Match { scrutinee, arms } => {
                     self.builder.build_conditional_branch(cmp, body_bb, exit_bb).unwrap();
 
                     self.named.insert(var.clone(), (counter_ptr, "int".to_string()));
+                    self.loop_exit.push(exit_bb);
+                    self.loop_continue.push(cont_bb);
                     self.builder.position_at_end(body_bb);
                     let mut body_terminated = false;
                     for s in body {
@@ -768,6 +920,8 @@ Expr::Match { scrutinee, arms } => {
                     if !body_terminated {
                         self.builder.build_unconditional_branch(cont_bb).unwrap();
                     }
+                    self.loop_exit.pop();
+                    self.loop_continue.pop();
 
                     self.builder.position_at_end(cont_bb);
                     let cur2 = self.builder.build_load(self.i64, counter_ptr, &format!("{}_next", var)).unwrap().into_int_value();
@@ -793,7 +947,7 @@ fn expand_macros_in_expr(expr: &Expr, macros: &HashMap<String, (Vec<String>, Vec
             if let Some((params, body)) = macros.get(name) {
                 let mut arg_map: HashMap<String, Expr> = HashMap::new();
                 for (i, p) in params.iter().enumerate() {
-                    arg_map.insert(p.clone(), args[i].clone());
+                    arg_map.insert(p.clone(), substitute_expr(&args[i], &HashMap::new(), macros));
                 }
                 if body.len() == 1 {
                     if let Stmt::Expr(e) = &body[0] {
