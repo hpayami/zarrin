@@ -9,6 +9,7 @@ mod ast;
 mod codegen;
 mod lexer;
 mod parser;
+mod typecheck;
 
 #[cfg(feature = "llvm")]
 mod codegen_llvm;
@@ -45,7 +46,13 @@ fn main() {
             println!("{:#?}", program);
         }
         "check" => {
-            println!("parsed OK: {} top-level statements", program.stmts.len());
+            match typecheck::TypeChecker::check(&program) {
+                Ok(()) => println!("OK: all types check out ({} top-level statements)", program.stmts.len()),
+                Err(e) => {
+                    eprintln!("type error: {}", e);
+                    exit(1);
+                }
+            }
         }
         #[cfg(feature = "llvm")]
         "build" => {
