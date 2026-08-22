@@ -10,6 +10,7 @@ pub enum Type {
     Unit,
     Named(String),
     Fn(Vec<Type>, Box<Type>),
+    Array(Box<Type>),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -47,6 +48,8 @@ pub enum Expr {
     Ident(String),
     Binary(Box<Expr>, BinOp, Box<Expr>),
     Range(Box<Expr>, Box<Expr>),
+    ArrayLit(Vec<Expr>),
+    Index(Box<Expr>, Box<Expr>),
     Call(Box<Expr>, Vec<Expr>),
     FieldAccess(Box<Expr>, String),
     MethodCall(Box<Expr>, String, Vec<Expr>),

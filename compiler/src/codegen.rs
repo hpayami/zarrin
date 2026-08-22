@@ -15,6 +15,7 @@ enum Value {
     Struct { name: String, fields: HashMap<String, Value> },
     EnumVariant { enum_name: String, variant: String, args: Vec<Value> },
     Range(i64, i64),
+    Array(Vec<Value>),
 }
 
 struct Env {
@@ -183,6 +184,9 @@ impl Interpreter {
                 if name == "to_string" { let v = self.eval_expr(&args[0], env); return Value::Str(value_to_string(&v)); }
                 if name == "int_to_str" { let v = self.eval_expr(&args[0], env); return match v { Value::Int(n) => Value::Str(n.to_string()), _ => panic!("int_to_str expects int") }; }
                 if name == "panic" { let v = self.eval_expr(&args[0], env); panic!("{}", value_to_string(&v)); }
+                if name == "array_len" { let v = self.eval_expr(&args[0], env); return match v { Value::Array(a) => Value::Int(a.len() as i64), _ => panic!("array_len expects array") }; }
+                if name == "array_get" { let arr = self.eval_expr(&args[0], env); let idx = self.eval_expr(&args[1], env); return match (arr, idx) { (Value::Array(a), Value::Int(i)) => a[i as usize].clone(), _ => panic!("array_get expects array and int") }; }
+                if name == "array_set" { let arr = self.eval_expr(&args[0], env); let idx = self.eval_expr(&args[1], env); let val = self.eval_expr(&args[2], env); if let (Value::Array(mut a), Value::Int(i)) = (arr, idx) { a[i as usize] = val; return Value::Array(a); } else { panic!("array_set expects array, int, value"); } }
                 if let Some(vdef) = env.enums.values().find_map(|v| v.iter().find(|(vn, _)| vn == name)) {
                     let _ = vdef;
                     let eval_args: Vec<Value> = args.iter().map(|a| self.eval_expr(a, env)).collect();
@@ -264,6 +268,18 @@ impl Interpreter {
                 match (av, bv) {
                     (Value::Int(a), Value::Int(b)) => Value::Range(a, b),
                     _ => panic!("range requires two ints"),
+                }
+            }
+            Expr::ArrayLit(elems) => {
+                let vals: Vec<Value> = elems.iter().map(|e| self.eval_expr(e, env)).collect();
+                Value::Array(vals)
+            }
+            Expr::Index(arr, idx) => {
+                let arr_val = self.eval_expr(arr, env);
+                let idx_val = self.eval_expr(idx, env);
+                match (arr_val, idx_val) {
+                    (Value::Array(a), Value::Int(i)) => a[i as usize].clone(),
+                    _ => panic!("array indexing requires array and int"),
                 }
             }
         }
@@ -392,5 +408,9 @@ fn value_to_string(v: &Value) -> String {
             }
         }
         Value::Range(a, b) => format!("{}..{}", a, b),
+        Value::Array(elems) => {
+            let es: Vec<String> = elems.iter().map(value_to_string).collect();
+            format!("[{}]", es.join(", "))
+        }
     }
 }

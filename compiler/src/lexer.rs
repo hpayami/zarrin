@@ -46,6 +46,8 @@ pub enum Token {
     RParen,
     LBrace,
     RBrace,
+    LBrack,
+    RBrack,
     Comma,
     Arrow,
     FatArrow,
@@ -111,6 +113,8 @@ impl<'a> Lexer<'a> {
                 ')' => Token::RParen,
                 '{' => Token::LBrace,
                 '}' => Token::RBrace,
+                '[' => Token::LBrack,
+                ']' => Token::RBrack,
                 ',' => Token::Comma,
                 ';' => Token::Semicolon,
                 '=' => {

@@ -342,6 +342,27 @@ impl TypeChecker {
                 }
                 Ok(Type::Int)
             }
+            Expr::ArrayLit(elems) => {
+                if elems.is_empty() {
+                    Ok(Type::Array(Box::new(Type::Inferred)))
+                } else {
+                    let elem_ty = Self::check_expr(&elems[0], env)?;
+                    for e in &elems[1..] {
+                        let et = Self::check_expr(e, env)?;
+                        if et != elem_ty { return Err(TypeError::TypeMismatch { expected: format!("{:?}", elem_ty), found: format!("{:?}", et) }); }
+                    }
+                    Ok(Type::Array(Box::new(elem_ty)))
+                }
+            }
+            Expr::Index(arr, idx) => {
+                let arr_ty = Self::check_expr(arr, env)?;
+                let idx_ty = Self::check_expr(idx, env)?;
+                if idx_ty != Type::Int { return Err(TypeError::TypeMismatch { expected: "int".into(), found: format!("{:?}", idx_ty) }); }
+                match arr_ty {
+                    Type::Array(et) => Ok(*et),
+                    _ => Err(TypeError::TypeMismatch { expected: "array".into(), found: format!("{:?}", arr_ty) }),
+                }
+            }
         }
     }
 

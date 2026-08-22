@@ -538,6 +538,12 @@ impl<'a> Parser<'a> {
                         expr = Expr::FieldAccess(Box::new(expr), field);
                     }
                 }
+                Token::LBrack => {
+                    self.advance();
+                    let index = self.parse_expr();
+                    self.expect(Token::RBrack);
+                    expr = Expr::Index(Box::new(expr), Box::new(index));
+                }
                 _ => break,
             }
         }
@@ -578,6 +584,18 @@ impl<'a> Parser<'a> {
                 let e = self.parse_expr();
                 self.expect(Token::RParen);
                 e
+            }
+            Token::LBrack => {
+                self.advance();
+                let mut elems = Vec::new();
+                while self.current != Token::RBrack {
+                    elems.push(self.parse_expr());
+                    if self.current == Token::Comma {
+                        self.advance();
+                    }
+                }
+                self.expect(Token::RBrack);
+                Expr::ArrayLit(elems)
             }
             t => panic!("unexpected token in expression: {:?}", t),
         }
