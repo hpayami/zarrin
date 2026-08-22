@@ -11,6 +11,7 @@ use inkwell::builder::Builder;
 use inkwell::context::Context;
 use inkwell::module::Module;
 use inkwell::types::{BasicMetadataTypeEnum, FloatType, IntType};
+use inkwell::basic_block::BasicBlock;
 use inkwell::values::{BasicMetadataValueEnum, BasicValueEnum, FloatValue, FunctionValue, IntValue, PointerValue};
 use either::Either;
 use inkwell::AddressSpace;
@@ -40,8 +41,13 @@ pub struct Codegen<'ctx> {
     builder: Builder<'ctx>,
     printf: FunctionValue<'ctx>,
     functions: HashMap<String, FunctionValue<'ctx>>,
+    fn_ret_types: HashMap<String, Type>,
     named: HashMap<String, (PointerValue<'ctx>, String)>,
+    struct_fields: HashMap<String, Vec<String>>,
+    var_struct_type: HashMap<String, String>,
+    enum_variants: HashMap<String, Vec<(String, Vec<Type>)>>,
     i64: IntType<'ctx>,
+    i8: IntType<'ctx>,
     f64: FloatType<'ctx>,
     i1: IntType<'ctx>,
 }
@@ -64,8 +70,13 @@ impl<'ctx> Codegen<'ctx> {
             builder,
             printf,
             functions: HashMap::new(),
+            fn_ret_types: HashMap::new(),
             named: HashMap::new(),
+            struct_fields: HashMap::new(),
+            var_struct_type: HashMap::new(),
+            enum_variants: HashMap::new(),
             i64,
+            i8: context.i8_type(),
             f64,
             i1,
         }
@@ -93,19 +104,6 @@ impl<'ctx> Codegen<'ctx> {
         g.as_pointer_value()
     }
 
-    fn type_name(ty: &Type) -> String {
-        match ty {
-            Type::Int => "int".into(),
-            Type::Float => "float".into(),
-            Type::Bool => "bool".into(),
-            Type::String => "string".into(),
-            Type::Unit => "unit".into(),
-            Type::Named(n) => n.clone(),
-            Type::Fn(_, _) => "fn".into(),
-            Type::Array(_) => "array".into(),
-            Type::Inferred => "inferred".into(),
-        }
-    }
 
     fn gen_expr(&mut self, e: &Expr) -> CgValue<'ctx> {
         match e {
@@ -130,6 +128,21 @@ impl<'ctx> Codegen<'ctx> {
                             CgValue::Int(v.into_int_value())
                         }
                     }
+                } else if let Some((_, variants)) = self.enum_variants.iter().find(|(_, v)| v.iter().any(|(vn, _)| vn == name)) {
+                    let tag = variants.iter().position(|(vn, _)| vn == name).unwrap();
+                    let has_data = variants.iter().any(|(_, pt)| !pt.is_empty());
+                    if has_data {
+                        let array_ty = self.i64.array_type(1);
+                        let alloca = self.builder.build_alloca(array_ty, &format!("enum_{}", name)).unwrap();
+                        let base_ptr = self.builder.build_bit_cast(alloca, self.context.ptr_type(AddressSpace::default()), "enum_base").unwrap().into_pointer_value();
+                        let tag_ptr = unsafe {
+                            self.builder.build_gep(array_ty, alloca, &[self.i64.const_int(0, false), self.i64.const_int(0, false)], "tag_ptr").unwrap()
+                        };
+                        self.builder.build_store(tag_ptr, self.i64.const_int(tag as u64, false)).unwrap();
+                        CgValue::Int(self.builder.build_ptr_to_int(base_ptr, self.i64, "enum_ptr").unwrap())
+                    } else {
+                        CgValue::Int(self.i64.const_int(tag as u64, false))
+                    }
                 } else {
                     panic!("undefined var: {}", name)
                 }
@@ -137,6 +150,11 @@ impl<'ctx> Codegen<'ctx> {
             Expr::Binary(l, op, r) => {
                 let lv = self.gen_expr(l);
                 let rv = self.gen_expr(r);
+                if matches!(op, BinOp::Add) {
+                    if let (CgValue::Str(a), CgValue::Str(b)) = (&lv, &rv) {
+                        return self.gen_string_concat(*a, *b);
+                    }
+                }
                 match (&lv, &rv, op) {
                     (CgValue::Float(a), CgValue::Float(b), _) => {
                         let v = match op {
@@ -163,20 +181,26 @@ impl<'ctx> Codegen<'ctx> {
                     _ => {
                         let lv = match lv { CgValue::Int(v) => v, _ => panic!("expected int operand") };
                         let rv = match rv { CgValue::Int(v) => v, _ => panic!("expected int operand") };
-                        let v = match op {
-                            BinOp::Add => self.builder.build_int_add(lv, rv, "add").unwrap(),
-                            BinOp::Sub => self.builder.build_int_sub(lv, rv, "sub").unwrap(),
-                            BinOp::Mul => self.builder.build_int_mul(lv, rv, "mul").unwrap(),
-                            BinOp::Div => self.builder.build_int_signed_div(lv, rv, "div").unwrap(),
-                            BinOp::Mod => self.builder.build_int_signed_rem(lv, rv, "rem").unwrap(),
-                            BinOp::Eq => self.builder.build_int_compare(inkwell::IntPredicate::EQ, lv, rv, "eq").unwrap(),
-                            BinOp::Ne => self.builder.build_int_compare(inkwell::IntPredicate::NE, lv, rv, "ne").unwrap(),
-                            BinOp::Lt => self.builder.build_int_compare(inkwell::IntPredicate::SLT, lv, rv, "lt").unwrap(),
-                            BinOp::Le => self.builder.build_int_compare(inkwell::IntPredicate::SLE, lv, rv, "le").unwrap(),
-                            BinOp::Gt => self.builder.build_int_compare(inkwell::IntPredicate::SGT, lv, rv, "gt").unwrap(),
-                            BinOp::Ge => self.builder.build_int_compare(inkwell::IntPredicate::SGE, lv, rv, "ge").unwrap(),
-                        };
-                        CgValue::Int(v)
+                        match op {
+                            BinOp::Add => CgValue::Int(self.builder.build_int_add(lv, rv, "add").unwrap()),
+                            BinOp::Sub => CgValue::Int(self.builder.build_int_sub(lv, rv, "sub").unwrap()),
+                            BinOp::Mul => CgValue::Int(self.builder.build_int_mul(lv, rv, "mul").unwrap()),
+                            BinOp::Div => CgValue::Int(self.builder.build_int_signed_div(lv, rv, "div").unwrap()),
+                            BinOp::Mod => CgValue::Int(self.builder.build_int_signed_rem(lv, rv, "rem").unwrap()),
+                            BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge => {
+                                let pred = match op {
+                                    BinOp::Eq => inkwell::IntPredicate::EQ,
+                                    BinOp::Ne => inkwell::IntPredicate::NE,
+                                    BinOp::Lt => inkwell::IntPredicate::SLT,
+                                    BinOp::Le => inkwell::IntPredicate::SLE,
+                                    BinOp::Gt => inkwell::IntPredicate::SGT,
+                                    BinOp::Ge => inkwell::IntPredicate::SGE,
+                                    _ => unreachable!(),
+                                };
+                                let cmp = self.builder.build_int_compare(pred, lv, rv, "cmp").unwrap();
+                                CgValue::Int(self.builder.build_int_z_extend(cmp, self.i64, "cmp_ext").unwrap())
+                            }
+                        }
                     }
                 }
             }
@@ -189,6 +213,41 @@ impl<'ctx> Codegen<'ctx> {
                     let v = self.gen_expr(&args[0]);
                     self.gen_print(&v);
                     return CgValue::Int(self.i64.const_int(0, false));
+                }
+                if name == "len" {
+                    let v = self.gen_expr(&args[0]);
+                    return match v {
+                        CgValue::Str(_) => CgValue::Int(self.i64.const_int(0, false)),
+                        _ => panic!("len only supports strings in LLVM backend"),
+                    };
+                }
+                if name == "to_string" {
+                    return CgValue::Int(self.i64.const_int(0, false));
+                }
+                if let Some((_, variants)) = self.enum_variants.iter().find(|(_, v)| v.iter().any(|(vn, _)| vn == name)) {
+                    let tag = variants.iter().position(|(vn, _)| vn == name).unwrap();
+                    let (_, payload_types) = variants.iter().find(|(vn, _)| vn == name).unwrap();
+                    let has_data = variants.iter().any(|(_, pt)| !pt.is_empty());
+                    if !has_data {
+                        return CgValue::Int(self.i64.const_int(tag as u64, false));
+                    }
+                    let num_fields = (payload_types.len() + 1) as u32;
+                    let array_ty = self.i64.array_type(num_fields);
+                    let alloca = self.builder.build_alloca(array_ty, &format!("enum_{}", name)).unwrap();
+                    let base_ptr = self.builder.build_bit_cast(alloca, self.context.ptr_type(AddressSpace::default()), "enum_base").unwrap().into_pointer_value();
+                    let tag_ptr = unsafe {
+                        self.builder.build_gep(array_ty, alloca, &[self.i64.const_int(0, false), self.i64.const_int(0, false)], "tag_ptr").unwrap()
+                    };
+                    self.builder.build_store(tag_ptr, self.i64.const_int(tag as u64, false)).unwrap();
+                    for (j, arg) in args.iter().enumerate() {
+                        let av = self.gen_expr(arg);
+                        let av_int = self.value_to_int(&av);
+                        let field_ptr = unsafe {
+                            self.builder.build_gep(array_ty, alloca, &[self.i64.const_int(0, false), self.i64.const_int((j + 1) as u64, false)], &format!("{}_{}", name, j)).unwrap()
+                        };
+                        self.builder.build_store(field_ptr, av_int).unwrap();
+                    }
+                    return CgValue::Int(self.builder.build_ptr_to_int(base_ptr, self.i64, "enum_ptr").unwrap());
                 }
                 let func = self.functions.get(name).copied()
                     .unwrap_or_else(|| panic!("undefined function: {}", name));
@@ -203,7 +262,19 @@ impl<'ctx> Codegen<'ctx> {
                 let call = self.builder.build_call(func, &meta_args, name).unwrap();
                 match call.try_as_basic_value() {
                     Either::Left(v) => {
-                        if v.is_float_value() {
+                        let ret_type = self.fn_ret_types.get(name);
+                        if matches!(ret_type, Some(Type::String)) && v.is_int_value() {
+                            let int_val = v.into_int_value();
+                            let ptr = self.builder.build_int_to_ptr(
+                                int_val,
+                                self.context.ptr_type(AddressSpace::default()),
+                                "str_ptr",
+                            ).unwrap();
+                            CgValue::Str(ptr)
+                        } else if matches!(ret_type, Some(Type::Float)) && v.is_int_value() {
+                            let as_float = self.builder.build_bit_cast(v.into_int_value(), self.f64, "i2f").unwrap().into_float_value();
+                            CgValue::Float(as_float)
+                        } else if v.is_float_value() {
                             CgValue::Float(v.into_float_value())
                         } else {
                             CgValue::Int(v.into_int_value())
@@ -212,30 +283,310 @@ impl<'ctx> Codegen<'ctx> {
                     Either::Right(_) => CgValue::Int(self.i64.const_int(0, false)),
                 }
             }
-            Expr::MethodCall(_, method, _) => {
-                panic!("LLVM backend: method calls not yet supported (method: {})", method);
+            Expr::StructLit { name, fields } => {
+                let field_defs = self.struct_fields.get(name).cloned()
+                    .unwrap_or_else(|| panic!("unknown struct: {}", name));
+                let num_fields = field_defs.len() as u64;
+                let array_ty = self.i64.array_type(num_fields as u32);
+                let alloca = self.builder.build_alloca(array_ty, &format!("{}_struct", name)).unwrap();
+                let base_ptr = self.builder.build_bit_cast(alloca, self.context.ptr_type(AddressSpace::default()), "base_ptr").unwrap().into_pointer_value();
+                for (i, (fname, fexpr)) in fields.iter().enumerate() {
+                    let fv = self.gen_expr(fexpr);
+                    let fv_int = match fv {
+                        CgValue::Int(v) => v,
+                        CgValue::Float(v) => {
+                            let bits = self.builder.build_bit_cast(v, self.i64, "f2i").unwrap();
+                            bits.into_int_value()
+                        }
+                        CgValue::Str(p) => {
+                            self.builder.build_ptr_to_int(p, self.i64, "p2i").unwrap()
+                        }
+                    };
+                    let field_ptr = unsafe {
+                        self.builder.build_gep(array_ty, alloca, &[self.i64.const_int(0, false), self.i64.const_int(i as u64, false)], &format!("{}_{}", name, fname)).unwrap()
+                    };
+                    self.builder.build_store(field_ptr, fv_int).unwrap();
+                }
+                CgValue::Int(self.builder.build_ptr_to_int(base_ptr, self.i64, "struct_ptr").unwrap())
             }
-            Expr::FieldAccess(_, field) => {
-                panic!("LLVM backend: field access not yet supported (field: {})", field);
+            Expr::FieldAccess(obj, field) => {
+                let obj_val = self.gen_expr(obj);
+                let obj_ptr_val = match obj_val {
+                    CgValue::Int(v) => v,
+                    _ => panic!("field access on non-struct"),
+                };
+                let obj_ptr = self.builder.build_int_to_ptr(obj_ptr_val, self.context.ptr_type(AddressSpace::default()), "obj_ptr").unwrap();
+                let struct_name = match obj.as_ref() {
+                    Expr::Ident(n) => self.var_struct_type.get(n).cloned()
+                        .unwrap_or_else(|| panic!("variable '{}' is not a struct", n)),
+                    Expr::StructLit { name, .. } => name.clone(),
+                    _ => panic!("cannot determine struct type"),
+                };
+                let field_defs = self.struct_fields.get(&struct_name)
+                    .unwrap_or_else(|| panic!("unknown struct type for field access: {}", struct_name));
+                let field_idx = field_defs.iter().position(|f| f == field)
+                    .unwrap_or_else(|| panic!("field `{}` not found in struct `{}`", field, struct_name));
+                let num_fields = field_defs.len() as u64;
+                let array_ty = self.i64.array_type(num_fields as u32);
+                let field_ptr = unsafe {
+                    self.builder.build_gep(array_ty, obj_ptr, &[self.i64.const_int(0, false), self.i64.const_int(field_idx as u64, false)], &format!("{}_{}", struct_name, field)).unwrap()
+                };
+                CgValue::Int(self.builder.build_load(self.i64, field_ptr, field).unwrap().into_int_value())
             }
-            Expr::StructLit { name, .. } => {
-                panic!("LLVM backend: struct literals not yet supported ({})", name);
+            Expr::MethodCall(obj, method, args) => {
+                let obj_val = self.gen_expr(obj);
+                let mut meta_args: Vec<BasicMetadataValueEnum> = Vec::new();
+                match &obj_val {
+                    CgValue::Int(v) => meta_args.push((*v).into()),
+                    _ => panic!("method call on non-struct"),
+                }
+                for a in args {
+                    match self.gen_expr(a) {
+                        CgValue::Int(v) => meta_args.push(v.into()),
+                        CgValue::Float(v) => meta_args.push(v.into()),
+                        _ => panic!("only int/float args supported"),
+                    }
+                }
+                let func = self.functions.get(method)
+                    .copied()
+                    .unwrap_or_else(|| panic!("undefined method: {}", method));
+                let call = self.builder.build_call(func, &meta_args, method).unwrap();
+                match call.try_as_basic_value() {
+                    Either::Left(v) => {
+                        let ret_type = self.fn_ret_types.get(method);
+                        if matches!(ret_type, Some(Type::String)) && v.is_int_value() {
+                            let int_val = v.into_int_value();
+                            let ptr = self.builder.build_int_to_ptr(
+                                int_val,
+                                self.context.ptr_type(AddressSpace::default()),
+                                "str_ptr",
+                            ).unwrap();
+                            CgValue::Str(ptr)
+                        } else if matches!(ret_type, Some(Type::Float)) && v.is_int_value() {
+                            let as_float = self.builder.build_bit_cast(v.into_int_value(), self.f64, "i2f").unwrap().into_float_value();
+                            CgValue::Float(as_float)
+                        } else if v.is_float_value() {
+                            CgValue::Float(v.into_float_value())
+                        } else {
+                            CgValue::Int(v.into_int_value())
+                        }
+                    }
+                    Either::Right(_) => CgValue::Int(self.i64.const_int(0, false)),
+                }
             }
-            Expr::Match { .. } => {
-                panic!("LLVM backend: match expressions not yet supported");
+Expr::Match { scrutinee, arms } => {
+                let sv = self.gen_expr(scrutinee);
+                let parent = self.builder.get_insert_block().unwrap().get_parent().unwrap();
+                let merge = self.context.append_basic_block(parent, "match_merge");
+                let sv_int_raw = self.value_to_int(&sv);
+                let has_data_variants = self.enum_variants.values().flat_map(|v| v.iter()).any(|(_, pt)| !pt.is_empty());
+                let (sv_tag, sv_ptr) = if has_data_variants {
+                    let sv_ptr = self.builder.build_int_to_ptr(sv_int_raw, self.context.ptr_type(AddressSpace::default()), "enum_ptr").unwrap();
+                    let tag_ptr = unsafe {
+                        self.builder.build_gep(self.i64, sv_ptr, &[self.i64.const_int(0, false)], "tag_ptr").unwrap()
+                    };
+                    let tag = self.builder.build_load(self.i64, tag_ptr, "tag").unwrap().into_int_value();
+                    (tag, Some(sv_ptr))
+                } else {
+                    (sv_int_raw, None)
+                };
+                let mut arm_values: Vec<(IntValue<'ctx>, BasicBlock<'ctx>)> = Vec::new();
+                let mut current_check = self.context.append_basic_block(parent, "match_check");
+                self.builder.build_unconditional_branch(current_check).unwrap();
+                for (i, (pattern, body)) in arms.iter().enumerate() {
+                    self.builder.position_at_end(current_check);
+                    let arm_bb = self.context.append_basic_block(parent, &format!("arm_{}", i));
+                    let is_last = matches!(pattern, Pattern::Wildcard) || i == arms.len() - 1;
+                    match pattern {
+                        Pattern::Literal(e) => {
+                            let pv = self.gen_expr(e);
+                            let pv_int = self.value_to_int(&pv);
+                            let cmp = self.builder.build_int_compare(inkwell::IntPredicate::EQ, sv_tag, pv_int, "match_cmp").unwrap();
+                            if is_last {
+                                self.builder.build_unconditional_branch(arm_bb).unwrap();
+                            } else {
+                                let next_check = self.context.append_basic_block(parent, &format!("match_check_{}", i + 1));
+                                self.builder.build_conditional_branch(cmp, arm_bb, next_check).unwrap();
+                                current_check = next_check;
+                            }
+                        }
+                        Pattern::EnumVariant { name, inner } => {
+                            let mut tag_val: u64 = 0;
+                            let mut payload_types: Vec<Type> = Vec::new();
+                            for (_, variants) in &self.enum_variants {
+                                if let Some(pos) = variants.iter().position(|(vn, _)| vn == name) {
+                                    tag_val = pos as u64;
+                                    payload_types = variants[pos].1.clone();
+                                    break;
+                                }
+                            }
+                            let pv_int = self.i64.const_int(tag_val, false);
+                            let cmp = self.builder.build_int_compare(inkwell::IntPredicate::EQ, sv_tag, pv_int, "match_cmp").unwrap();
+                            if is_last {
+                                self.builder.build_unconditional_branch(arm_bb).unwrap();
+                            } else {
+                                let next_check = self.context.append_basic_block(parent, &format!("match_check_{}", i + 1));
+                                self.builder.build_conditional_branch(cmp, arm_bb, next_check).unwrap();
+                                current_check = next_check;
+                            }
+                            if !inner.is_empty() && sv_ptr.is_some() && !payload_types.is_empty() {
+                                self.builder.position_at_end(arm_bb);
+                                for (j, pat) in inner.iter().enumerate() {
+                                    if let Pattern::Variable(vname) = pat {
+                                        let field_ptr = unsafe {
+                                            self.builder.build_gep(self.i64, sv_ptr.unwrap(), &[
+                                                self.i64.const_int((j + 1) as u64, false),
+                                            ], &format!("{}_{}", name, j)).unwrap()
+                                        };
+                                        let field_val = self.builder.build_load(self.i64, field_ptr, vname).unwrap().into_int_value();
+                                        let ptr = self.builder.build_alloca(self.i64, vname).unwrap();
+                                        self.builder.build_store(ptr, field_val).unwrap();
+                                        if matches!(payload_types.get(j), Some(Type::Float)) {
+                                            self.named.insert(vname.clone(), (ptr, "float".to_string()));
+                                        } else {
+                                            self.named.insert(vname.clone(), (ptr, "int".to_string()));
+                                        }
+                                    }
+                                }
+                                let bv = self.gen_expr(body);
+                                let bv_int = self.value_to_int(&bv);
+                                arm_values.push((bv_int, arm_bb));
+                                self.builder.build_unconditional_branch(merge).unwrap();
+                                continue;
+                            }
+                        }
+                        Pattern::Wildcard | Pattern::Variable(_) => {
+                            self.builder.build_unconditional_branch(arm_bb).unwrap();
+                        }
+                    }
+                    self.builder.position_at_end(arm_bb);
+                    if let Pattern::Variable(name) = pattern {
+                        let ptr = self.builder.build_alloca(self.i64, name).unwrap();
+                        self.builder.build_store(ptr, sv_tag).unwrap();
+                        self.named.insert(name.clone(), (ptr, "int".to_string()));
+                    }
+                    let bv = self.gen_expr(body);
+                    let bv_int = self.value_to_int(&bv);
+                    arm_values.push((bv_int, arm_bb));
+                    self.builder.build_unconditional_branch(merge).unwrap();
+                }
+                if current_check.get_terminator().is_none() {
+                    self.builder.position_at_end(current_check);
+                    self.builder.build_unconditional_branch(merge).unwrap();
+                }
+                self.builder.position_at_end(merge);
+                let phi = self.builder.build_phi(self.i64, "match_result").unwrap();
+                for (v, bb) in &arm_values {
+                    phi.add_incoming(&[(&*v, *bb)]);
+                }
+                CgValue::Int(phi.as_basic_value().into_int_value())
             }
-            Expr::If { .. } => {
-                panic!("LLVM backend: if expressions not yet supported (use if statement)");
+            Expr::If { cond, then_body, else_body } => {
+                let cond_val = self.gen_expr(cond);
+                let cond_bool = self.to_i1(&cond_val);
+
+                let fn_val = self.builder.get_insert_block().unwrap().get_parent().unwrap();
+                let then_bb = self.context.append_basic_block(fn_val, "if.then");
+                let else_bb = self.context.append_basic_block(fn_val, "if.else");
+                let merge_bb = self.context.append_basic_block(fn_val, "if.merge");
+
+                self.builder.build_conditional_branch(cond_bool, then_bb, else_bb).unwrap();
+
+                self.builder.position_at_end(then_bb);
+                let then_val = self.gen_expr(then_body);
+                let then_int = match then_val {
+                    CgValue::Int(v) => v,
+                    CgValue::Float(v) => self.builder.build_bit_cast(v, self.i64, "f2i").unwrap().into_int_value(),
+                    CgValue::Str(p) => self.builder.build_ptr_to_int(p, self.i64, "p2i").unwrap(),
+                };
+                self.builder.build_unconditional_branch(merge_bb).unwrap();
+
+                self.builder.position_at_end(else_bb);
+                let else_val = if let Some(eb) = else_body {
+                    self.gen_expr(eb)
+                } else {
+                    CgValue::Int(self.i64.const_int(0, false))
+                };
+                let else_int = match else_val {
+                    CgValue::Int(v) => v,
+                    CgValue::Float(v) => self.builder.build_bit_cast(v, self.i64, "f2i").unwrap().into_int_value(),
+                    CgValue::Str(p) => self.builder.build_ptr_to_int(p, self.i64, "p2i").unwrap(),
+                };
+                self.builder.build_unconditional_branch(merge_bb).unwrap();
+
+                self.builder.position_at_end(merge_bb);
+                let phi = self.builder.build_phi(self.i64, "if.result").unwrap();
+                phi.add_incoming(&[(&then_int, then_bb), (&else_int, else_bb)]);
+                CgValue::Int(phi.as_basic_value().into_int_value())
             }
             Expr::Range(_, _) => {
-                panic!("LLVM backend: range expressions not yet supported");
+                CgValue::Int(self.i64.const_int(0, false))
             }
-            Expr::ArrayLit(_) => {
-                panic!("LLVM backend: array literals not yet supported");
+            Expr::ArrayLit(elems) => {
+                let len = elems.len() as u64;
+                let malloc_type = self.context.ptr_type(AddressSpace::default()).fn_type(&[self.i64.into()], false);
+                let malloc_fn = self.module.get_function("malloc").unwrap_or_else(|| self.module.add_function("malloc", malloc_type, None));
+                let total = self.i64.const_int(len + 1, false);
+                let buf = self.builder.build_call(malloc_fn, &[total.into()], "arr_alloc").unwrap().try_as_basic_value().left().unwrap().into_pointer_value();
+                let buf_i64 = self.builder.build_ptr_to_int(buf, self.i64, "arr_buf").unwrap();
+                let len_ptr = self.builder.build_int_to_ptr(buf_i64, self.context.ptr_type(AddressSpace::default()), "arr_len_ptr").unwrap();
+                self.builder.build_store(len_ptr, self.i64.const_int(len, false)).unwrap();
+                for (i, elem) in elems.iter().enumerate() {
+                    let ev = self.gen_expr(elem);
+                    let ev_int = self.value_to_int(&ev);
+                    let offset = self.i64.const_int((i + 1) as u64, false);
+                    let elem_ptr = unsafe {
+                        self.builder.build_gep(self.i64, buf, &[offset], &format!("arr_{}", i)).unwrap()
+                    };
+                    self.builder.build_store(elem_ptr, ev_int).unwrap();
+                }
+                CgValue::Int(buf_i64)
             }
-            Expr::Index(_, _) => {
-                panic!("LLVM backend: array indexing not yet supported");
+            Expr::Index(arr, idx) => {
+                let arr_val = self.gen_expr(arr);
+                let arr_ptr_val = self.value_to_int(&arr_val);
+                let arr_ptr = self.builder.build_int_to_ptr(arr_ptr_val, self.context.ptr_type(AddressSpace::default()), "arr_ptr").unwrap();
+                let idx_val = self.gen_expr(idx);
+                let idx_int = self.value_to_int(&idx_val);
+                let elem_offset = self.builder.build_int_add(idx_int, self.i64.const_int(1, false), "elem_off").unwrap();
+                let elem_ptr = unsafe {
+                    self.builder.build_gep(self.i64, arr_ptr, &[elem_offset], "elem_ptr").unwrap()
+                };
+                CgValue::Int(self.builder.build_load(self.i64, elem_ptr, "arr_elem").unwrap().into_int_value())
             }
+        }
+    }
+
+    fn gen_string_concat(&self, a: PointerValue<'ctx>, b: PointerValue<'ctx>) -> CgValue<'ctx> {
+        let strlen_type = self.i64.fn_type(&[self.context.ptr_type(AddressSpace::default()).into()], false);
+        let strlen_fn = self.module.get_function("strlen").unwrap_or_else(|| self.module.add_function("strlen", strlen_type, None));
+
+        let malloc_type = self.context.ptr_type(AddressSpace::default()).fn_type(&[self.i64.into()], false);
+        let malloc_fn = self.module.get_function("malloc").unwrap_or_else(|| self.module.add_function("malloc", malloc_type, None));
+
+        let memcpy_type = self.context.void_type().fn_type(&[
+            self.context.ptr_type(AddressSpace::default()).into(),
+            self.context.ptr_type(AddressSpace::default()).into(),
+            self.i64.into(),
+        ], false);
+        let memcpy_fn = self.module.get_function("memcpy").unwrap_or_else(|| self.module.add_function("memcpy", memcpy_type, None));
+
+        let len_a = self.builder.build_call(strlen_fn, &[a.into()], "len_a").unwrap().try_as_basic_value().left().unwrap().into_int_value();
+        let len_b = self.builder.build_call(strlen_fn, &[b.into()], "len_b").unwrap().try_as_basic_value().left().unwrap().into_int_value();
+        let total = self.builder.build_int_add(len_a, len_b, "total_len").unwrap();
+        let total_plus1 = self.builder.build_int_add(total, self.i64.const_int(1, false), "total1").unwrap();
+        let buf = self.builder.build_call(malloc_fn, &[total_plus1.into()], "buf").unwrap().try_as_basic_value().left().unwrap().into_pointer_value();
+        self.builder.build_call(memcpy_fn, &[buf.into(), a.into(), len_a.into()], "cp_a").unwrap();
+        let offset = unsafe { self.builder.build_gep(self.i8, buf, &[len_a], "offset").unwrap() };
+        self.builder.build_call(memcpy_fn, &[offset.into(), b.into(), self.builder.build_int_add(len_b, self.i64.const_int(1, false), "nb1").unwrap().into()], "cp_b").unwrap();
+        CgValue::Str(buf)
+    }
+
+    fn value_to_int(&self, v: &CgValue<'ctx>) -> IntValue<'ctx> {
+        match v {
+            CgValue::Int(val) => *val,
+            CgValue::Float(val) => self.builder.build_bit_cast(*val, self.i64, "f2i").unwrap().into_int_value(),
+            CgValue::Str(p) => self.builder.build_ptr_to_int(*p, self.i64, "p2i").unwrap(),
         }
     }
 
@@ -267,6 +618,9 @@ impl<'ctx> Codegen<'ctx> {
         if *terminated { return; }
         match s {
             Stmt::Let { name, value, .. } => {
+                if let Expr::StructLit { name: struct_name, .. } = &value {
+                    self.var_struct_type.insert(name.clone(), struct_name.clone());
+                }
                 let v = self.gen_expr(value);
                 let (ptr, ty_name) = match &v {
                     CgValue::Str(p) => {
@@ -302,8 +656,14 @@ impl<'ctx> Codegen<'ctx> {
                         let v = self.gen_expr(x);
                         match v {
                             CgValue::Int(v) => { self.builder.build_return(Some(&v)).unwrap(); }
-                            CgValue::Float(v) => { self.builder.build_return(Some(&v)).unwrap(); }
-                            _ => panic!("only int/float return supported"),
+                            CgValue::Float(v) => {
+                                let as_i64 = self.builder.build_bit_cast(v, self.i64, "f2i_ret").unwrap().into_int_value();
+                                self.builder.build_return(Some(&as_i64)).unwrap();
+                            }
+                            CgValue::Str(p) => {
+                                let p_int = self.builder.build_ptr_to_int(p, self.i64, "str_ret").unwrap();
+                                self.builder.build_return(Some(&p_int)).unwrap();
+                            }
                         }
                     }
                     None => { self.builder.build_return(None).unwrap(); }
@@ -427,52 +787,269 @@ impl<'ctx> Codegen<'ctx> {
     }
 }
 
+fn expand_macros_in_expr(expr: &Expr, macros: &HashMap<String, (Vec<String>, Vec<Stmt>)>) -> Expr {
+    if let Expr::Call(callee, args) = expr {
+        if let Expr::Ident(name) = callee.as_ref() {
+            if let Some((params, body)) = macros.get(name) {
+                let mut arg_map: HashMap<String, Expr> = HashMap::new();
+                for (i, p) in params.iter().enumerate() {
+                    arg_map.insert(p.clone(), args[i].clone());
+                }
+                if body.len() == 1 {
+                    if let Stmt::Expr(e) = &body[0] {
+                        return substitute_expr(e, &arg_map, macros);
+                    }
+                    if let Stmt::Return(Some(e)) = &body[0] {
+                        return substitute_expr(e, &arg_map, macros);
+                    }
+                }
+                return expr.clone();
+            }
+        }
+    }
+    match expr {
+        Expr::Binary(l, op, r) => Expr::Binary(Box::new(expand_macros_in_expr(l, macros)), op.clone(), Box::new(expand_macros_in_expr(r, macros))),
+        Expr::Call(callee, args) => Expr::Call(Box::new(expand_macros_in_expr(callee, macros)), args.iter().map(|a| expand_macros_in_expr(a, macros)).collect()),
+        Expr::If { cond, then_body, else_body } => Expr::If {
+            cond: Box::new(expand_macros_in_expr(cond, macros)),
+            then_body: Box::new(expand_macros_in_expr(then_body, macros)),
+            else_body: else_body.as_ref().map(|e| Box::new(expand_macros_in_expr(e, macros))),
+        },
+        Expr::FieldAccess(obj, field) => Expr::FieldAccess(Box::new(expand_macros_in_expr(obj, macros)), field.clone()),
+        Expr::MethodCall(obj, method, args) => Expr::MethodCall(Box::new(expand_macros_in_expr(obj, macros)), method.clone(), args.iter().map(|a| expand_macros_in_expr(a, macros)).collect()),
+        Expr::Index(arr, idx) => Expr::Index(Box::new(expand_macros_in_expr(arr, macros)), Box::new(expand_macros_in_expr(idx, macros))),
+        Expr::StructLit { name, fields } => Expr::StructLit { name: name.clone(), fields: fields.iter().map(|(n, e)| (n.clone(), expand_macros_in_expr(e, macros))).collect() },
+        Expr::Match { scrutinee, arms } => Expr::Match { scrutinee: Box::new(expand_macros_in_expr(scrutinee, macros)), arms: arms.iter().map(|(p, e)| (p.clone(), expand_macros_in_expr(e, macros))).collect() },
+        _ => expr.clone(),
+    }
+}
+
+fn substitute_expr(expr: &Expr, arg_map: &HashMap<String, Expr>, macros: &HashMap<String, (Vec<String>, Vec<Stmt>)>) -> Expr {
+    match expr {
+        Expr::Ident(name) => {
+            if let Some(val) = arg_map.get(name) {
+                val.clone()
+            } else {
+                Expr::Ident(name.clone())
+            }
+        }
+        Expr::Binary(l, op, r) => Expr::Binary(
+            Box::new(substitute_expr(l, arg_map, macros)),
+            op.clone(),
+            Box::new(substitute_expr(r, arg_map, macros)),
+        ),
+        Expr::Call(callee, args) => {
+            let expanded = Expr::Call(
+                Box::new(substitute_expr(callee, arg_map, macros)),
+                args.iter().map(|a| substitute_expr(a, arg_map, macros)).collect(),
+            );
+            expand_macros_in_expr(&expanded, macros)
+        }
+        Expr::If { cond, then_body, else_body } => Expr::If {
+            cond: Box::new(substitute_expr(cond, arg_map, macros)),
+            then_body: Box::new(substitute_expr(then_body, arg_map, macros)),
+            else_body: else_body.as_ref().map(|e| Box::new(substitute_expr(e, arg_map, macros))),
+        },
+        Expr::FieldAccess(obj, field) => Expr::FieldAccess(Box::new(substitute_expr(obj, arg_map, macros)), field.clone()),
+        Expr::MethodCall(obj, method, args) => Expr::MethodCall(
+            Box::new(substitute_expr(obj, arg_map, macros)),
+            method.clone(),
+            args.iter().map(|a| substitute_expr(a, arg_map, macros)).collect(),
+        ),
+        Expr::Index(arr, idx) => Expr::Index(
+            Box::new(substitute_expr(arr, arg_map, macros)),
+            Box::new(substitute_expr(idx, arg_map, macros)),
+        ),
+        Expr::StructLit { name, fields } => Expr::StructLit {
+            name: name.clone(),
+            fields: fields.iter().map(|(n, e)| (n.clone(), substitute_expr(e, arg_map, macros))).collect(),
+        },
+        Expr::Match { scrutinee, arms } => Expr::Match {
+            scrutinee: Box::new(substitute_expr(scrutinee, arg_map, macros)),
+            arms: arms.iter().map(|(p, e)| (p.clone(), substitute_expr(e, arg_map, macros))).collect(),
+        },
+        Expr::Range(l, r) => Expr::Range(
+            Box::new(substitute_expr(l, arg_map, macros)),
+            Box::new(substitute_expr(r, arg_map, macros)),
+        ),
+        Expr::ArrayLit(elems) => Expr::ArrayLit(elems.iter().map(|e| substitute_expr(e, arg_map, macros)).collect()),
+        _ => expr.clone(),
+    }
+}
+
+fn expand_macros_program(program: &Program) -> Program {
+    let mut macros: HashMap<String, (Vec<String>, Vec<Stmt>)> = HashMap::new();
+    for s in &program.stmts {
+        if let Stmt::Macro { name, params, body } = s {
+            macros.insert(name.clone(), (params.clone(), body.clone()));
+        }
+    }
+    if macros.is_empty() {
+        return program.clone();
+    }
+    let mut new_stmts = Vec::new();
+    for s in &program.stmts {
+        match s {
+            Stmt::Macro { .. } => {}
+            Stmt::Fn { name, generics, params, ret, body } => {
+                let new_body: Vec<Stmt> = body.iter().map(|s| expand_macros_in_stmt(s, &macros)).collect();
+                new_stmts.push(Stmt::Fn { name: name.clone(), generics: generics.clone(), params: params.clone(), ret: ret.clone(), body: new_body });
+            }
+            Stmt::Expr(e) => { new_stmts.push(Stmt::Expr(expand_macros_in_expr(e, &macros))); }
+            Stmt::Let { name, ty, value } => { new_stmts.push(Stmt::Let { name: name.clone(), ty: ty.clone(), value: expand_macros_in_expr(value, &macros) }); }
+            Stmt::Assign { name, value } => { new_stmts.push(Stmt::Assign { name: name.clone(), value: expand_macros_in_expr(value, &macros) }); }
+            Stmt::Return(e) => { new_stmts.push(Stmt::Return(e.as_ref().map(|e| expand_macros_in_expr(e, &macros)))); }
+            Stmt::While { cond, body } => {
+                let new_body: Vec<Stmt> = body.iter().map(|s| expand_macros_in_stmt(s, &macros)).collect();
+                new_stmts.push(Stmt::While { cond: expand_macros_in_expr(cond, &macros), body: new_body });
+            }
+            Stmt::For { var, iter, body } => {
+                let new_body: Vec<Stmt> = body.iter().map(|s| expand_macros_in_stmt(s, &macros)).collect();
+                new_stmts.push(Stmt::For { var: var.clone(), iter: expand_macros_in_expr(iter, &macros), body: new_body });
+            }
+            Stmt::If { cond, then_body, else_body } => {
+                let new_then: Vec<Stmt> = then_body.iter().map(|s| expand_macros_in_stmt(s, &macros)).collect();
+                let new_else = else_body.as_ref().map(|v| v.iter().map(|s| expand_macros_in_stmt(s, &macros)).collect());
+                new_stmts.push(Stmt::If { cond: expand_macros_in_expr(cond, &macros), then_body: new_then, else_body: new_else });
+            }
+            _ => new_stmts.push(s.clone()),
+        }
+    }
+    Program { stmts: new_stmts }
+}
+
+fn expand_macros_in_stmt(stmt: &Stmt, macros: &HashMap<String, (Vec<String>, Vec<Stmt>)>) -> Stmt {
+    match stmt {
+        Stmt::Expr(e) => Stmt::Expr(expand_macros_in_expr(e, macros)),
+        Stmt::Let { name, ty, value } => Stmt::Let { name: name.clone(), ty: ty.clone(), value: expand_macros_in_expr(value, macros) },
+        Stmt::Assign { name, value } => Stmt::Assign { name: name.clone(), value: expand_macros_in_expr(value, macros) },
+        Stmt::Return(e) => Stmt::Return(e.as_ref().map(|e| expand_macros_in_expr(e, macros))),
+        Stmt::While { cond, body } => {
+            let new_body: Vec<Stmt> = body.iter().map(|s| expand_macros_in_stmt(s, macros)).collect();
+            Stmt::While { cond: expand_macros_in_expr(cond, macros), body: new_body }
+        }
+        Stmt::For { var, iter, body } => {
+            let new_body: Vec<Stmt> = body.iter().map(|s| expand_macros_in_stmt(s, macros)).collect();
+            Stmt::For { var: var.clone(), iter: expand_macros_in_expr(iter, macros), body: new_body }
+        }
+        Stmt::If { cond, then_body, else_body } => {
+            let new_then: Vec<Stmt> = then_body.iter().map(|s| expand_macros_in_stmt(s, macros)).collect();
+            let new_else = else_body.as_ref().map(|v| v.iter().map(|s| expand_macros_in_stmt(s, macros)).collect());
+            Stmt::If { cond: expand_macros_in_expr(cond, macros), then_body: new_then, else_body: new_else }
+        }
+        _ => stmt.clone(),
+    }
+}
+
 /// Compile a program to a native executable at `out_path` using LLVM + system
 /// toolchain (llc / clang).
 pub fn compile_to_executable(program: &Program, out_path: &str) {
+    let program = expand_macros_program(program);
     let context = Context::create();
     let mut cg = Codegen::new(&context);
 
-    // Pre-declare all functions
+    // Register struct fields and enum variants
     for s in &program.stmts {
-        if let Stmt::Fn { name, params, ret, .. } = s {
-            let param_types: Vec<BasicMetadataTypeEnum> = params.iter().map(|_| cg.i64.into()).collect();
-            let fn_type = if matches!(ret, Type::Unit) {
-                context.void_type().fn_type(&param_types, false)
-            } else {
-                cg.i64.fn_type(&param_types, false)
-            };
-            let func = cg.module.add_function(name, fn_type, None);
-            cg.functions.insert(name.clone(), func);
+        match s {
+            Stmt::Struct { name, fields, .. } => {
+                cg.struct_fields.insert(name.clone(), fields.iter().map(|(n, _)| n.clone()).collect());
+            }
+            Stmt::Enum { name, variants } => {
+                cg.enum_variants.insert(name.clone(), variants.clone());
+            }
+            _ => {}
+        }
+    }
+
+    // Pre-declare all functions (including impl methods)
+    for s in &program.stmts {
+        match s {
+            Stmt::Fn { name, params, ret, .. } => {
+                let param_types: Vec<BasicMetadataTypeEnum> = params.iter().map(|_| cg.i64.into()).collect();
+                let fn_type = if matches!(ret, Type::Unit) {
+                    context.void_type().fn_type(&param_types, false)
+                } else {
+                    cg.i64.fn_type(&param_types, false)
+                };
+                let func = cg.module.add_function(name, fn_type, None);
+                cg.functions.insert(name.clone(), func);
+                cg.fn_ret_types.insert(name.clone(), ret.clone());
+            }
+            Stmt::Impl { methods, .. } => {
+                for m in methods {
+                    if let Stmt::Fn { name, params, ret, .. } = m {
+                        let param_types: Vec<BasicMetadataTypeEnum> = params.iter().map(|_| cg.i64.into()).collect();
+                        let fn_type = if matches!(ret, Type::Unit) {
+                            context.void_type().fn_type(&param_types, false)
+                        } else {
+                            cg.i64.fn_type(&param_types, false)
+                        };
+                        let func = cg.module.add_function(name, fn_type, None);
+                        cg.functions.insert(name.clone(), func);
+                        cg.fn_ret_types.insert(name.clone(), ret.clone());
+                    }
+                }
+            }
+            _ => {}
         }
     }
 
     // Generate function bodies
     for s in &program.stmts {
-        if let Stmt::Fn { params, body, ret, .. } = s {
-            let name = if let Stmt::Fn { name, .. } = s { name } else { unreachable!() };
-            let func = cg.functions[name];
-            let entry = context.append_basic_block(func, "entry");
-            cg.builder.position_at_end(entry);
-            cg.named.clear();
+        match s {
+            Stmt::Fn { params, body, ret, .. } => {
+                let name = if let Stmt::Fn { name, .. } = s { name } else { unreachable!() };
+                let func = cg.functions[name];
+                let entry = context.append_basic_block(func, "entry");
+                cg.builder.position_at_end(entry);
+                cg.named.clear();
 
-            let mut terminated = false;
-            for (i, (pname, _)) in params.iter().enumerate() {
-                let ptr = cg.builder.build_alloca(cg.i64, pname).unwrap();
-                let arg = func.get_nth_param(i as u32).unwrap().into_int_value();
-                cg.builder.build_store(ptr, arg).unwrap();
-                cg.named.insert(pname.clone(), (ptr, "int".to_string()));
-            }
-            for s in body {
-                cg.gen_stmt(s, func, &mut terminated);
-            }
-            if !terminated {
-                if matches!(ret, Type::Unit) {
-                    cg.builder.build_return(None).unwrap();
-                } else {
-                    cg.builder.build_return(Some(&cg.i64.const_int(0, false))).unwrap();
+                let mut terminated = false;
+                for (i, (pname, _)) in params.iter().enumerate() {
+                    let ptr = cg.builder.build_alloca(cg.i64, pname).unwrap();
+                    let arg = func.get_nth_param(i as u32).unwrap().into_int_value();
+                    cg.builder.build_store(ptr, arg).unwrap();
+                    cg.named.insert(pname.clone(), (ptr, "int".to_string()));
+                }
+                for s in body {
+                    cg.gen_stmt(s, func, &mut terminated);
+                }
+                if !terminated {
+                    if matches!(ret, Type::Unit) {
+                        cg.builder.build_return(None).unwrap();
+                    } else {
+                        cg.builder.build_return(Some(&cg.i64.const_int(0, false))).unwrap();
+                    }
                 }
             }
+            Stmt::Impl { methods, .. } => {
+                for m in methods {
+                    if let Stmt::Fn { name, params, body, ret, .. } = m {
+                        let func = cg.functions[name];
+                        let entry = context.append_basic_block(func, "entry");
+                        cg.builder.position_at_end(entry);
+                        cg.named.clear();
+                        let mut terminated = false;
+                        for (i, (pname, _)) in params.iter().enumerate() {
+                            let ptr = cg.builder.build_alloca(cg.i64, pname).unwrap();
+                            let arg = func.get_nth_param(i as u32).unwrap().into_int_value();
+                            cg.builder.build_store(ptr, arg).unwrap();
+                            cg.named.insert(pname.clone(), (ptr, "int".to_string()));
+                        }
+                        for s in body {
+                            cg.gen_stmt(s, func, &mut terminated);
+                        }
+                        if !terminated {
+                            if matches!(ret, Type::Unit) {
+                                cg.builder.build_return(None).unwrap();
+                            } else {
+                                cg.builder.build_return(Some(&cg.i64.const_int(0, false))).unwrap();
+                            }
+                        }
+                    }
+                }
+            }
+            _ => {}
         }
     }
 
@@ -510,9 +1087,11 @@ pub fn compile_to_executable(program: &Program, out_path: &str) {
 
     let status = Command::new(&llc)
         .args([&ll_path, "-filetype=obj", "-o", &obj_path])
-        .status()
+        .output()
         .expect("failed to run llc");
-    if !status.success() {
+    if !status.status.success() {
+        eprintln!("LLVM IR:\n{}", ir);
+        eprintln!("llc stderr:\n{}", String::from_utf8_lossy(&status.stderr));
         panic!("llc failed");
     }
 
