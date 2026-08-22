@@ -169,10 +169,22 @@ impl TypeChecker {
                 Self::check_expr(cond, env)?;
                 for s in body { Self::check_stmt(s, env)?; }
             }
+            Stmt::For { var, iter, body } => {
+                Self::check_expr(iter, env)?;
+                env.push_scope();
+                env.define(var, Type::Int);
+                for s in body { Self::check_stmt(s, env)?; }
+                env.pop_scope();
+            }
             Stmt::Break => {}
+            Stmt::Continue => {}
             Stmt::Assign { name, value } => {
-                let _ = name;
-                Self::check_expr(value, env)?;
+                let val_ty = Self::check_expr(value, env)?;
+                if let Some(var_ty) = env.lookup(name) {
+                    if var_ty != val_ty {
+                        return Err(TypeError::TypeMismatch { expected: format!("{:?}", var_ty), found: format!("{:?}", val_ty) });
+                    }
+                }
             }
             Stmt::If { cond, then_body, else_body } => {
                 Self::check_expr(cond, env)?;
@@ -221,7 +233,7 @@ impl TypeChecker {
                 let rt = Self::check_expr(r, env)?;
                 if lt != rt { return Err(TypeError::TypeMismatch { expected: format!("{:?}", lt), found: format!("{:?}", rt) }); }
                 match op {
-                    BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div => Ok(lt),
+                    BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Mod => Ok(lt),
                     BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge => Ok(Type::Bool),
                 }
             }
@@ -321,6 +333,14 @@ impl TypeChecker {
                 } else {
                     Ok(Type::Unit)
                 }
+            }
+            Expr::Range(a, b) => {
+                let at = Self::check_expr(a, env)?;
+                let bt = Self::check_expr(b, env)?;
+                if at != Type::Int || bt != Type::Int {
+                    return Err(TypeError::TypeMismatch { expected: "int".into(), found: format!("{:?}", if at != Type::Int { at } else { bt }) });
+                }
+                Ok(Type::Int)
             }
         }
     }

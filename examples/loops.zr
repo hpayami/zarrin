@@ -1,0 +1,41 @@
+// Zarrin: for loops, continue, break, ranges, type annotations
+fn sum_to(n: int) -> int {
+    let total = 0;
+    for i in 1..n + 1 {
+        total = total + i;
+    }
+    return total;
+}
+
+fn is_prime(n: int) -> bool {
+    if n < 2 {
+        return false;
+    }
+    let i = 2;
+    while i * i <= n {
+        if n % i == 0 {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+fn main() {
+    // Type annotations
+    let x: int = 42;
+    let msg: string = "fibonacci primes under 50:";
+    print(msg);
+
+    // For loop with range
+    print(sum_to(100));
+
+    // While + break + modulo
+    let i = 2;
+    while i < 50 {
+        if is_prime(i) {
+            print(i);
+        }
+        i = i + 1;
+    }
+}

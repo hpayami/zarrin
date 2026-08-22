@@ -24,6 +24,8 @@ pub enum Token {
     Else,
     While,
     Break,
+    Continue,
+    In,
     // symbols
     Colon,
     ColonColon,
@@ -32,6 +34,7 @@ pub enum Token {
     Minus,
     Star,
     Slash,
+    Percent,
     Eq,
     Ne,
     Lt,
@@ -46,6 +49,7 @@ pub enum Token {
     Comma,
     Arrow,
     FatArrow,
+    DotDot,
     Semicolon,
     Eof,
 }
@@ -102,6 +106,7 @@ impl<'a> Lexer<'a> {
                 }
                 '*' => Token::Star,
                 '/' => Token::Slash,
+                '%' => Token::Percent,
                 '(' => Token::LParen,
                 ')' => Token::RParen,
                 '{' => Token::LBrace,
@@ -151,7 +156,14 @@ impl<'a> Lexer<'a> {
                         Token::Colon
                     }
                 }
-                '.' => Token::Dot,
+                '.' => {
+                    if self.chars.peek() == Some(&'.') {
+                        self.chars.next();
+                        Token::DotDot
+                    } else {
+                        Token::Dot
+                    }
+                }
                 '"' => {
                     let mut s = String::new();
                     while let Some(&ch) = self.chars.peek() {
@@ -173,6 +185,11 @@ impl<'a> Lexer<'a> {
                             num.push(n);
                             self.chars.next();
                         } else if n == '.' && !is_float {
+                            let mut it = self.chars.clone();
+                            it.next();
+                            if it.peek() == Some(&'.') {
+                                break;
+                            }
                             is_float = true;
                             num.push(n);
                             self.chars.next();
@@ -213,6 +230,8 @@ impl<'a> Lexer<'a> {
                         "else" => Token::Else,
                         "while" => Token::While,
                         "break" => Token::Break,
+                        "continue" => Token::Continue,
+                        "in" => Token::In,
                         "true" => Token::Bool(true),
                         "false" => Token::Bool(false),
                         _ => Token::Ident(id),

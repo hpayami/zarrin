@@ -14,6 +14,7 @@ enum Value {
     Fn(String),
     Struct { name: String, fields: HashMap<String, Value> },
     EnumVariant { enum_name: String, variant: String, args: Vec<Value> },
+    Range(i64, i64),
 }
 
 struct Env {
@@ -42,6 +43,7 @@ pub struct Interpreter {
     fns: HashMap<String, Stmt>,
     returned: Option<Value>,
     should_break: bool,
+    should_continue: bool,
 }
 
 impl Interpreter {
@@ -50,7 +52,7 @@ impl Interpreter {
         for s in &program.stmts {
             if let Stmt::Fn { name, .. } = s { fns.insert(name.clone(), s.clone()); }
         }
-        Interpreter { fns, returned: None, should_break: false }
+        Interpreter { fns, returned: None, should_break: false, should_continue: false }
     }
 
     pub fn run(&mut self, program: &Program) {
@@ -94,11 +96,48 @@ impl Interpreter {
                     for s in body {
                         self.eval_stmt(s, env);
                         if self.returned.is_some() { return; }
+                        if self.should_continue { self.should_continue = false; break; }
                         if self.should_break { self.should_break = false; break; }
                     }
+                    if self.should_break { self.should_break = false; break; }
+                }
+            }
+            Stmt::For { var, iter, body } => {
+                let iter_val = self.eval_expr(iter, env);
+                match iter_val {
+                    Value::Range(start, end) => {
+                        let mut i = start;
+                        while i < end {
+                            env.set(var, Value::Int(i));
+                            for s in body {
+                                self.eval_stmt(s, env);
+                                if self.returned.is_some() { return; }
+                                if self.should_continue { self.should_continue = false; break; }
+                                if self.should_break { self.should_break = false; break; }
+                            }
+                            if self.should_break { self.should_break = false; break; }
+                            i += 1;
+                        }
+                    }
+                    Value::Int(n) => {
+                        let mut i = 0;
+                        while i < n {
+                            env.set(var, Value::Int(i));
+                            for s in body {
+                                self.eval_stmt(s, env);
+                                if self.returned.is_some() { return; }
+                                if self.should_continue { self.should_continue = false; break; }
+                                if self.should_break { self.should_break = false; break; }
+                            }
+                            if self.should_break { self.should_break = false; break; }
+                            i += 1;
+                        }
+                    }
+                    _ => panic!("for loop requires int or range"),
                 }
             }
             Stmt::Break => { self.should_break = true; return; }
+            Stmt::Continue => { self.should_continue = true; return; }
             Stmt::Assign { name, value } => {
                 let v = self.eval_expr(value, env);
                 env.set(name, v);
@@ -219,6 +258,14 @@ impl Interpreter {
                     Value::Unit
                 }
             }
+            Expr::Range(a, b) => {
+                let av = self.eval_expr(a, env);
+                let bv = self.eval_expr(b, env);
+                match (av, bv) {
+                    (Value::Int(a), Value::Int(b)) => Value::Range(a, b),
+                    _ => panic!("range requires two ints"),
+                }
+            }
         }
     }
 
@@ -289,7 +336,7 @@ fn eval_binop(l: &Value, op: &BinOp, r: &Value) -> Value {
     match (l, r) {
         (Value::Int(a), Value::Int(b)) => match op {
             BinOp::Add => Value::Int(a + b), BinOp::Sub => Value::Int(a - b),
-            BinOp::Mul => Value::Int(a * b), BinOp::Div => Value::Int(a / b),
+            BinOp::Mul => Value::Int(a * b), BinOp::Div => Value::Int(a / b), BinOp::Mod => Value::Int(a % b),
             BinOp::Eq => Value::Bool(a == b), BinOp::Ne => Value::Bool(a != b),
             BinOp::Lt => Value::Bool(a < b), BinOp::Le => Value::Bool(a <= b),
             BinOp::Gt => Value::Bool(a > b), BinOp::Ge => Value::Bool(a >= b),
@@ -344,5 +391,6 @@ fn value_to_string(v: &Value) -> String {
                 format!("{}({})", variant, as_.join(", "))
             }
         }
+        Value::Range(a, b) => format!("{}..{}", a, b),
     }
 }

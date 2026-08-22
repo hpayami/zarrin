@@ -80,10 +80,31 @@ impl<'a> Parser<'a> {
                 self.expect(Token::RBrace);
                 Stmt::While { cond, body }
             }
+            Token::For => {
+                self.advance(); // for
+                let var = match self.advance() {
+                    Token::Ident(n) => n,
+                    t => panic!("expected variable name after for, found {:?}", t),
+                };
+                self.expect(Token::In);
+                let iter = self.parse_expr();
+                self.expect(Token::LBrace);
+                let mut body = Vec::new();
+                while self.current != Token::RBrace {
+                    body.push(self.parse_stmt());
+                }
+                self.expect(Token::RBrace);
+                Stmt::For { var, iter, body }
+            }
             Token::Break => {
                 self.advance();
                 self.expect(Token::Semicolon);
                 Stmt::Break
+            }
+            Token::Continue => {
+                self.advance();
+                self.expect(Token::Semicolon);
+                Stmt::Continue
             }
             Token::Return => {
                 self.advance();
@@ -141,10 +162,16 @@ impl<'a> Parser<'a> {
             Token::Ident(n) => n,
             t => panic!("expected identifier after let, found {:?}", t),
         };
+        let ty = if self.current == Token::Colon {
+            self.advance();
+            self.parse_type()
+        } else {
+            Type::Inferred
+        };
         self.expect(Token::Assign);
         let value = self.parse_expr();
         self.expect(Token::Semicolon);
-        Stmt::Let { name, ty: Type::Inferred, value }
+        Stmt::Let { name, ty, value }
     }
 
     fn parse_fn(&mut self) -> Stmt {
@@ -446,7 +473,7 @@ impl<'a> Parser<'a> {
     }
 
     pub fn parse_expr(&mut self) -> Expr {
-        self.parse_binop(0)
+        self.parse_range()
     }
 
     fn parse_binop(&mut self, min_prec: u8) -> Expr {
@@ -457,6 +484,7 @@ impl<'a> Parser<'a> {
                 Token::Minus => (1, BinOp::Sub),
                 Token::Star => (2, BinOp::Mul),
                 Token::Slash => (2, BinOp::Div),
+                Token::Percent => (2, BinOp::Mod),
                 Token::Eq => (0, BinOp::Eq),
                 Token::Ne => (0, BinOp::Ne),
                 Token::Lt => (0, BinOp::Lt),
@@ -471,6 +499,16 @@ impl<'a> Parser<'a> {
             self.advance();
             let right = self.parse_binop(prec + 1);
             left = Expr::Binary(Box::new(left), op, Box::new(right));
+        }
+        left
+    }
+
+    fn parse_range(&mut self) -> Expr {
+        let mut left = self.parse_binop(0);
+        if self.current == Token::DotDot {
+            self.advance();
+            let right = self.parse_binop(0);
+            left = Expr::Range(Box::new(left), Box::new(right));
         }
         left
     }
