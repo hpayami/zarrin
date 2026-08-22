@@ -244,13 +244,40 @@ impl<'ctx> Codegen<'ctx> {
                         _ => panic!("len supports strings and arrays"),
                     };
                 }
-                if name == "to_string" {
-                    return CgValue::Int(self.i64.const_int(0, false));
-                }
                 if name == "int_to_str" {
-                    return CgValue::Int(self.i64.const_int(0, false));
+                    let val = self.gen_expr(&args[0]);
+                    let int_val = self.value_to_int(&val);
+                    let str_ptr = self.gen_int_to_str(int_val);
+                    return CgValue::Str(str_ptr);
+                }
+                if name == "to_string" {
+                    let val = self.gen_expr(&args[0]);
+                    match &val {
+                        CgValue::Int(i) => {
+                            let str_ptr = self.gen_int_to_str(*i);
+                            return CgValue::Str(str_ptr);
+                        }
+                        CgValue::Str(s) => return val,
+                        CgValue::Float(f) => {
+                            let str_ptr = self.gen_float_to_str(*f);
+                            return CgValue::Str(str_ptr);
+                        }
+                    }
                 }
                 if name == "panic" {
+                    let val = self.gen_expr(&args[0]);
+                    let str_ptr = match &val {
+                        CgValue::Str(s) => *s,
+                        _ => {
+                            let int_val = self.value_to_int(&val);
+                            self.gen_int_to_str(int_val)
+                        }
+                    };
+                    let fmt = self.builder.build_global_string_ptr("%s\n", "panic_fmt").unwrap().as_pointer_value();
+                    self.builder.build_call(self.printf, &[fmt.into(), str_ptr.into()], "panic_str").unwrap();
+                    let abort_type = self.context.void_type().fn_type(&[], false);
+                    let abort_fn = self.module.get_function("exit").unwrap_or_else(|| self.module.add_function("exit", abort_type, None));
+                    self.builder.build_call(abort_fn, &[self.i64.const_int(1, false).into()], "panic_exit").unwrap();
                     return CgValue::Int(self.i64.const_int(0, false));
                 }
                 if name == "array_len" {
@@ -715,6 +742,27 @@ Expr::Match { scrutinee, arms } => {
         result_ptr
     }
 
+    fn gen_float_to_str(&self, val: FloatValue<'ctx>) -> PointerValue<'ctx> {
+        let malloc_type = self.context.ptr_type(AddressSpace::default()).fn_type(&[self.i64.into()], false);
+        let malloc_fn = self.module.get_function("malloc").unwrap_or_else(|| self.module.add_function("malloc", malloc_type, None));
+        let buf = self.builder.build_call(malloc_fn, &[self.i64.const_int(64, false).into()], "float_buf").unwrap().try_as_basic_value().left().unwrap().into_pointer_value();
+
+        let byte_ptr_ty = self.i8.ptr_type(AddressSpace::default());
+        let byte_ptr = self.builder.build_bit_cast(buf, byte_ptr_ty, "float_byte_ptr").unwrap().into_pointer_value();
+
+        let sprintf_type = self.i64.fn_type(&[
+            byte_ptr_ty.into(),
+            byte_ptr_ty.into(),
+        ], true);
+        let sprintf_fn = self.module.get_function("sprintf").unwrap_or_else(|| self.module.add_function("sprintf", sprintf_type, None));
+
+        let fmt = self.builder.build_global_string_ptr("%.6f", "float_fmt").unwrap().as_pointer_value();
+
+        self.builder.build_call(sprintf_fn, &[byte_ptr.into(), fmt.into(), val.into()], "call_sprintf").unwrap();
+
+        buf
+    }
+
     fn value_to_int(&self, v: &CgValue<'ctx>) -> IntValue<'ctx> {
         match v {
             CgValue::Int(val) => *val,
@@ -1046,7 +1094,7 @@ fn expand_macros_program(program: &Program) -> Program {
         match s {
             Stmt::Macro { .. } => {}
             Stmt::Fn { name, generics, params, ret, body } => {
-                let new_body: Vec<Stmt> = body.iter().map(|s| expand_macros_in_stmt(s, &macros)).collect();
+                let new_body: Vec<Stmt> = body.iter().flat_map(|s| expand_macros_in_stmt(s, &macros)).collect();
                 new_stmts.push(Stmt::Fn { name: name.clone(), generics: generics.clone(), params: params.clone(), ret: ret.clone(), body: new_body });
             }
             Stmt::Expr(e) => { new_stmts.push(Stmt::Expr(expand_macros_in_expr(e, &macros))); }
@@ -1054,16 +1102,16 @@ fn expand_macros_program(program: &Program) -> Program {
             Stmt::Assign { name, value } => { new_stmts.push(Stmt::Assign { name: name.clone(), value: expand_macros_in_expr(value, &macros) }); }
             Stmt::Return(e) => { new_stmts.push(Stmt::Return(e.as_ref().map(|e| expand_macros_in_expr(e, &macros)))); }
             Stmt::While { cond, body } => {
-                let new_body: Vec<Stmt> = body.iter().map(|s| expand_macros_in_stmt(s, &macros)).collect();
+                let new_body: Vec<Stmt> = body.iter().flat_map(|s| expand_macros_in_stmt(s, &macros)).collect();
                 new_stmts.push(Stmt::While { cond: expand_macros_in_expr(cond, &macros), body: new_body });
             }
             Stmt::For { var, iter, body } => {
-                let new_body: Vec<Stmt> = body.iter().map(|s| expand_macros_in_stmt(s, &macros)).collect();
+                let new_body: Vec<Stmt> = body.iter().flat_map(|s| expand_macros_in_stmt(s, &macros)).collect();
                 new_stmts.push(Stmt::For { var: var.clone(), iter: expand_macros_in_expr(iter, &macros), body: new_body });
             }
             Stmt::If { cond, then_body, else_body } => {
-                let new_then: Vec<Stmt> = then_body.iter().map(|s| expand_macros_in_stmt(s, &macros)).collect();
-                let new_else = else_body.as_ref().map(|v| v.iter().map(|s| expand_macros_in_stmt(s, &macros)).collect());
+                let new_then: Vec<Stmt> = then_body.iter().flat_map(|s| expand_macros_in_stmt(s, &macros)).collect();
+                let new_else = else_body.as_ref().map(|v| v.iter().flat_map(|s| expand_macros_in_stmt(s, &macros)).collect());
                 new_stmts.push(Stmt::If { cond: expand_macros_in_expr(cond, &macros), then_body: new_then, else_body: new_else });
             }
             _ => new_stmts.push(s.clone()),
@@ -1072,26 +1120,114 @@ fn expand_macros_program(program: &Program) -> Program {
     Program { stmts: new_stmts }
 }
 
-fn expand_macros_in_stmt(stmt: &Stmt, macros: &HashMap<String, (Vec<String>, Vec<Stmt>)>) -> Stmt {
+fn expand_macros_in_stmt(stmt: &Stmt, macros: &HashMap<String, (Vec<String>, Vec<Stmt>)>) -> Vec<Stmt> {
     match stmt {
-        Stmt::Expr(e) => Stmt::Expr(expand_macros_in_expr(e, macros)),
-        Stmt::Let { name, ty, value } => Stmt::Let { name: name.clone(), ty: ty.clone(), value: expand_macros_in_expr(value, macros) },
-        Stmt::Assign { name, value } => Stmt::Assign { name: name.clone(), value: expand_macros_in_expr(value, macros) },
-        Stmt::Return(e) => Stmt::Return(e.as_ref().map(|e| expand_macros_in_expr(e, macros))),
+        Stmt::Expr(e) => {
+            if let Expr::Call(callee, args) = e {
+                if let Expr::Ident(mname) = callee.as_ref() {
+                    if let Some((params, body)) = macros.get(mname) {
+                        if body.len() >= 2 {
+                            return expand_macro_call_inline(params, body, args, None, macros);
+                        }
+                    }
+                }
+            }
+            vec![Stmt::Expr(expand_macros_in_expr(e, macros))]
+        }
+        Stmt::Let { name, ty, value } => {
+            if let Expr::Call(callee, args) = value {
+                if let Expr::Ident(mname) = callee.as_ref() {
+                    if let Some((params, body)) = macros.get(mname) {
+                        if body.len() >= 2 {
+                            return expand_macro_call_inline(params, body, args, Some(name.clone()), macros);
+                        }
+                    }
+                }
+            }
+            vec![Stmt::Let { name: name.clone(), ty: ty.clone(), value: expand_macros_in_expr(value, macros) }]
+        }
+        Stmt::Assign { name, value } => vec![Stmt::Assign { name: name.clone(), value: expand_macros_in_expr(value, macros) }],
+        Stmt::Return(e) => vec![Stmt::Return(e.as_ref().map(|e| expand_macros_in_expr(e, macros)))],
         Stmt::While { cond, body } => {
-            let new_body: Vec<Stmt> = body.iter().map(|s| expand_macros_in_stmt(s, macros)).collect();
-            Stmt::While { cond: expand_macros_in_expr(cond, macros), body: new_body }
+            let new_body: Vec<Stmt> = body.iter().flat_map(|s| expand_macros_in_stmt(s, macros)).collect();
+            vec![Stmt::While { cond: expand_macros_in_expr(cond, macros), body: new_body }]
         }
         Stmt::For { var, iter, body } => {
-            let new_body: Vec<Stmt> = body.iter().map(|s| expand_macros_in_stmt(s, macros)).collect();
-            Stmt::For { var: var.clone(), iter: expand_macros_in_expr(iter, macros), body: new_body }
+            let new_body: Vec<Stmt> = body.iter().flat_map(|s| expand_macros_in_stmt(s, macros)).collect();
+            vec![Stmt::For { var: var.clone(), iter: expand_macros_in_expr(iter, macros), body: new_body }]
         }
         Stmt::If { cond, then_body, else_body } => {
-            let new_then: Vec<Stmt> = then_body.iter().map(|s| expand_macros_in_stmt(s, macros)).collect();
-            let new_else = else_body.as_ref().map(|v| v.iter().map(|s| expand_macros_in_stmt(s, macros)).collect());
-            Stmt::If { cond: expand_macros_in_expr(cond, macros), then_body: new_then, else_body: new_else }
+            let new_then: Vec<Stmt> = then_body.iter().flat_map(|s| expand_macros_in_stmt(s, macros)).collect();
+            let new_else = else_body.as_ref().map(|v| v.iter().flat_map(|s| expand_macros_in_stmt(s, macros)).collect());
+            vec![Stmt::If { cond: expand_macros_in_expr(cond, macros), then_body: new_then, else_body: new_else }]
         }
-        _ => stmt.clone(),
+        _ => vec![stmt.clone()],
+    }
+}
+
+fn expand_macro_call_inline(params: &[String], body: &[Stmt], args: &[Expr], return_var: Option<String>, macros: &HashMap<String, (Vec<String>, Vec<Stmt>)>) -> Vec<Stmt> {
+    let mut arg_map: HashMap<String, Expr> = HashMap::new();
+    for (i, p) in params.iter().enumerate() {
+        arg_map.insert(p.clone(), substitute_expr(&args[i], &HashMap::new(), macros));
+    }
+    let mut result = Vec::new();
+    for s in body {
+        match s {
+            Stmt::Let { name, ty: _, value } => {
+                let substituted_val = substitute_expr(value, &arg_map, macros);
+                result.push(Stmt::Let { name: name.clone(), ty: Type::Inferred, value: substituted_val });
+            }
+            Stmt::Return(Some(e)) => {
+                let substituted = substitute_expr(e, &arg_map, macros);
+                if let Some(var) = &return_var {
+                    result.push(Stmt::Let { name: var.clone(), ty: Type::Inferred, value: substituted });
+                } else {
+                    result.push(Stmt::Return(Some(substituted)));
+                }
+            }
+            Stmt::Assign { name, value } => {
+                let substituted = substitute_expr(value, &arg_map, macros);
+                result.push(Stmt::Assign { name: name.clone(), value: substituted });
+            }
+            Stmt::If { cond, then_body, else_body } => {
+                let substituted_cond = substitute_expr(cond, &arg_map, macros);
+                let new_then: Vec<Stmt> = then_body.iter().flat_map(|s| expand_macro_call_inline_single(s, &arg_map, return_var.clone(), macros)).collect();
+                let new_else = else_body.as_ref().map(|v| v.iter().flat_map(|s| expand_macro_call_inline_single(s, &arg_map, return_var.clone(), macros)).collect());
+                result.push(Stmt::If { cond: substituted_cond, then_body: new_then, else_body: new_else });
+            }
+            Stmt::Expr(e) => {
+                let substituted = substitute_expr(e, &arg_map, macros);
+                result.push(Stmt::Expr(substituted));
+            }
+            _ => result.push(s.clone()),
+        }
+    }
+    result
+}
+
+fn expand_macro_call_inline_single(stmt: &Stmt, arg_map: &HashMap<String, Expr>, return_var: Option<String>, macros: &HashMap<String, (Vec<String>, Vec<Stmt>)>) -> Vec<Stmt> {
+    match stmt {
+        Stmt::Let { name, ty: _, value } => {
+            let substituted_val = substitute_expr(value, arg_map, macros);
+            vec![Stmt::Let { name: name.clone(), ty: Type::Inferred, value: substituted_val }]
+        }
+        Stmt::Return(Some(e)) => {
+            let substituted = substitute_expr(e, arg_map, macros);
+            if let Some(var) = &return_var {
+                vec![Stmt::Let { name: var.clone(), ty: Type::Inferred, value: substituted }]
+            } else {
+                vec![Stmt::Return(Some(substituted))]
+            }
+        }
+        Stmt::Assign { name, value } => {
+            let substituted = substitute_expr(value, arg_map, macros);
+            vec![Stmt::Assign { name: name.clone(), value: substituted }]
+        }
+        Stmt::Expr(e) => {
+            let substituted = substitute_expr(e, arg_map, macros);
+            vec![Stmt::Expr(substituted)]
+        }
+        _ => vec![stmt.clone()],
     }
 }
 
