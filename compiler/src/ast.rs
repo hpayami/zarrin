@@ -25,6 +25,17 @@ pub enum BinOp {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+pub enum Pattern {
+    Literal(Expr),
+    Variable(String),
+    Wildcard,
+    EnumVariant {
+        name: String,
+        inner: Vec<Pattern>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub enum Expr {
     Int(i64),
     Float(f64),
@@ -33,6 +44,15 @@ pub enum Expr {
     Ident(String),
     Binary(Box<Expr>, BinOp, Box<Expr>),
     Call(Box<Expr>, Vec<Expr>),
+    FieldAccess(Box<Expr>, String),
+    StructLit {
+        name: String,
+        fields: Vec<(String, Expr)>,
+    },
+    Match {
+        scrutinee: Box<Expr>,
+        arms: Vec<(Pattern, Expr)>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -47,6 +67,14 @@ pub enum Stmt {
         params: Vec<(String, Type)>,
         ret: Type,
         body: Vec<Stmt>,
+    },
+    Struct {
+        name: String,
+        fields: Vec<(String, Type)>,
+    },
+    Enum {
+        name: String,
+        variants: Vec<(String, Vec<Type>)>,
     },
     Expr(Expr),
     Return(Option<Expr>),

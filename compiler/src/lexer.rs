@@ -12,8 +12,13 @@ pub enum Token {
     Let,
     Fn,
     Return,
+    Struct,
+    Enum,
+    Match,
     // symbols
     Colon,
+    ColonColon,
+    Dot,
     Plus,
     Minus,
     Star,
@@ -29,6 +34,7 @@ pub enum Token {
     RBrace,
     Comma,
     Arrow,
+    FatArrow,
     Semicolon,
     Eof,
 }
@@ -95,6 +101,9 @@ impl<'a> Lexer<'a> {
                     if self.chars.peek() == Some(&'=') {
                         self.chars.next();
                         Token::Eq
+                    } else if self.chars.peek() == Some(&'>') {
+                        self.chars.next();
+                        Token::FatArrow
                     } else {
                         Token::Assign
                     }
@@ -109,7 +118,15 @@ impl<'a> Lexer<'a> {
                 }
                 '<' => Token::Lt,
                 '>' => Token::Gt,
-                ':' => Token::Colon,
+                ':' => {
+                    if self.chars.peek() == Some(&':') {
+                        self.chars.next();
+                        Token::ColonColon
+                    } else {
+                        Token::Colon
+                    }
+                }
+                '.' => Token::Dot,
                 '"' => {
                     let mut s = String::new();
                     while let Some(&ch) = self.chars.peek() {
@@ -159,8 +176,12 @@ impl<'a> Lexer<'a> {
                         "let" => Token::Let,
                         "fn" => Token::Fn,
                         "return" => Token::Return,
+                        "struct" => Token::Struct,
+                        "enum" => Token::Enum,
+                        "match" => Token::Match,
                         "true" => Token::Bool(true),
                         "false" => Token::Bool(false),
+                        _ => Token::Ident(id),
                         _ => Token::Ident(id),
                     }
                 }
