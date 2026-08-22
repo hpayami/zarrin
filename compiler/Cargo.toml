@@ -1,0 +1,20 @@
+[package]
+name = "zarrin"
+version = "0.1.0"
+edition = "2021"
+description = "Zarrin programming language compiler"
+license = "MIT"
+
+[[bin]]
+name = "zarrinc"
+path = "src/main.rs"
+
+[features]
+# Enables the real LLVM backend (requires system LLVM / llvm-config).
+# Disabled by default so the project builds without LLVM installed.
+llvm = ["inkwell"]
+
+[dependencies]
+inkwell = { version = "0.5", optional = true, features = ["llvm18-0"] }
+
+[dev-dependencies]

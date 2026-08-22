@@ -1,0 +1,12 @@
+// Zarrin example: functions, let bindings, arithmetic, printing.
+fn square(x: int) -> int {
+    return x * x;
+}
+
+let a = 3;
+let b = 4;
+let s = square(a);
+
+print(s);
+print(a + b);
+print("hello from zarrin");
