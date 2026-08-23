@@ -48,6 +48,7 @@ pub struct Codegen<'ctx> {
     enum_variants: HashMap<String, Vec<(String, Vec<Type>)>>,
     loop_exit: Vec<BasicBlock<'ctx>>,
     loop_continue: Vec<BasicBlock<'ctx>>,
+    loop_result_ptr: Vec<PointerValue<'ctx>>,
     i64: IntType<'ctx>,
     i8: IntType<'ctx>,
     f64: FloatType<'ctx>,
@@ -79,6 +80,7 @@ impl<'ctx> Codegen<'ctx> {
             enum_variants: HashMap::new(),
             loop_exit: Vec::new(),
             loop_continue: Vec::new(),
+            loop_result_ptr: Vec::new(),
             i64,
             i8: context.i8_type(),
             f64,
@@ -441,6 +443,129 @@ impl<'ctx> Codegen<'ctx> {
                     };
                     self.builder.build_store(null_ptr, self.i8.const_int(0, false)).unwrap();
                     return CgValue::Str(buf);
+                }
+                if name == "split" {
+                    let s_val = self.gen_expr(&args[0]);
+                    let delim_val = self.gen_expr(&args[1]);
+                    let s_ptr = match s_val { CgValue::Str(p) => p, _ => panic!("split expects string") };
+                    let delim_ptr = match delim_val { CgValue::Str(p) => p, _ => panic!("split expects string") };
+                    let byte_ptr_ty = self.context.ptr_type(AddressSpace::default());
+                    let malloc_type = byte_ptr_ty.fn_type(&[self.i64.into()], false);
+                    let malloc_fn = self.module.get_function("malloc").unwrap_or_else(|| self.module.add_function("malloc", malloc_type, None));
+                    let strstr_type = byte_ptr_ty.fn_type(&[byte_ptr_ty.into(), byte_ptr_ty.into()], false);
+                    let strstr_fn = self.module.get_function("strstr").unwrap_or_else(|| self.module.add_function("strstr", strstr_type, None));
+                    let strlen_type = self.i64.fn_type(&[byte_ptr_ty.into()], false);
+                    let strlen_fn = self.module.get_function("strlen").unwrap_or_else(|| self.module.add_function("strlen", strlen_type, None));
+                    let memcpy_type = self.context.void_type().fn_type(&[byte_ptr_ty.into(), byte_ptr_ty.into(), self.i64.into()], false);
+                    let memcpy_fn = self.module.get_function("memcpy").unwrap_or_else(|| self.module.add_function("memcpy", memcpy_type, None));
+                    let fn_val = self.builder.get_insert_block().unwrap().get_parent().unwrap();
+
+                    let delim_len_val = self.builder.build_call(strlen_fn, &[delim_ptr.into()], "delim_len").unwrap().try_as_basic_value().left().unwrap().into_int_value();
+
+                    let count_ptr = self.builder.build_alloca(self.i64, "split_count").unwrap();
+                    self.builder.build_store(count_ptr, self.i64.const_int(1, false)).unwrap();
+
+                    let cur_ptr_ptr = self.builder.build_alloca(byte_ptr_ty, "split_cur").unwrap();
+                    self.builder.build_store(cur_ptr_ptr, s_ptr).unwrap();
+
+                    let loop_bb = self.context.append_basic_block(fn_val, "split_loop");
+                    let body_bb = self.context.append_basic_block(fn_val, "split_body");
+                    let after_bb = self.context.append_basic_block(fn_val, "split_after");
+
+                    self.builder.build_unconditional_branch(loop_bb).unwrap();
+                    self.builder.position_at_end(loop_bb);
+                    let cur_ptr = self.builder.build_load(byte_ptr_ty, cur_ptr_ptr, "cur_ptr").unwrap().into_pointer_value();
+                    let found = self.builder.build_call(strstr_fn, &[cur_ptr.into(), delim_ptr.into()], "found_ptr").unwrap().try_as_basic_value().left().unwrap().into_pointer_value();
+                    let is_null = self.builder.build_is_null(found, "is_null").unwrap();
+                    self.builder.build_conditional_branch(is_null, after_bb, body_bb).unwrap();
+
+                    self.builder.position_at_end(body_bb);
+                    let cnt = self.builder.build_load(self.i64, count_ptr, "cnt").unwrap().into_int_value();
+                    let new_cnt = self.builder.build_int_add(cnt, self.i64.const_int(1, false), "new_cnt").unwrap();
+                    self.builder.build_store(count_ptr, new_cnt).unwrap();
+                    let next_pos = unsafe {
+                        self.builder.build_gep(self.i8, found, &[delim_len_val], "next_pos").unwrap()
+                    };
+                    self.builder.build_store(cur_ptr_ptr, next_pos).unwrap();
+                    self.builder.build_unconditional_branch(loop_bb).unwrap();
+
+                    self.builder.position_at_end(after_bb);
+                    let total_count = self.builder.build_load(self.i64, count_ptr, "total_count").unwrap().into_int_value();
+
+                    let arr_alloc_size = self.builder.build_int_mul(self.builder.build_int_add(total_count, self.i64.const_int(1, false), "arr_size_tmp").unwrap(), self.i64.const_int(8, false), "arr_bytes").unwrap();
+                    let arr_buf = self.builder.build_call(malloc_fn, &[arr_alloc_size.into()], "arr_buf").unwrap().try_as_basic_value().left().unwrap().into_pointer_value();
+                    self.builder.build_store(arr_buf, total_count).unwrap();
+
+                    let idx_ptr = self.builder.build_alloca(self.i64, "split_idx").unwrap();
+                    self.builder.build_store(idx_ptr, self.i64.const_int(0, false)).unwrap();
+
+                    let extract_loop = self.context.append_basic_block(fn_val, "split_extract_loop");
+                    let extract_body = self.context.append_basic_block(fn_val, "split_extract_body");
+                    let extract_done = self.context.append_basic_block(fn_val, "split_extract_done");
+
+                    let s_cur2 = self.builder.build_alloca(byte_ptr_ty, "split_s_cur2").unwrap();
+                    self.builder.build_store(s_cur2, s_ptr).unwrap();
+
+                    self.builder.build_unconditional_branch(extract_loop).unwrap();
+                    self.builder.position_at_end(extract_loop);
+                    let eidx = self.builder.build_load(self.i64, idx_ptr, "eidx").unwrap().into_int_value();
+                    let ecmp = self.builder.build_int_compare(inkwell::IntPredicate::SLT, eidx, total_count, "ecmp").unwrap();
+                    self.builder.build_conditional_branch(ecmp, extract_body, extract_done).unwrap();
+
+                    self.builder.position_at_end(extract_body);
+                    let ecur = self.builder.build_load(byte_ptr_ty, s_cur2, "ecur").unwrap().into_pointer_value();
+                    let efound = self.builder.build_call(strstr_fn, &[ecur.into(), delim_ptr.into()], "efound").unwrap().try_as_basic_value().left().unwrap().into_pointer_value();
+                    let efound_is_null = self.builder.build_is_null(efound, "efound_is_null").unwrap();
+
+                    let part_start_bb = self.context.append_basic_block(fn_val, "split_part_start");
+                    let part_null_bb = self.context.append_basic_block(fn_val, "split_part_null");
+                    self.builder.build_conditional_branch(efound_is_null, part_null_bb, part_start_bb).unwrap();
+
+                    self.builder.position_at_end(part_start_bb);
+                    let part_len = self.builder.build_ptr_diff(self.i8, efound, ecur, "part_len").unwrap();
+                    let part_buf = self.builder.build_call(malloc_fn, &[self.builder.build_int_add(part_len, self.i64.const_int(1, false), "part_alloc").unwrap().into()], "part_buf").unwrap().try_as_basic_value().left().unwrap().into_pointer_value();
+                    self.builder.build_call(memcpy_fn, &[part_buf.into(), ecur.into(), part_len.into()], "part_cp").unwrap();
+                    let part_null_ptr = unsafe {
+                        self.builder.build_gep(self.i8, part_buf, &[part_len], "part_null").unwrap()
+                    };
+                    self.builder.build_store(part_null_ptr, self.i8.const_int(0, false)).unwrap();
+                    let part_ptr_int = self.builder.build_ptr_to_int(part_buf, self.i64, "part_ptr_int").unwrap();
+                    let arr_slot_idx = self.builder.build_int_add(eidx, self.i64.const_int(1, false), "arr_slot_idx").unwrap();
+                    let arr_slot = unsafe {
+                        self.builder.build_gep(self.i64, arr_buf, &[arr_slot_idx], "arr_slot").unwrap()
+                    };
+                    self.builder.build_store(arr_slot, part_ptr_int).unwrap();
+                    let next_ecur = unsafe {
+                        self.builder.build_gep(self.i8, efound, &[delim_len_val], "next_ecur").unwrap()
+                    };
+                    self.builder.build_store(s_cur2, next_ecur).unwrap();
+
+                    let part_done_bb = self.context.append_basic_block(fn_val, "split_part_done");
+                    self.builder.build_unconditional_branch(part_done_bb).unwrap();
+
+                    self.builder.position_at_end(part_null_bb);
+                    let ecur_len = self.builder.build_call(strlen_fn, &[ecur.into()], "ecur_len").unwrap().try_as_basic_value().left().unwrap().into_int_value();
+                    let last_buf = self.builder.build_call(malloc_fn, &[self.builder.build_int_add(ecur_len, self.i64.const_int(1, false), "last_alloc").unwrap().into()], "last_buf").unwrap().try_as_basic_value().left().unwrap().into_pointer_value();
+                    self.builder.build_call(memcpy_fn, &[last_buf.into(), ecur.into(), ecur_len.into()], "last_cp").unwrap();
+                    let last_null_ptr = unsafe {
+                        self.builder.build_gep(self.i8, last_buf, &[ecur_len], "last_null").unwrap()
+                    };
+                    self.builder.build_store(last_null_ptr, self.i8.const_int(0, false)).unwrap();
+                    let last_ptr_int = self.builder.build_ptr_to_int(last_buf, self.i64, "last_ptr_int").unwrap();
+                    let last_arr_slot_idx = self.builder.build_int_add(eidx, self.i64.const_int(1, false), "last_arr_slot_idx").unwrap();
+                    let last_arr_slot = unsafe {
+                        self.builder.build_gep(self.i64, arr_buf, &[last_arr_slot_idx], "last_arr_slot").unwrap()
+                    };
+                    self.builder.build_store(last_arr_slot, last_ptr_int).unwrap();
+                    self.builder.build_unconditional_branch(part_done_bb).unwrap();
+
+                    self.builder.position_at_end(part_done_bb);
+                    let next_eidx = self.builder.build_int_add(eidx, self.i64.const_int(1, false), "next_eidx").unwrap();
+                    self.builder.build_store(idx_ptr, next_eidx).unwrap();
+                    self.builder.build_unconditional_branch(extract_loop).unwrap();
+
+                    self.builder.position_at_end(extract_done);
+                    return CgValue::Int(self.builder.build_ptr_to_int(arr_buf, self.i64, "arr_ret").unwrap());
                 }
                 if let Some((_, variants)) = self.enum_variants.iter().find(|(_, v)| v.iter().any(|(vn, _)| vn == name)) {
                     let tag = variants.iter().position(|(vn, _)| vn == name).unwrap();
@@ -806,6 +931,7 @@ Expr::Match { scrutinee, arms } => {
 
                 self.loop_exit.push(after_bb);
                 self.loop_continue.push(loop_bb);
+                self.loop_result_ptr.push(result_ptr);
 
                 self.builder.position_at_end(body_bb);
                 let mut terminated = false;
@@ -819,6 +945,7 @@ Expr::Match { scrutinee, arms } => {
 
                 self.loop_exit.pop();
                 self.loop_continue.pop();
+                self.loop_result_ptr.pop();
 
                 self.builder.position_at_end(after_bb);
                 let result = self.builder.build_load(self.i64, result_ptr, "while_result").unwrap().into_int_value();
@@ -860,6 +987,7 @@ Expr::Match { scrutinee, arms } => {
 
                 self.loop_exit.push(after_bb);
                 self.loop_continue.push(inc_bb);
+                self.loop_result_ptr.push(result_ptr);
 
                 self.builder.position_at_end(body_bb);
                 let elem = cur_idx;
@@ -878,6 +1006,7 @@ Expr::Match { scrutinee, arms } => {
 
                 self.loop_exit.pop();
                 self.loop_continue.pop();
+                self.loop_result_ptr.pop();
 
                 self.builder.position_at_end(inc_bb);
                 let next_idx = self.builder.build_int_add(cur_idx, self.i64.const_int(1, false), "next_idx").unwrap();
@@ -1226,8 +1355,15 @@ Expr::Match { scrutinee, arms } => {
 
                 self.builder.position_at_end(after_bb);
             }
-            Stmt::Break(_) => {
+            Stmt::Break(val) => {
                 if let Some(exit_bb) = self.loop_exit.last().cloned() {
+                    if let Some(expr) = val {
+                        let bv = self.gen_expr(expr);
+                        let bv_int = self.value_to_int(&bv);
+                        if let Some(result_ptr) = self.loop_result_ptr.last().cloned() {
+                            self.builder.build_store(result_ptr, bv_int).unwrap();
+                        }
+                    }
                     self.builder.build_unconditional_branch(exit_bb).unwrap();
                     let dead_bb = self.context.append_basic_block(self.builder.get_insert_block().unwrap().get_parent().unwrap(), "dead");
                     self.builder.position_at_end(dead_bb);

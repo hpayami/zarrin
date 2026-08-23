@@ -45,6 +45,7 @@ pub struct Interpreter {
     returned: Option<Value>,
     should_break: bool,
     should_continue: bool,
+    break_value: Option<Value>,
 }
 
 impl Interpreter {
@@ -53,7 +54,7 @@ impl Interpreter {
         for s in &program.stmts {
             if let Stmt::Fn { name, .. } = s { fns.insert(name.clone(), s.clone()); }
         }
-        Interpreter { fns, returned: None, should_break: false, should_continue: false }
+        Interpreter { fns, returned: None, should_break: false, should_continue: false, break_value: None }
     }
 
     pub fn run(&mut self, program: &Program) {
@@ -98,9 +99,9 @@ impl Interpreter {
                         self.eval_stmt(s, env);
                         if self.returned.is_some() { return; }
                         if self.should_continue { self.should_continue = false; break; }
-                        if self.should_break { self.should_break = false; break; }
+                        if self.should_break { self.should_break = false; self.break_value = None; break; }
                     }
-                    if self.should_break { self.should_break = false; break; }
+                    if self.should_break { self.should_break = false; self.break_value = None; break; }
                 }
             }
             Stmt::For { var, iter, body } => {
@@ -114,9 +115,9 @@ impl Interpreter {
                                 self.eval_stmt(s, env);
                                 if self.returned.is_some() { return; }
                                 if self.should_continue { self.should_continue = false; break; }
-                                if self.should_break { self.should_break = false; break; }
+                                if self.should_break { self.should_break = false; self.break_value = None; break; }
                             }
-                            if self.should_break { self.should_break = false; break; }
+                            if self.should_break { self.should_break = false; self.break_value = None; break; }
                             i += 1;
                         }
                     }
@@ -128,16 +129,22 @@ impl Interpreter {
                                 self.eval_stmt(s, env);
                                 if self.returned.is_some() { return; }
                                 if self.should_continue { self.should_continue = false; break; }
-                                if self.should_break { self.should_break = false; break; }
+                                if self.should_break { self.should_break = false; self.break_value = None; break; }
                             }
-                            if self.should_break { self.should_break = false; break; }
+                            if self.should_break { self.should_break = false; self.break_value = None; break; }
                             i += 1;
                         }
                     }
                     _ => panic!("for loop requires int or range"),
                 }
             }
-            Stmt::Break(_) => { self.should_break = true; return; }
+            Stmt::Break(val) => {
+                if let Some(expr) = val {
+                    self.break_value = Some(self.eval_expr(expr, env));
+                }
+                self.should_break = true;
+                return;
+            }
             Stmt::Continue(_) => { self.should_continue = true; return; }
             Stmt::Assign { name, value } => {
                 let v = self.eval_expr(value, env);
@@ -190,7 +197,7 @@ impl Interpreter {
             Expr::Call(callee, args) => {
                 let name = match callee.as_ref() { Expr::Ident(n) => n, _ => panic!("cannot call non-function") };
                 if name == "print" { let v = self.eval_expr(&args[0], env); println!("{}", value_to_string(&v)); return Value::Unit; }
-                if name == "len" { let v = self.eval_expr(&args[0], env); return match v { Value::Str(s) => Value::Int(s.len() as i64), _ => panic!("len expects string") }; }
+                if name == "len" { let v = self.eval_expr(&args[0], env); return match v { Value::Str(s) => Value::Int(s.len() as i64), Value::Array(a) => Value::Int(a.len() as i64), _ => panic!("len expects string or array") }; }
                 if name == "to_string" { let v = self.eval_expr(&args[0], env); return Value::Str(value_to_string(&v)); }
                 if name == "int_to_str" { let v = self.eval_expr(&args[0], env); return match v { Value::Int(n) => Value::Str(n.to_string()), _ => panic!("int_to_str expects int") }; }
                 if name == "panic" { let v = self.eval_expr(&args[0], env); panic!("{}", value_to_string(&v)); }
@@ -297,11 +304,23 @@ impl Interpreter {
                     if !truthy { break; }
                     for s in body {
                         self.eval_stmt(s, env);
-                        if self.should_break { self.should_break = false; break; }
+                        if self.should_break {
+                            if let Some(bv) = self.break_value.take() {
+                                result = bv;
+                            }
+                            self.should_break = false;
+                            break;
+                        }
                         if self.should_continue { self.should_continue = false; continue; }
                         if self.returned.is_some() { return self.returned.take().unwrap(); }
                     }
-                    if self.should_break { self.should_break = false; break; }
+                    if self.should_break {
+                        if let Some(bv) = self.break_value.take() {
+                            result = bv;
+                        }
+                        self.should_break = false;
+                        break;
+                    }
                 }
                 result
             }
@@ -314,7 +333,11 @@ impl Interpreter {
                             env.set(&var, Value::Int(i));
                             for s in body {
                                 self.eval_stmt(s, env);
-                                if self.should_break { self.should_break = false; break 'outer; }
+                                if self.should_break {
+                                    if let Some(bv) = self.break_value.take() { result = bv; }
+                                    self.should_break = false;
+                                    break 'outer;
+                                }
                                 if self.should_continue { self.should_continue = false; continue; }
                                 if self.returned.is_some() { return self.returned.take().unwrap(); }
                             }
@@ -325,7 +348,11 @@ impl Interpreter {
                             env.set(&var, elem);
                             for s in body {
                                 self.eval_stmt(s, env);
-                                if self.should_break { self.should_break = false; break 'outer2; }
+                                if self.should_break {
+                                    if let Some(bv) = self.break_value.take() { result = bv; }
+                                    self.should_break = false;
+                                    break 'outer2;
+                                }
                                 if self.should_continue { self.should_continue = false; continue; }
                                 if self.returned.is_some() { return self.returned.take().unwrap(); }
                             }

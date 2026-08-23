@@ -590,6 +590,10 @@ impl<'a> Parser<'a> {
             Token::Float(f) => { self.advance(); Expr::Float(f) }
             Token::Bool(b) => { self.advance(); Expr::Bool(b) }
             Token::Str(s) => { self.advance(); Expr::Str(s) }
+            Token::InterpStr(s) => {
+                self.advance();
+                self.parse_interp_string(s)
+            }
             Token::Match => self.parse_match(),
             Token::If => self.parse_if_expr(),
             Token::While => self.parse_while_expr(),
@@ -650,6 +654,60 @@ impl<'a> Parser<'a> {
                 }
             }
             t => panic!("unexpected token in expression: {:?}", t),
+        }
+    }
+
+    fn parse_interp_string(&self, content: String) -> Expr {
+        use crate::lexer::{Lexer, Token};
+        let mut parts: Vec<Expr> = Vec::new();
+        let mut current_str = String::new();
+        let mut chars = content.chars().peekable();
+        while let Some(&ch) = chars.peek() {
+            if ch == '{' {
+                chars.next();
+                if !current_str.is_empty() {
+                    parts.push(Expr::Str(current_str.clone()));
+                    current_str.clear();
+                }
+                let mut depth = 1u32;
+                let mut expr_str = String::new();
+                while let Some(&c) = chars.peek() {
+                    if c == '{' { depth += 1; }
+                    if c == '}' {
+                        depth -= 1;
+                        if depth == 0 {
+                            chars.next();
+                            break;
+                        }
+                    }
+                    expr_str.push(c);
+                    chars.next();
+                }
+                let mut sub_parser = Parser::new(&expr_str);
+                let expr = sub_parser.parse_expr();
+                parts.push(Expr::Call(Box::new(Expr::Ident("to_string".to_string())), vec![expr]));
+            } else {
+                current_str.push(ch);
+                chars.next();
+            }
+        }
+        if !current_str.is_empty() {
+            parts.push(Expr::Str(current_str));
+        }
+        if parts.is_empty() {
+            Expr::Str(String::new())
+        } else if parts.len() == 1 {
+            parts.remove(0)
+        } else {
+            let mut result = parts.remove(0);
+            for part in parts {
+                result = Expr::Binary(
+                    Box::new(result),
+                    BinOp::Add,
+                    Box::new(part),
+                );
+            }
+            result
         }
     }
 

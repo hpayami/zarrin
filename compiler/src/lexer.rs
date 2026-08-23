@@ -5,6 +5,9 @@ pub enum Token {
     Int(i64),
     Float(f64),
     Str(String),
+    InterpStr(String),
+    InterpStart,
+    InterpEnd,
     Ident(String),
     // literals
     Bool(bool),
@@ -62,12 +65,16 @@ pub enum Token {
 
 pub struct Lexer<'a> {
     chars: std::iter::Peekable<std::str::Chars<'a>>,
+    interp_depth: u32,
+    interp_string_buf: String,
 }
 
 impl<'a> Lexer<'a> {
     pub fn new(src: &'a str) -> Self {
         Lexer {
             chars: src.chars().peekable(),
+            interp_depth: 0,
+            interp_string_buf: String::new(),
         }
     }
 
@@ -190,15 +197,26 @@ impl<'a> Lexer<'a> {
                 }
                 '"' => {
                     let mut s = String::new();
+                    let mut has_interp = false;
                     while let Some(&ch) = self.chars.peek() {
                         if ch == '"' {
                             self.chars.next();
                             break;
                         }
+                        if ch == '{' {
+                            has_interp = true;
+                        }
+                        if ch == '}' && has_interp {
+                            // Will be handled during re-lexing in parser
+                        }
                         s.push(ch);
                         self.chars.next();
                     }
-                    Token::Str(s)
+                    if has_interp {
+                        Token::InterpStr(s)
+                    } else {
+                        Token::Str(s)
+                    }
                 }
                 ch if ch.is_ascii_digit() => {
                     let mut num = String::new();
