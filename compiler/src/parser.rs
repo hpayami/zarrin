@@ -667,7 +667,7 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_interp_string(&self, content: String) -> Expr {
-        use crate::lexer::{Lexer, Token};
+        use crate::lexer::{Lexer};
         let mut parts: Vec<Expr> = Vec::new();
         let mut current_str = String::new();
         let mut chars = content.chars().peekable();

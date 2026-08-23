@@ -6,8 +6,6 @@ pub enum Token {
     Float(f64),
     Str(String),
     InterpStr(String),
-    InterpStart,
-    InterpEnd,
     Ident(String),
     // literals
     Bool(bool),
@@ -66,16 +64,12 @@ pub enum Token {
 
 pub struct Lexer<'a> {
     chars: std::iter::Peekable<std::str::Chars<'a>>,
-    interp_depth: u32,
-    interp_string_buf: String,
 }
 
 impl<'a> Lexer<'a> {
     pub fn new(src: &'a str) -> Self {
         Lexer {
             chars: src.chars().peekable(),
-            interp_depth: 0,
-            interp_string_buf: String::new(),
         }
     }
 
