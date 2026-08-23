@@ -55,6 +55,7 @@ pub enum Token {
     Bang,
     AmpAmp,
     PipePipe,
+    Pipe,
     Semicolon,
     Eof,
 }
@@ -125,7 +126,7 @@ impl<'a> Lexer<'a> {
                         self.chars.next();
                         Token::PipePipe
                     } else {
-                        panic!("unexpected character: '|', did you mean '||'?");
+                        Token::Pipe
                     }
                 }
                 '(' => Token::LParen,

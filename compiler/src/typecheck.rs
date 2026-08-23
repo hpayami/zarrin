@@ -355,8 +355,13 @@ impl TypeChecker {
             Expr::Match { scrutinee, arms } => {
                 let scrutinee_ty = Self::check_expr(scrutinee, env)?;
                 let mut result_ty = None;
-                for (pattern, body) in arms {
-                    Self::check_pattern(pattern, &scrutinee_ty, env)?;
+                for (patterns, guard, body) in arms {
+                    for pattern in patterns {
+                        Self::check_pattern(pattern, &scrutinee_ty, env)?;
+                    }
+                    if let Some(g) = guard {
+                        Self::check_expr(g, env)?;
+                    }
                     let body_ty = Self::check_expr(body, env)?;
                     if let Some(prev) = &result_ty {
                         if *prev != body_ty { return Err(TypeError::TypeMismatch { expected: format!("{:?}", prev), found: format!("{:?}", body_ty) }); }
@@ -376,6 +381,19 @@ impl TypeChecker {
                 } else {
                     Ok(Type::Unit)
                 }
+            }
+            Expr::While { cond, body } => {
+                Self::check_expr(cond, env)?;
+                for s in body { Self::check_stmt(s, env)?; }
+                Ok(Type::Int)
+            }
+            Expr::For { var, iter, body } => {
+                Self::check_expr(iter, env)?;
+                env.push_scope();
+                env.define(var, Type::Int);
+                for s in body { Self::check_stmt(s, env)?; }
+                env.pop_scope();
+                Ok(Type::Int)
             }
             Expr::Range(a, b) => {
                 let at = Self::check_expr(a, env)?;

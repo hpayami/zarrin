@@ -263,7 +263,19 @@ impl Interpreter {
             }
             Expr::Match { scrutinee, arms } => {
                 let sv = self.eval_expr(scrutinee, env);
-                for (pattern, body) in arms { if self.match_pattern(pattern, &sv, env) { return self.eval_expr(body, env); } }
+                for (patterns, guard, body) in arms {
+                    for pattern in patterns {
+                        if self.match_pattern(pattern, &sv, env) {
+                            if let Some(g) = guard {
+                                let gv = self.eval_expr(g, env);
+                                let truthy = match gv { Value::Bool(b) => b, Value::Int(n) => n != 0, _ => true };
+                                if truthy { return self.eval_expr(body, env); }
+                            } else {
+                                return self.eval_expr(body, env);
+                            }
+                        }
+                    }
+                }
                 panic!("no matching pattern");
             }
             Expr::If { cond, then_body, else_body } => {
@@ -276,6 +288,52 @@ impl Interpreter {
                 } else {
                     Value::Unit
                 }
+            }
+            Expr::While { cond, body } => {
+                let mut result = Value::Unit;
+                loop {
+                    let cv = self.eval_expr(cond, env);
+                    let truthy = match cv { Value::Bool(b) => b, Value::Int(n) => n != 0, _ => true };
+                    if !truthy { break; }
+                    for s in body {
+                        self.eval_stmt(s, env);
+                        if self.should_break { self.should_break = false; break; }
+                        if self.should_continue { self.should_continue = false; continue; }
+                        if self.returned.is_some() { return self.returned.take().unwrap(); }
+                    }
+                    if self.should_break { self.should_break = false; break; }
+                }
+                result
+            }
+            Expr::For { var, iter, body } => {
+                let iter_val = self.eval_expr(iter, env);
+                let mut result = Value::Unit;
+                match iter_val {
+                    Value::Range(start, end) => {
+                        'outer: for i in start..end {
+                            env.set(&var, Value::Int(i));
+                            for s in body {
+                                self.eval_stmt(s, env);
+                                if self.should_break { self.should_break = false; break 'outer; }
+                                if self.should_continue { self.should_continue = false; continue; }
+                                if self.returned.is_some() { return self.returned.take().unwrap(); }
+                            }
+                        }
+                    }
+                    Value::Array(arr) => {
+                        'outer2: for elem in arr {
+                            env.set(&var, elem);
+                            for s in body {
+                                self.eval_stmt(s, env);
+                                if self.should_break { self.should_break = false; break 'outer2; }
+                                if self.should_continue { self.should_continue = false; continue; }
+                                if self.returned.is_some() { return self.returned.take().unwrap(); }
+                            }
+                        }
+                    }
+                    _ => panic!("for loop requires range or array"),
+                }
+                result
             }
             Expr::Range(a, b) => {
                 let av = self.eval_expr(a, env);

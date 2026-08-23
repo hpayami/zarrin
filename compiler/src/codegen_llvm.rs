@@ -611,82 +611,134 @@ Expr::Match { scrutinee, arms } => {
                 let mut arm_values: Vec<(IntValue<'ctx>, BasicBlock<'ctx>)> = Vec::new();
                 let mut current_check = self.context.append_basic_block(parent, "match_check");
                 self.builder.build_unconditional_branch(current_check).unwrap();
-                for (i, (pattern, body)) in arms.iter().enumerate() {
+                for (i, (patterns, guard, body)) in arms.iter().enumerate() {
                     self.builder.position_at_end(current_check);
                     let arm_bb = self.context.append_basic_block(parent, &format!("arm_{}", i));
-                    let is_last = matches!(pattern, Pattern::Wildcard) || i == arms.len() - 1;
-                    match pattern {
-                        Pattern::Literal(e) => {
-                            let pv = self.gen_expr(e);
-                            let pv_int = self.value_to_int(&pv);
-                            let cmp = self.builder.build_int_compare(inkwell::IntPredicate::EQ, sv_tag, pv_int, "match_cmp").unwrap();
-                            if is_last {
-                                self.builder.build_unconditional_branch(arm_bb).unwrap();
-                            } else {
-                                let next_check = self.context.append_basic_block(parent, &format!("match_check_{}", i + 1));
-                                self.builder.build_conditional_branch(cmp, arm_bb, next_check).unwrap();
-                                current_check = next_check;
-                            }
-                        }
-                        Pattern::EnumVariant { name, inner } => {
-                            let mut tag_val: u64 = 0;
-                            let mut payload_types: Vec<Type> = Vec::new();
-                            for (_, variants) in &self.enum_variants {
-                                if let Some(pos) = variants.iter().position(|(vn, _)| vn == name) {
-                                    tag_val = pos as u64;
-                                    payload_types = variants[pos].1.clone();
-                                    break;
-                                }
-                            }
-                            let pv_int = self.i64.const_int(tag_val, false);
-                            let cmp = self.builder.build_int_compare(inkwell::IntPredicate::EQ, sv_tag, pv_int, "match_cmp").unwrap();
-                            if is_last {
-                                self.builder.build_unconditional_branch(arm_bb).unwrap();
-                            } else {
-                                let next_check = self.context.append_basic_block(parent, &format!("match_check_{}", i + 1));
-                                self.builder.build_conditional_branch(cmp, arm_bb, next_check).unwrap();
-                                current_check = next_check;
-                            }
-                            if !inner.is_empty() && sv_ptr.is_some() && !payload_types.is_empty() {
-                                self.builder.position_at_end(arm_bb);
-                                for (j, pat) in inner.iter().enumerate() {
-                                    if let Pattern::Variable(vname) = pat {
-                                        let field_ptr = unsafe {
-                                            self.builder.build_gep(self.i64, sv_ptr.unwrap(), &[
-                                                self.i64.const_int((j + 1) as u64, false),
-                                            ], &format!("{}_{}", name, j)).unwrap()
-                                        };
-                                        let field_val = self.builder.build_load(self.i64, field_ptr, vname).unwrap().into_int_value();
-                                        let ptr = self.builder.build_alloca(self.i64, vname).unwrap();
-                                        self.builder.build_store(ptr, field_val).unwrap();
-                                        if matches!(payload_types.get(j), Some(Type::Float)) {
-                                            self.named.insert(vname.clone(), (ptr, "float".to_string()));
-                                        } else {
-                                            self.named.insert(vname.clone(), (ptr, "int".to_string()));
-                                        }
+                    let is_wildcard = patterns.iter().any(|p| matches!(p, Pattern::Wildcard | Pattern::Variable(_)));
+                    let is_last = is_wildcard || i == arms.len() - 1;
+
+                    let mut any_matched_bb = arm_bb;
+                    let mut check_bb = current_check;
+
+                    for (pi, pattern) in patterns.iter().enumerate() {
+                        self.builder.position_at_end(check_bb);
+                        match pattern {
+                            Pattern::Literal(e) => {
+                                let pv = self.gen_expr(e);
+                                let pv_int = self.value_to_int(&pv);
+                                let cmp = self.builder.build_int_compare(inkwell::IntPredicate::EQ, sv_tag, pv_int, "match_cmp").unwrap();
+                                if pi < patterns.len() - 1 {
+                                    let next_pattern = self.context.append_basic_block(parent, &format!("arm_{}_pat_{}", i, pi + 1));
+                                    self.builder.build_conditional_branch(cmp, arm_bb, next_pattern).unwrap();
+                                    check_bb = next_pattern;
+                                } else {
+                                    if is_last {
+                                        self.builder.build_unconditional_branch(arm_bb).unwrap();
+                                    } else {
+                                        let next_check = self.context.append_basic_block(parent, &format!("match_check_{}", i + 1));
+                                        self.builder.build_conditional_branch(cmp, arm_bb, next_check).unwrap();
+                                        current_check = next_check;
                                     }
                                 }
-                                let bv = self.gen_expr(body);
-                                let bv_int = self.value_to_int(&bv);
-                                arm_values.push((bv_int, arm_bb));
-                                self.builder.build_unconditional_branch(merge).unwrap();
-                                continue;
                             }
-                        }
-                        Pattern::Wildcard | Pattern::Variable(_) => {
-                            self.builder.build_unconditional_branch(arm_bb).unwrap();
+                            Pattern::EnumVariant { name, inner } => {
+                                let mut tag_val: u64 = 0;
+                                let mut payload_types: Vec<Type> = Vec::new();
+                                for (_, variants) in &self.enum_variants {
+                                    if let Some(pos) = variants.iter().position(|(vn, _)| vn == name) {
+                                        tag_val = pos as u64;
+                                        payload_types = variants[pos].1.clone();
+                                        break;
+                                    }
+                                }
+                                let pv_int = self.i64.const_int(tag_val, false);
+                                let cmp = self.builder.build_int_compare(inkwell::IntPredicate::EQ, sv_tag, pv_int, "match_cmp").unwrap();
+                                if pi < patterns.len() - 1 {
+                                    let next_pattern = self.context.append_basic_block(parent, &format!("arm_{}_pat_{}", i, pi + 1));
+                                    self.builder.build_conditional_branch(cmp, arm_bb, next_pattern).unwrap();
+                                    check_bb = next_pattern;
+                                } else {
+                                    if is_last {
+                                        self.builder.build_unconditional_branch(arm_bb).unwrap();
+                                    } else {
+                                        let next_check = self.context.append_basic_block(parent, &format!("match_check_{}", i + 1));
+                                        self.builder.build_conditional_branch(cmp, arm_bb, next_check).unwrap();
+                                        current_check = next_check;
+                                    }
+                                }
+                                if !inner.is_empty() && sv_ptr.is_some() && !payload_types.is_empty() {
+                                    self.builder.position_at_end(arm_bb);
+                                    for (j, pat) in inner.iter().enumerate() {
+                                        if let Pattern::Variable(vname) = pat {
+                                            let field_ptr = unsafe {
+                                                self.builder.build_gep(self.i64, sv_ptr.unwrap(), &[
+                                                    self.i64.const_int((j + 1) as u64, false),
+                                                ], &format!("{}_{}", name, j)).unwrap()
+                                            };
+                                            let field_val = self.builder.build_load(self.i64, field_ptr, vname).unwrap().into_int_value();
+                                            let ptr = self.builder.build_alloca(self.i64, vname).unwrap();
+                                            self.builder.build_store(ptr, field_val).unwrap();
+                                            if matches!(payload_types.get(j), Some(Type::Float)) {
+                                                self.named.insert(vname.clone(), (ptr, "float".to_string()));
+                                            } else {
+                                                self.named.insert(vname.clone(), (ptr, "int".to_string()));
+                                            }
+                                        }
+                                    }
+                                    if let Some(g) = guard {
+                                        let gv = self.gen_expr(g);
+                                        let gc = self.to_i1(&gv);
+                                        let guard_fail = self.context.append_basic_block(parent, &format!("arm_{}_guard_fail", i));
+                                        self.builder.build_conditional_branch(gc, arm_bb, guard_fail).unwrap();
+                                        self.builder.position_at_end(guard_fail);
+                                        if !is_last {
+                                            let next_check = self.context.append_basic_block(parent, &format!("match_check_{}", i + 1));
+                                            self.builder.build_unconditional_branch(next_check).unwrap();
+                                            current_check = next_check;
+                                        } else {
+                                            self.builder.build_unconditional_branch(merge).unwrap();
+                                        }
+                                    } else {
+                                        let bv = self.gen_expr(body);
+                                        let bv_int = self.value_to_int(&bv);
+                                        arm_values.push((bv_int, arm_bb));
+                                        self.builder.build_unconditional_branch(merge).unwrap();
+                                    }
+                                    continue;
+                                }
+                            }
+                            Pattern::Wildcard | Pattern::Variable(_) => {
+                                self.builder.build_unconditional_branch(arm_bb).unwrap();
+                            }
                         }
                     }
                     self.builder.position_at_end(arm_bb);
-                    if let Pattern::Variable(name) = pattern {
-                        let ptr = self.builder.build_alloca(self.i64, name).unwrap();
-                        self.builder.build_store(ptr, sv_tag).unwrap();
-                        self.named.insert(name.clone(), (ptr, "int".to_string()));
+                    if let Some(first_pat) = patterns.first() {
+                        if let Pattern::Variable(name) = first_pat {
+                            let ptr = self.builder.build_alloca(self.i64, name).unwrap();
+                            self.builder.build_store(ptr, sv_tag).unwrap();
+                            self.named.insert(name.clone(), (ptr, "int".to_string()));
+                        }
                     }
-                    let bv = self.gen_expr(body);
-                    let bv_int = self.value_to_int(&bv);
-                    arm_values.push((bv_int, arm_bb));
-                    self.builder.build_unconditional_branch(merge).unwrap();
+                    if let Some(g) = guard {
+                        let gv = self.gen_expr(g);
+                        let gc = self.to_i1(&gv);
+                        let guard_fail = self.context.append_basic_block(parent, &format!("arm_{}_guard_fail2", i));
+                        self.builder.build_conditional_branch(gc, arm_bb, guard_fail).unwrap();
+                        self.builder.position_at_end(guard_fail);
+                        if !is_last {
+                            let next_check = self.context.append_basic_block(parent, &format!("match_check_{}", i + 1));
+                            self.builder.build_unconditional_branch(next_check).unwrap();
+                            current_check = next_check;
+                        } else {
+                            self.builder.build_unconditional_branch(merge).unwrap();
+                        }
+                    } else {
+                        let bv = self.gen_expr(body);
+                        let bv_int = self.value_to_int(&bv);
+                        arm_values.push((bv_int, arm_bb));
+                        self.builder.build_unconditional_branch(merge).unwrap();
+                    }
                 }
                 if current_check.get_terminator().is_none() {
                     self.builder.position_at_end(current_check);
@@ -736,6 +788,105 @@ Expr::Match { scrutinee, arms } => {
                 let phi = self.builder.build_phi(self.i64, "if.result").unwrap();
                 phi.add_incoming(&[(&then_int, then_bb), (&else_int, else_bb)]);
                 CgValue::Int(phi.as_basic_value().into_int_value())
+            }
+            Expr::While { cond, body } => {
+                let fn_val = self.builder.get_insert_block().unwrap().get_parent().unwrap();
+                let loop_bb = self.context.append_basic_block(fn_val, "while_expr");
+                let body_bb = self.context.append_basic_block(fn_val, "while_expr_body");
+                let after_bb = self.context.append_basic_block(fn_val, "while_expr_end");
+
+                let result_ptr = self.builder.build_alloca(self.i64, "while_result").unwrap();
+                self.builder.build_store(result_ptr, self.i64.const_int(0, false)).unwrap();
+
+                self.builder.build_unconditional_branch(loop_bb).unwrap();
+                self.builder.position_at_end(loop_bb);
+                let cond_val = self.gen_expr(cond);
+                let cond_bool = self.to_i1(&cond_val);
+                self.builder.build_conditional_branch(cond_bool, body_bb, after_bb).unwrap();
+
+                self.loop_exit.push(after_bb);
+                self.loop_continue.push(loop_bb);
+
+                self.builder.position_at_end(body_bb);
+                let mut terminated = false;
+                for s in body {
+                    self.gen_stmt(s, fn_val, &mut terminated);
+                    if terminated { break; }
+                }
+                if !terminated {
+                    self.builder.build_unconditional_branch(loop_bb).unwrap();
+                }
+
+                self.loop_exit.pop();
+                self.loop_continue.pop();
+
+                self.builder.position_at_end(after_bb);
+                let result = self.builder.build_load(self.i64, result_ptr, "while_result").unwrap().into_int_value();
+                CgValue::Int(result)
+            }
+            Expr::For { var, iter, body } => {
+                let fn_val = self.builder.get_insert_block().unwrap().get_parent().unwrap();
+                let iter_val = self.gen_expr(iter);
+                let iter_int = self.value_to_int(&iter_val);
+
+                let arr_ptr_val = self.builder.build_alloca(self.i64, "for_arr_ptr").unwrap();
+                let is_array = self.builder.build_alloca(self.i64, "for_is_array").unwrap();
+
+                let loop_bb = self.context.append_basic_block(fn_val, "for_loop");
+                let body_bb = self.context.append_basic_block(fn_val, "for_body");
+                let inc_bb = self.context.append_basic_block(fn_val, "for_inc");
+                let after_bb = self.context.append_basic_block(fn_val, "for_end");
+
+                let result_ptr = self.builder.build_alloca(self.i64, "for_result").unwrap();
+                self.builder.build_store(result_ptr, self.i64.const_int(0, false)).unwrap();
+                self.builder.build_store(is_array, self.i64.const_int(0, false)).unwrap();
+                self.builder.build_store(arr_ptr_val, self.i64.const_int(0, false)).unwrap();
+
+                let idx_ptr = self.builder.build_alloca(self.i64, "for_idx").unwrap();
+                self.builder.build_store(idx_ptr, self.i64.const_int(0, false)).unwrap();
+
+                self.builder.build_unconditional_branch(loop_bb).unwrap();
+                self.builder.position_at_end(loop_bb);
+                let cur_idx = self.builder.build_load(self.i64, idx_ptr, "for_cur_idx").unwrap().into_int_value();
+                let is_arr = self.builder.build_load(self.i64, is_array, "for_is_arr").unwrap().into_int_value();
+                let is_arr_bool = self.builder.build_int_compare(inkwell::IntPredicate::NE, is_arr, self.i64.const_int(0, false), "is_arr_i1").unwrap();
+
+                let range_check_bb = self.context.append_basic_block(fn_val, "for_range_check");
+                self.builder.build_conditional_branch(is_arr_bool, range_check_bb, range_check_bb).unwrap();
+
+                self.builder.position_at_end(range_check_bb);
+                let has_more = self.builder.build_int_compare(inkwell::IntPredicate::SLT, cur_idx, iter_int, "has_more").unwrap();
+                self.builder.build_conditional_branch(has_more, body_bb, after_bb).unwrap();
+
+                self.loop_exit.push(after_bb);
+                self.loop_continue.push(inc_bb);
+
+                self.builder.position_at_end(body_bb);
+                let elem = cur_idx;
+                let var_ptr = self.builder.build_alloca(self.i64, var).unwrap();
+                self.builder.build_store(var_ptr, elem).unwrap();
+                self.named.insert(var.clone(), (var_ptr, "int".to_string()));
+
+                let mut terminated = false;
+                for s in body {
+                    self.gen_stmt(s, fn_val, &mut terminated);
+                    if terminated { break; }
+                }
+                if !terminated {
+                    self.builder.build_unconditional_branch(inc_bb).unwrap();
+                }
+
+                self.loop_exit.pop();
+                self.loop_continue.pop();
+
+                self.builder.position_at_end(inc_bb);
+                let next_idx = self.builder.build_int_add(cur_idx, self.i64.const_int(1, false), "next_idx").unwrap();
+                self.builder.build_store(idx_ptr, next_idx).unwrap();
+                self.builder.build_unconditional_branch(loop_bb).unwrap();
+
+                self.builder.position_at_end(after_bb);
+                let result = self.builder.build_load(self.i64, result_ptr, "for_result").unwrap().into_int_value();
+                CgValue::Int(result)
             }
             Expr::Range(_, _) => {
                 CgValue::Int(self.i64.const_int(0, false))
@@ -1175,7 +1326,9 @@ fn expand_macros_in_expr(expr: &Expr, macros: &HashMap<String, (Vec<String>, Vec
         Expr::MethodCall(obj, method, args) => Expr::MethodCall(Box::new(expand_macros_in_expr(obj, macros)), method.clone(), args.iter().map(|a| expand_macros_in_expr(a, macros)).collect()),
         Expr::Index(arr, idx) => Expr::Index(Box::new(expand_macros_in_expr(arr, macros)), Box::new(expand_macros_in_expr(idx, macros))),
         Expr::StructLit { name, fields } => Expr::StructLit { name: name.clone(), fields: fields.iter().map(|(n, e)| (n.clone(), expand_macros_in_expr(e, macros))).collect() },
-        Expr::Match { scrutinee, arms } => Expr::Match { scrutinee: Box::new(expand_macros_in_expr(scrutinee, macros)), arms: arms.iter().map(|(p, e)| (p.clone(), expand_macros_in_expr(e, macros))).collect() },
+        Expr::Match { scrutinee, arms } => Expr::Match { scrutinee: Box::new(expand_macros_in_expr(scrutinee, macros)), arms: arms.iter().map(|(pats, guard, e)| (pats.clone(), guard.as_ref().map(|g| expand_macros_in_expr(g, macros)), expand_macros_in_expr(e, macros))).collect() },
+        Expr::While { cond, body } => Expr::While { cond: Box::new(expand_macros_in_expr(cond, macros)), body: body.iter().flat_map(|s| expand_macros_in_stmt(s, macros)).collect() },
+        Expr::For { var, iter, body } => Expr::For { var: var.clone(), iter: Box::new(expand_macros_in_expr(iter, macros)), body: body.iter().flat_map(|s| expand_macros_in_stmt(s, macros)).collect() },
         _ => expr.clone(),
     }
 }
@@ -1223,7 +1376,7 @@ fn substitute_expr(expr: &Expr, arg_map: &HashMap<String, Expr>, macros: &HashMa
         },
         Expr::Match { scrutinee, arms } => Expr::Match {
             scrutinee: Box::new(substitute_expr(scrutinee, arg_map, macros)),
-            arms: arms.iter().map(|(p, e)| (p.clone(), substitute_expr(e, arg_map, macros))).collect(),
+            arms: arms.iter().map(|(pats, guard, e)| (pats.clone(), guard.as_ref().map(|g| substitute_expr(g, arg_map, macros)), substitute_expr(e, arg_map, macros))).collect(),
         },
         Expr::Range(l, r) => Expr::Range(
             Box::new(substitute_expr(l, arg_map, macros)),

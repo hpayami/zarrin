@@ -592,6 +592,8 @@ impl<'a> Parser<'a> {
             Token::Str(s) => { self.advance(); Expr::Str(s) }
             Token::Match => self.parse_match(),
             Token::If => self.parse_if_expr(),
+            Token::While => self.parse_while_expr(),
+            Token::For => self.parse_for_expr(),
             Token::Ident(name) => {
                 self.advance();
                 if self.current == Token::LBrace
@@ -631,6 +633,22 @@ impl<'a> Parser<'a> {
                 self.expect(Token::RBrack);
                 Expr::ArrayLit(elems)
             }
+            Token::LBrace => {
+                self.advance();
+                let mut stmts = Vec::new();
+                while self.current != Token::RBrace {
+                    stmts.push(self.parse_stmt());
+                }
+                self.expect(Token::RBrace);
+                if let Some(last) = stmts.pop() {
+                    match last {
+                        Stmt::Expr(e) | Stmt::Return(Some(e)) => e,
+                        _ => Expr::Bool(false),
+                    }
+                } else {
+                    Expr::Bool(false)
+                }
+            }
             t => panic!("unexpected token in expression: {:?}", t),
         }
     }
@@ -660,10 +678,20 @@ impl<'a> Parser<'a> {
         self.expect(Token::LBrace);
         let mut arms = Vec::new();
         while self.current != Token::RBrace {
-            let pattern = self.parse_pattern();
+            let mut patterns = vec![self.parse_pattern()];
+            while self.current == Token::Pipe {
+                self.advance();
+                patterns.push(self.parse_pattern());
+            }
+            let guard = if self.current == Token::If {
+                self.advance();
+                Some(self.parse_expr())
+            } else {
+                None
+            };
             self.expect(Token::FatArrow);
             let body = self.parse_expr();
-            arms.push((pattern, body));
+            arms.push((patterns, guard, body));
             if self.current == Token::Comma {
                 self.advance();
             }
@@ -717,6 +745,35 @@ impl<'a> Parser<'a> {
         Expr::If { cond: Box::new(cond), then_body: Box::new(then_body), else_body }
     }
 
+    fn parse_while_expr(&mut self) -> Expr {
+        self.advance(); // while
+        let cond = self.parse_expr();
+        self.expect(Token::LBrace);
+        let mut body = Vec::new();
+        while self.current != Token::RBrace {
+            body.push(self.parse_stmt());
+        }
+        self.expect(Token::RBrace);
+        Expr::While { cond: Box::new(cond), body }
+    }
+
+    fn parse_for_expr(&mut self) -> Expr {
+        self.advance(); // for
+        let var = match self.advance() {
+            Token::Ident(n) => n,
+            t => panic!("expected variable name after for, found {:?}", t),
+        };
+        self.expect(Token::In);
+        let iter = self.parse_expr();
+        self.expect(Token::LBrace);
+        let mut body = Vec::new();
+        while self.current != Token::RBrace {
+            body.push(self.parse_stmt());
+        }
+        self.expect(Token::RBrace);
+        Expr::For { var, iter: Box::new(iter), body }
+    }
+
     fn parse_pattern(&mut self) -> Pattern {
         match self.current.clone() {
             Token::Int(n) => { self.advance(); Pattern::Literal(Expr::Int(n)) }
@@ -726,6 +783,26 @@ impl<'a> Parser<'a> {
                 self.advance();
                 if name == "_" {
                     return Pattern::Wildcard;
+                }
+                if self.current == Token::ColonColon {
+                    self.advance();
+                    if let Token::Ident(variant) = self.current.clone() {
+                        self.advance();
+                        let full_name = format!("{}::{}", name, variant);
+                        if self.current == Token::LParen {
+                            self.advance();
+                            let mut inner = Vec::new();
+                            while self.current != Token::RParen {
+                                inner.push(self.parse_pattern());
+                                if self.current == Token::Comma {
+                                    self.advance();
+                                }
+                            }
+                            self.expect(Token::RParen);
+                            return Pattern::EnumVariant { name: full_name, inner };
+                        }
+                        return Pattern::EnumVariant { name: full_name, inner: Vec::new() };
+                    }
                 }
                 if self.current == Token::LParen {
                     self.advance();

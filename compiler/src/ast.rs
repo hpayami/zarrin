@@ -68,12 +68,21 @@ pub enum Expr {
     },
     Match {
         scrutinee: Box<Expr>,
-        arms: Vec<(Pattern, Expr)>,
+        arms: Vec<(Vec<Pattern>, Option<Expr>, Expr)>,
     },
     If {
         cond: Box<Expr>,
         then_body: Box<Expr>,
         else_body: Option<Box<Expr>>,
+    },
+    While {
+        cond: Box<Expr>,
+        body: Vec<Stmt>,
+    },
+    For {
+        var: String,
+        iter: Box<Expr>,
+        body: Vec<Stmt>,
     },
 }
 
