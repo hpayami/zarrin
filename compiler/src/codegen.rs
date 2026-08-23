@@ -137,8 +137,8 @@ impl Interpreter {
                     _ => panic!("for loop requires int or range"),
                 }
             }
-            Stmt::Break => { self.should_break = true; return; }
-            Stmt::Continue => { self.should_continue = true; return; }
+            Stmt::Break(_) => { self.should_break = true; return; }
+            Stmt::Continue(_) => { self.should_continue = true; return; }
             Stmt::Assign { name, value } => {
                 let v = self.eval_expr(value, env);
                 env.set(name, v);
@@ -177,6 +177,16 @@ impl Interpreter {
                 env.get(name)
             }
             Expr::Binary(l, op, r) => { let lv = self.eval_expr(l, env); let rv = self.eval_expr(r, env); eval_binop(&lv, op, &rv) }
+            Expr::Unary(op, e) => {
+                let v = self.eval_expr(e, env);
+                match (op, &v) {
+                    (UnaryOp::Neg, Value::Int(n)) => Value::Int(-n),
+                    (UnaryOp::Neg, Value::Float(f)) => Value::Float(-f),
+                    (UnaryOp::Not, Value::Bool(b)) => Value::Bool(!b),
+                    (UnaryOp::Not, Value::Int(n)) => Value::Int(if *n == 0 { 1 } else { 0 }),
+                    _ => panic!("invalid unary operation {:?} on {:?}", op, v),
+                }
+            }
             Expr::Call(callee, args) => {
                 let name = match callee.as_ref() { Expr::Ident(n) => n, _ => panic!("cannot call non-function") };
                 if name == "print" { let v = self.eval_expr(&args[0], env); println!("{}", value_to_string(&v)); return Value::Unit; }
@@ -187,6 +197,11 @@ impl Interpreter {
                 if name == "array_len" { let v = self.eval_expr(&args[0], env); return match v { Value::Array(a) => Value::Int(a.len() as i64), _ => panic!("array_len expects array") }; }
                 if name == "array_get" { let arr = self.eval_expr(&args[0], env); let idx = self.eval_expr(&args[1], env); return match (arr, idx) { (Value::Array(a), Value::Int(i)) => a[i as usize].clone(), _ => panic!("array_get expects array and int") }; }
                 if name == "array_set" { let arr = self.eval_expr(&args[0], env); let idx = self.eval_expr(&args[1], env); let val = self.eval_expr(&args[2], env); if let (Value::Array(mut a), Value::Int(i)) = (arr, idx) { a[i as usize] = val; return Value::Array(a); } else { panic!("array_set expects array, int, value"); } }
+                if name == "substring" { let s = self.eval_expr(&args[0], env); let start = self.eval_expr(&args[1], env); let end = self.eval_expr(&args[2], env); if let (Value::Str(s), Value::Int(start), Value::Int(end)) = (s, start, end) { return Value::Str(s[start as usize..end as usize].to_string()); } else { panic!("substring expects string, int, int"); } }
+                if name == "contains" { let s = self.eval_expr(&args[0], env); let needle = self.eval_expr(&args[1], env); if let (Value::Str(s), Value::Str(needle)) = (s, needle) { return Value::Bool(s.contains(&needle)); } else { panic!("contains expects string, string"); } }
+                if name == "split" { let s = self.eval_expr(&args[0], env); let delim = self.eval_expr(&args[1], env); if let (Value::Str(s), Value::Str(delim)) = (s, delim) { return Value::Array(s.split(&delim).map(|part| Value::Str(part.to_string())).collect()); } else { panic!("split expects string, string"); } }
+                if name == "trim" { let s = self.eval_expr(&args[0], env); if let Value::Str(s) = s { return Value::Str(s.trim().to_string()); } else { panic!("trim expects string"); } }
+                if name == "char_at" { let s = self.eval_expr(&args[0], env); let idx = self.eval_expr(&args[1], env); if let (Value::Str(s), Value::Int(i)) = (s, idx) { let ch = s.chars().nth(i as usize).unwrap_or('\0'); return Value::Str(ch.to_string()); } else { panic!("char_at expects string, int"); } }
                 if let Some(vdef) = env.enums.values().find_map(|v| v.iter().find(|(vn, _)| vn == name)) {
                     let _ = vdef;
                     let eval_args: Vec<Value> = args.iter().map(|a| self.eval_expr(a, env)).collect();
@@ -356,11 +371,17 @@ fn eval_binop(l: &Value, op: &BinOp, r: &Value) -> Value {
             BinOp::Eq => Value::Bool(a == b), BinOp::Ne => Value::Bool(a != b),
             BinOp::Lt => Value::Bool(a < b), BinOp::Le => Value::Bool(a <= b),
             BinOp::Gt => Value::Bool(a > b), BinOp::Ge => Value::Bool(a >= b),
+            BinOp::And => Value::Bool(*a != 0 && *b != 0), BinOp::Or => Value::Bool(*a != 0 || *b != 0),
         },
         (Value::Float(a), Value::Float(b)) => match op {
             BinOp::Add => Value::Float(a + b), BinOp::Sub => Value::Float(a - b),
             BinOp::Mul => Value::Float(a * b), BinOp::Div => Value::Float(a / b),
             _ => panic!("unsupported float op"),
+        },
+        (Value::Bool(a), Value::Bool(b)) => match op {
+            BinOp::Eq => Value::Bool(a == b), BinOp::Ne => Value::Bool(a != b),
+            BinOp::And => Value::Bool(*a && *b), BinOp::Or => Value::Bool(*a || *b),
+            _ => panic!("unsupported bool op"),
         },
         (Value::Str(a), Value::Str(b)) => match op {
             BinOp::Add => Value::Str(format!("{}{}", a, b)),

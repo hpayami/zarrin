@@ -12,7 +12,7 @@ use inkwell::context::Context;
 use inkwell::module::Module;
 use inkwell::types::{BasicMetadataTypeEnum, FloatType, IntType};
 use inkwell::basic_block::BasicBlock;
-use inkwell::values::{BasicMetadataValueEnum, BasicValueEnum, FloatValue, FunctionValue, IntValue, PointerValue};
+use inkwell::values::{BasicMetadataValueEnum, BasicValue, BasicValueEnum, FloatValue, FunctionValue, IntValue, PointerValue};
 use either::Either;
 use inkwell::AddressSpace;
 use std::collections::HashMap;
@@ -213,8 +213,28 @@ impl<'ctx> Codegen<'ctx> {
                                 let cmp = self.builder.build_int_compare(pred, lv, rv, "cmp").unwrap();
                                 CgValue::Int(self.builder.build_int_z_extend(cmp, self.i64, "cmp_ext").unwrap())
                             }
+                            BinOp::And => CgValue::Int(self.builder.build_and(lv, rv, "and").unwrap()),
+                            BinOp::Or => CgValue::Int(self.builder.build_or(lv, rv, "or").unwrap()),
                         }
                     }
+                }
+            }
+            Expr::Unary(op, e) => {
+                let v = self.gen_expr(e);
+                match op {
+                    UnaryOp::Neg => match v {
+                        CgValue::Int(i) => CgValue::Int(self.builder.build_int_neg(i, "neg").unwrap()),
+                        CgValue::Float(f) => CgValue::Float(self.builder.build_float_neg(f, "fneg").unwrap()),
+                        _ => panic!("cannot negate non-numeric value"),
+                    },
+                    UnaryOp::Not => match v {
+                        CgValue::Int(i) => {
+                            let zero = self.i64.const_int(0, false);
+                            let cmp = self.builder.build_int_compare(inkwell::IntPredicate::EQ, i, zero, "not_cmp").unwrap();
+                            CgValue::Int(self.builder.build_int_z_extend(cmp, self.i64, "not").unwrap())
+                        }
+                        _ => panic!("cannot negate non-boolean value"),
+                    },
                 }
             }
             Expr::Call(callee, args) => {
@@ -326,6 +346,101 @@ impl<'ctx> Codegen<'ctx> {
                     };
                     self.builder.build_store(elem_ptr, new_int).unwrap();
                     return CgValue::Int(self.builder.build_ptr_to_int(buf, self.i64, "new_arr_ptr").unwrap());
+                }
+                if name == "substring" {
+                    let s_val = self.gen_expr(&args[0]);
+                    let start_val = self.gen_expr(&args[1]);
+                    let end_val = self.gen_expr(&args[2]);
+                    let s_ptr = match s_val { CgValue::Str(p) => p, _ => panic!("substring expects string") };
+                    let start = self.value_to_int(&start_val);
+                    let end = self.value_to_int(&end_val);
+                    let malloc_type = self.context.ptr_type(AddressSpace::default()).fn_type(&[self.i64.into()], false);
+                    let malloc_fn = self.module.get_function("malloc").unwrap_or_else(|| self.module.add_function("malloc", malloc_type, None));
+                    let memcpy_type = self.context.void_type().fn_type(&[
+                        self.context.ptr_type(AddressSpace::default()).into(),
+                        self.context.ptr_type(AddressSpace::default()).into(),
+                        self.i64.into(),
+                    ], false);
+                    let memcpy_fn = self.module.get_function("memcpy").unwrap_or_else(|| self.module.add_function("memcpy", memcpy_type, None));
+                    let sub_len = self.builder.build_int_sub(end, start, "sub_len").unwrap();
+                    let buf = self.builder.build_call(malloc_fn, &[self.builder.build_int_add(sub_len, self.i64.const_int(1, false), "sub_alloc").unwrap().into()], "sub_buf").unwrap().try_as_basic_value().left().unwrap().into_pointer_value();
+                    let src_ptr = unsafe {
+                        self.builder.build_gep(self.i8, s_ptr, &[start], "src_ptr").unwrap()
+                    };
+                    self.builder.build_call(memcpy_fn, &[buf.into(), src_ptr.into(), sub_len.into()], "sub_cp").unwrap();
+                    let null_ptr = unsafe {
+                        self.builder.build_gep(self.i8, buf, &[sub_len], "null_ptr").unwrap()
+                    };
+                    self.builder.build_store(null_ptr, self.i8.const_int(0, false)).unwrap();
+                    return CgValue::Str(buf);
+                }
+                if name == "contains" {
+                    let s_val = self.gen_expr(&args[0]);
+                    let needle_val = self.gen_expr(&args[1]);
+                    let s_ptr = match s_val { CgValue::Str(p) => p, _ => panic!("contains expects string") };
+                    let needle_ptr = match needle_val { CgValue::Str(p) => p, _ => panic!("contains expects string") };
+                    let strstr_type = self.context.ptr_type(AddressSpace::default()).fn_type(&[
+                        self.context.ptr_type(AddressSpace::default()).into(),
+                        self.context.ptr_type(AddressSpace::default()).into(),
+                    ], false);
+                    let strstr_fn = self.module.get_function("strstr").unwrap_or_else(|| self.module.add_function("strstr", strstr_type, None));
+                    let result = self.builder.build_call(strstr_fn, &[s_ptr.into(), needle_ptr.into()], "strstr_call").unwrap().try_as_basic_value().left().unwrap().into_pointer_value();
+                    let is_null = self.builder.build_is_null(result, "is_null").unwrap();
+                    let not_found = self.builder.build_int_z_extend(is_null, self.i64, "not_found").unwrap();
+                    let found = self.builder.build_int_sub(self.i64.const_int(1, false), not_found, "found").unwrap();
+                    return CgValue::Int(found);
+                }
+                if name == "trim" {
+                    let s_val = self.gen_expr(&args[0]);
+                    let s_ptr = match s_val { CgValue::Str(p) => p, _ => panic!("trim expects string") };
+                    let byte_ptr_ty = self.context.ptr_type(AddressSpace::default());
+                    let i64_type = self.i64.fn_type(&[byte_ptr_ty.into(), byte_ptr_ty.into()], false);
+                    let strspn_fn = self.module.get_function("strspn").unwrap_or_else(|| self.module.add_function("strspn", i64_type, None));
+                    let strcspn_fn = self.module.get_function("strcspn").unwrap_or_else(|| self.module.add_function("strcspn", i64_type, None));
+                    let ws = self.builder.build_global_string_ptr(" \t\n\r", "ws").unwrap().as_pointer_value();
+                    let start_skip = self.builder.build_call(strspn_fn, &[s_ptr.into(), ws.into()], "start_skip").unwrap().try_as_basic_value().left().unwrap().into_int_value();
+                    let trimmed_start = unsafe {
+                        self.builder.build_gep(self.i8, s_ptr, &[start_skip], "trimmed_start").unwrap()
+                    };
+                    let len_after = self.builder.build_call(strcspn_fn, &[trimmed_start.into(), ws.into()], "len_after").unwrap().try_as_basic_value().left().unwrap().into_int_value();
+                    let malloc_type = self.context.ptr_type(AddressSpace::default()).fn_type(&[self.i64.into()], false);
+                    let malloc_fn = self.module.get_function("malloc").unwrap_or_else(|| self.module.add_function("malloc", malloc_type, None));
+                    let memcpy_type = self.context.void_type().fn_type(&[
+                        byte_ptr_ty.into(),
+                        byte_ptr_ty.into(),
+                        self.i64.into(),
+                    ], false);
+                    let memcpy_fn = self.module.get_function("memcpy").unwrap_or_else(|| self.module.add_function("memcpy", memcpy_type, None));
+                    let buf = self.builder.build_call(malloc_fn, &[self.builder.build_int_add(len_after, self.i64.const_int(1, false), "trim_alloc").unwrap().into()], "trim_buf").unwrap().try_as_basic_value().left().unwrap().into_pointer_value();
+                    self.builder.build_call(memcpy_fn, &[buf.into(), trimmed_start.into(), len_after.into()], "trim_cp").unwrap();
+                    let null_ptr = unsafe {
+                        self.builder.build_gep(self.i8, buf, &[len_after], "null_ptr").unwrap()
+                    };
+                    self.builder.build_store(null_ptr, self.i8.const_int(0, false)).unwrap();
+                    return CgValue::Str(buf);
+                }
+                if name == "char_at" {
+                    let s_val = self.gen_expr(&args[0]);
+                    let idx_val = self.gen_expr(&args[1]);
+                    let s_ptr = match s_val { CgValue::Str(p) => p, _ => panic!("char_at expects string") };
+                    let idx_int = self.value_to_int(&idx_val);
+                    let byte_ptr_ty = self.context.ptr_type(AddressSpace::default());
+                    let char_ptr = unsafe {
+                        self.builder.build_gep(self.i8, s_ptr, &[idx_int], "char_ptr").unwrap()
+                    };
+                    let buf = {
+                        let malloc_type = self.context.ptr_type(AddressSpace::default()).fn_type(&[self.i64.into()], false);
+                        let malloc_fn = self.module.get_function("malloc").unwrap_or_else(|| self.module.add_function("malloc", malloc_type, None));
+                        self.builder.build_call(malloc_fn, &[self.i64.const_int(2, false).into()], "char_buf").unwrap().try_as_basic_value().left().unwrap().into_pointer_value()
+                    };
+                    let ch = self.builder.build_load(self.i8, char_ptr, "ch").unwrap().into_int_value();
+                    let buf_byte = self.builder.build_bit_cast(buf, self.i8.ptr_type(AddressSpace::default()), "buf_byte").unwrap().into_pointer_value();
+                    self.builder.build_store(buf_byte, ch).unwrap();
+                    let null_ptr = unsafe {
+                        self.builder.build_gep(self.i8, buf_byte, &[self.i64.const_int(1, false)], "null_ptr").unwrap()
+                    };
+                    self.builder.build_store(null_ptr, self.i8.const_int(0, false)).unwrap();
+                    return CgValue::Str(buf);
                 }
                 if let Some((_, variants)) = self.enum_variants.iter().find(|(_, v)| v.iter().any(|(vn, _)| vn == name)) {
                     let tag = variants.iter().position(|(vn, _)| vn == name).unwrap();
@@ -691,22 +806,39 @@ Expr::Match { scrutinee, arms } => {
         let buf = self.builder.build_call(malloc_fn, &[self.i64.const_int(32, false).into()], "int_buf").unwrap().try_as_basic_value().left().unwrap().into_pointer_value();
 
         let fn_val = self.builder.get_insert_block().unwrap().get_parent().unwrap();
+        let entry_bb = self.builder.get_insert_block().unwrap();
+
+        let neg_bb = self.context.append_basic_block(fn_val, "itoa_neg");
+        let pos_bb = self.context.append_basic_block(fn_val, "itoa_pos");
         let loop_bb = self.context.append_basic_block(fn_val, "itoa_loop");
         let done_bb = self.context.append_basic_block(fn_val, "itoa_done");
+
+        let is_neg = self.builder.build_int_compare(inkwell::IntPredicate::SLT, val, self.i64.const_int(0, false), "is_neg").unwrap();
+        self.builder.build_conditional_branch(is_neg, neg_bb, pos_bb).unwrap();
+
+        self.builder.position_at_end(neg_bb);
+        let neg_val = self.builder.build_int_neg(val, "neg_val").unwrap();
+        self.builder.build_unconditional_branch(pos_bb).unwrap();
+
+        self.builder.position_at_end(pos_bb);
+        let abs_phi = self.builder.build_phi(self.i64, "abs_val").unwrap();
+        abs_phi.add_incoming(&[
+            (&neg_val as &dyn BasicValue, neg_bb),
+            (&val as &dyn BasicValue, entry_bb),
+        ]);
+        let abs = abs_phi.as_basic_value().into_int_value();
 
         let idx_ptr = self.builder.build_alloca(self.i64, "itoa_idx").unwrap();
         self.builder.build_store(idx_ptr, self.i64.const_int(30, false)).unwrap();
         let val_ptr = self.builder.build_alloca(self.i64, "itoa_val").unwrap();
-        self.builder.build_store(val_ptr, val).unwrap();
-
-        let zero = self.i64.const_int(0, false);
-        let ten = self.i64.const_int(10, false);
+        self.builder.build_store(val_ptr, abs).unwrap();
 
         self.builder.build_unconditional_branch(loop_bb).unwrap();
         self.builder.position_at_end(loop_bb);
         let cur_idx = self.builder.build_load(self.i64, idx_ptr, "cur_idx").unwrap().into_int_value();
         let cur_val = self.builder.build_load(self.i64, val_ptr, "cur_val").unwrap().into_int_value();
-        let digit = self.builder.build_int_signed_rem(cur_val, ten, "digit").unwrap();
+        let ten = self.i64.const_int(10, false);
+        let digit = self.builder.build_int_unsigned_rem(cur_val, ten, "digit").unwrap();
         let ascii = self.builder.build_int_add(digit, self.i64.const_int(48, false), "ascii").unwrap();
 
         let byte_ptr_ty = self.i8.ptr_type(AddressSpace::default());
@@ -719,11 +851,11 @@ Expr::Match { scrutinee, arms } => {
 
         let next_idx = self.builder.build_int_sub(cur_idx, self.i64.const_int(1, false), "next_idx").unwrap();
         self.builder.build_store(idx_ptr, next_idx).unwrap();
-        let next_val = self.builder.build_int_signed_div(cur_val, ten, "next_val").unwrap();
+        let next_val = self.builder.build_int_unsigned_div(cur_val, ten, "next_val").unwrap();
         self.builder.build_store(val_ptr, next_val).unwrap();
 
-        let is_done = self.builder.build_int_compare(inkwell::IntPredicate::SLT, next_idx, zero, "is_done").unwrap();
-        let is_val_zero = self.builder.build_int_compare(inkwell::IntPredicate::EQ, next_val, zero, "val_zero").unwrap();
+        let is_done = self.builder.build_int_compare(inkwell::IntPredicate::SLT, next_idx, self.i64.const_int(0, false), "is_done").unwrap();
+        let is_val_zero = self.builder.build_int_compare(inkwell::IntPredicate::EQ, next_val, self.i64.const_int(0, false), "val_zero").unwrap();
         let should_exit = self.builder.build_or(is_done, is_val_zero, "should_exit").unwrap();
         self.builder.build_conditional_branch(should_exit, done_bb, loop_bb).unwrap();
 
@@ -731,13 +863,34 @@ Expr::Match { scrutinee, arms } => {
         let null_term_idx = self.builder.build_load(self.i64, idx_ptr, "null_idx").unwrap().into_int_value();
         let first_digit = self.builder.build_int_add(null_term_idx, self.i64.const_int(1, false), "first_digit").unwrap();
         let buf_byte_ptr2 = self.builder.build_bit_cast(buf, byte_ptr_ty, "buf_byte2").unwrap().into_pointer_value();
+
+        let write_neg_bb = self.context.append_basic_block(fn_val, "write_neg");
+        let final_bb = self.context.append_basic_block(fn_val, "itoa_final");
+        self.builder.build_conditional_branch(is_neg, write_neg_bb, final_bb).unwrap();
+
+        self.builder.position_at_end(write_neg_bb);
+        let first_digit_neg = self.builder.build_int_sub(first_digit, self.i64.const_int(1, false), "first_digit_neg").unwrap();
+        let minus_ptr = unsafe {
+            self.builder.build_gep(self.i8, buf_byte_ptr2, &[first_digit_neg], "minus_ptr").unwrap()
+        };
+        self.builder.build_store(minus_ptr, self.i8.const_int(45, false)).unwrap();
+        self.builder.build_unconditional_branch(final_bb).unwrap();
+
+        self.builder.position_at_end(final_bb);
+        let final_first_digit = self.builder.build_phi(self.i64, "final_first").unwrap();
+        final_first_digit.add_incoming(&[
+            (&first_digit_neg as &dyn BasicValue, write_neg_bb),
+            (&first_digit as &dyn BasicValue, done_bb),
+        ]);
+        let fd = final_first_digit.as_basic_value().into_int_value();
+
         let null_ptr = unsafe {
             self.builder.build_gep(self.i8, buf_byte_ptr2, &[self.i64.const_int(31, false)], "null_ptr").unwrap()
         };
         self.builder.build_store(null_ptr, self.i8.const_int(0, false)).unwrap();
 
         let result_ptr = unsafe {
-            self.builder.build_gep(self.i8, buf_byte_ptr2, &[first_digit], "result_ptr").unwrap()
+            self.builder.build_gep(self.i8, buf_byte_ptr2, &[fd], "result_ptr").unwrap()
         };
         result_ptr
     }
@@ -922,14 +1075,14 @@ Expr::Match { scrutinee, arms } => {
 
                 self.builder.position_at_end(after_bb);
             }
-            Stmt::Break => {
+            Stmt::Break(_) => {
                 if let Some(exit_bb) = self.loop_exit.last().cloned() {
                     self.builder.build_unconditional_branch(exit_bb).unwrap();
                     let dead_bb = self.context.append_basic_block(self.builder.get_insert_block().unwrap().get_parent().unwrap(), "dead");
                     self.builder.position_at_end(dead_bb);
                 }
             }
-            Stmt::Continue => {
+            Stmt::Continue(_) => {
                 if let Some(cont_bb) = self.loop_continue.last().cloned() {
                     self.builder.build_unconditional_branch(cont_bb).unwrap();
                     let dead_bb = self.context.append_basic_block(self.builder.get_insert_block().unwrap().get_parent().unwrap(), "dead");
@@ -1011,6 +1164,7 @@ fn expand_macros_in_expr(expr: &Expr, macros: &HashMap<String, (Vec<String>, Vec
     }
     match expr {
         Expr::Binary(l, op, r) => Expr::Binary(Box::new(expand_macros_in_expr(l, macros)), op.clone(), Box::new(expand_macros_in_expr(r, macros))),
+        Expr::Unary(op, e) => Expr::Unary(op.clone(), Box::new(expand_macros_in_expr(e, macros))),
         Expr::Call(callee, args) => Expr::Call(Box::new(expand_macros_in_expr(callee, macros)), args.iter().map(|a| expand_macros_in_expr(a, macros)).collect()),
         Expr::If { cond, then_body, else_body } => Expr::If {
             cond: Box::new(expand_macros_in_expr(cond, macros)),
@@ -1040,6 +1194,7 @@ fn substitute_expr(expr: &Expr, arg_map: &HashMap<String, Expr>, macros: &HashMa
             op.clone(),
             Box::new(substitute_expr(r, arg_map, macros)),
         ),
+        Expr::Unary(op, e) => Expr::Unary(op.clone(), Box::new(substitute_expr(e, arg_map, macros))),
         Expr::Call(callee, args) => {
             let expanded = Expr::Call(
                 Box::new(substitute_expr(callee, arg_map, macros)),
@@ -1255,13 +1410,14 @@ pub fn compile_to_executable(program: &Program, out_path: &str) {
     for s in &program.stmts {
         match s {
             Stmt::Fn { name, params, ret, .. } => {
+                let internal_name = if name == "main" { "_zarrin_main".to_string() } else { name.clone() };
                 let param_types: Vec<BasicMetadataTypeEnum> = params.iter().map(|_| cg.i64.into()).collect();
                 let fn_type = if matches!(ret, Type::Unit) {
                     context.void_type().fn_type(&param_types, false)
                 } else {
                     cg.i64.fn_type(&param_types, false)
                 };
-                let func = cg.module.add_function(name, fn_type, None);
+                let func = cg.module.add_function(&internal_name, fn_type, None);
                 cg.functions.insert(name.clone(), func);
                 cg.fn_ret_types.insert(name.clone(), ret.clone());
             }
@@ -1344,23 +1500,30 @@ pub fn compile_to_executable(program: &Program, out_path: &str) {
     }
 
     // Generate main
+    let has_user_main = program.stmts.iter().any(|s| matches!(s, Stmt::Fn { name, .. } if name == "main"));
+
     let main_type = context.i64_type().fn_type(&[], false);
     let main_fn = cg.module.add_function("main", main_type, None);
     let entry = context.append_basic_block(main_fn, "entry");
     cg.builder.position_at_end(entry);
     cg.named.clear();
 
-    let mut terminated = false;
-    for s in &program.stmts {
-        match s {
-            Stmt::Fn { .. } | Stmt::Struct { .. } | Stmt::Enum { .. } | Stmt::Trait { .. }
-            | Stmt::Macro { .. } | Stmt::ExternFn { .. } | Stmt::Impl { .. } => {}
-            _ => cg.gen_stmt(s, main_fn, &mut terminated),
-        }
-    }
-
-    if !terminated {
+    if has_user_main {
+        let user_main = cg.module.get_function("_zarrin_main").unwrap();
+        cg.builder.build_call(user_main, &[], "").unwrap();
         cg.builder.build_return(Some(&cg.i64.const_int(0, false))).unwrap();
+    } else {
+        let mut terminated = false;
+        for s in &program.stmts {
+            match s {
+                Stmt::Fn { .. } | Stmt::Struct { .. } | Stmt::Enum { .. } | Stmt::Trait { .. }
+                | Stmt::Macro { .. } | Stmt::ExternFn { .. } | Stmt::Impl { .. } => {}
+                _ => cg.gen_stmt(s, main_fn, &mut terminated),
+            }
+        }
+        if !terminated {
+            cg.builder.build_return(Some(&cg.i64.const_int(0, false))).unwrap();
+        }
     }
 
     let ir = cg.module.print_to_string();

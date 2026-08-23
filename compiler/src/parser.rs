@@ -57,13 +57,19 @@ impl<'a> Parser<'a> {
                 self.expect(Token::RBrace);
                 let else_body = if self.current == Token::Else {
                     self.advance();
-                    self.expect(Token::LBrace);
-                    let mut eb = Vec::new();
-                    while self.current != Token::RBrace {
-                        eb.push(self.parse_stmt());
+                    if self.current == Token::If {
+                        // else if -> desugar to else { if ... }
+                        let if_stmt = self.parse_stmt();
+                        Some(vec![if_stmt])
+                    } else {
+                        self.expect(Token::LBrace);
+                        let mut eb = Vec::new();
+                        while self.current != Token::RBrace {
+                            eb.push(self.parse_stmt());
+                        }
+                        self.expect(Token::RBrace);
+                        Some(eb)
                     }
-                    self.expect(Token::RBrace);
-                    Some(eb)
                 } else {
                     None
                 };
@@ -98,13 +104,23 @@ impl<'a> Parser<'a> {
             }
             Token::Break => {
                 self.advance();
+                let e = if self.current == Token::Semicolon {
+                    None
+                } else {
+                    Some(self.parse_expr())
+                };
                 self.expect(Token::Semicolon);
-                Stmt::Break
+                Stmt::Break(e)
             }
             Token::Continue => {
                 self.advance();
+                let e = if self.current == Token::Semicolon {
+                    None
+                } else {
+                    Some(self.parse_expr())
+                };
                 self.expect(Token::Semicolon);
-                Stmt::Continue
+                Stmt::Continue(e)
             }
             Token::Return => {
                 self.advance();
@@ -477,7 +493,7 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_binop(&mut self, min_prec: u8) -> Expr {
-        let mut left = self.parse_postfix();
+        let mut left = self.parse_unary();
         loop {
             let (prec, op) = match self.current {
                 Token::Plus => (1, BinOp::Add),
@@ -491,6 +507,8 @@ impl<'a> Parser<'a> {
                 Token::Le => (0, BinOp::Le),
                 Token::Gt => (0, BinOp::Gt),
                 Token::Ge => (0, BinOp::Ge),
+                Token::AmpAmp => (3, BinOp::And),
+                Token::PipePipe => (3, BinOp::Or),
                 _ => break,
             };
             if prec < min_prec {
@@ -511,6 +529,22 @@ impl<'a> Parser<'a> {
             left = Expr::Range(Box::new(left), Box::new(right));
         }
         left
+    }
+
+    fn parse_unary(&mut self) -> Expr {
+        match self.current {
+            Token::Minus => {
+                self.advance();
+                let expr = self.parse_unary();
+                Expr::Unary(UnaryOp::Neg, Box::new(expr))
+            }
+            Token::Bang => {
+                self.advance();
+                let expr = self.parse_unary();
+                Expr::Unary(UnaryOp::Not, Box::new(expr))
+            }
+            _ => self.parse_postfix(),
+        }
     }
 
     fn parse_postfix(&mut self) -> Expr {

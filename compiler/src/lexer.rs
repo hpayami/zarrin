@@ -52,6 +52,9 @@ pub enum Token {
     Arrow,
     FatArrow,
     DotDot,
+    Bang,
+    AmpAmp,
+    PipePipe,
     Semicolon,
     Eof,
 }
@@ -109,6 +112,22 @@ impl<'a> Lexer<'a> {
                 '*' => Token::Star,
                 '/' => Token::Slash,
                 '%' => Token::Percent,
+                '&' => {
+                    if self.chars.peek() == Some(&'&') {
+                        self.chars.next();
+                        Token::AmpAmp
+                    } else {
+                        panic!("unexpected character: '&', did you mean '&&'?");
+                    }
+                }
+                '|' => {
+                    if self.chars.peek() == Some(&'|') {
+                        self.chars.next();
+                        Token::PipePipe
+                    } else {
+                        panic!("unexpected character: '|', did you mean '||'?");
+                    }
+                }
                 '(' => Token::LParen,
                 ')' => Token::RParen,
                 '{' => Token::LBrace,
@@ -133,7 +152,7 @@ impl<'a> Lexer<'a> {
                         self.chars.next();
                         Token::Ne
                     } else {
-                        Token::Ident("!".into())
+                        Token::Bang
                     }
                 }
                 '<' => {

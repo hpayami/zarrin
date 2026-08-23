@@ -26,6 +26,14 @@ pub enum BinOp {
     Le,
     Gt,
     Ge,
+    And,
+    Or,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum UnaryOp {
+    Neg,
+    Not,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -47,6 +55,7 @@ pub enum Expr {
     Str(String),
     Ident(String),
     Binary(Box<Expr>, BinOp, Box<Expr>),
+    Unary(UnaryOp, Box<Expr>),
     Range(Box<Expr>, Box<Expr>),
     ArrayLit(Vec<Expr>),
     Index(Box<Expr>, Box<Expr>),
@@ -114,8 +123,8 @@ pub enum Stmt {
         iter: Expr,
         body: Vec<Stmt>,
     },
-    Break,
-    Continue,
+    Break(Option<Expr>),
+    Continue(Option<Expr>),
     Assign {
         name: String,
         value: Expr,

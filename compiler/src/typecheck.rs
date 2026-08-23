@@ -176,8 +176,8 @@ impl TypeChecker {
                 for s in body { Self::check_stmt(s, env)?; }
                 env.pop_scope();
             }
-            Stmt::Break => {}
-            Stmt::Continue => {}
+            Stmt::Break(_) => {}
+            Stmt::Continue(_) => {}
             Stmt::Assign { name, value } => {
                 let val_ty = Self::check_expr(value, env)?;
                 if let Some(var_ty) = env.lookup(name) {
@@ -235,6 +235,24 @@ impl TypeChecker {
                 match op {
                     BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Mod => Ok(lt),
                     BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge => Ok(Type::Bool),
+                    BinOp::And | BinOp::Or => Ok(Type::Bool),
+                }
+            }
+            Expr::Unary(op, e) => {
+                let et = Self::check_expr(e, env)?;
+                match op {
+                    UnaryOp::Neg => {
+                        if et != Type::Int && et != Type::Float {
+                            return Err(TypeError::TypeMismatch { expected: "int or float".into(), found: format!("{:?}", et) });
+                        }
+                        Ok(et)
+                    }
+                    UnaryOp::Not => {
+                        if et != Type::Bool && et != Type::Int {
+                            return Err(TypeError::TypeMismatch { expected: "bool or int".into(), found: format!("{:?}", et) });
+                        }
+                        Ok(Type::Bool)
+                    }
                 }
             }
             Expr::Call(callee, args) => {
@@ -246,6 +264,31 @@ impl TypeChecker {
                     if args.len() != 1 { return Err(TypeError::WrongArity { name: "print".into(), expected: 1, found: args.len() }); }
                     Self::check_expr(&args[0], env)?;
                     return Ok(Type::Unit);
+                }
+                if func_name == "substring" {
+                    if args.len() != 3 { return Err(TypeError::WrongArity { name: "substring".into(), expected: 3, found: args.len() }); }
+                    for a in args.iter() { Self::check_expr(a, env)?; }
+                    return Ok(Type::String);
+                }
+                if func_name == "contains" {
+                    if args.len() != 2 { return Err(TypeError::WrongArity { name: "contains".into(), expected: 2, found: args.len() }); }
+                    for a in args.iter() { Self::check_expr(a, env)?; }
+                    return Ok(Type::Bool);
+                }
+                if func_name == "split" {
+                    if args.len() != 2 { return Err(TypeError::WrongArity { name: "split".into(), expected: 2, found: args.len() }); }
+                    for a in args.iter() { Self::check_expr(a, env)?; }
+                    return Ok(Type::Array(Box::new(Type::String)));
+                }
+                if func_name == "trim" {
+                    if args.len() != 1 { return Err(TypeError::WrongArity { name: "trim".into(), expected: 1, found: args.len() }); }
+                    Self::check_expr(&args[0], env)?;
+                    return Ok(Type::String);
+                }
+                if func_name == "char_at" {
+                    if args.len() != 2 { return Err(TypeError::WrongArity { name: "char_at".into(), expected: 2, found: args.len() }); }
+                    for a in args.iter() { Self::check_expr(a, env)?; }
+                    return Ok(Type::String);
                 }
                 if let Some(variant_args) = env.enums.values().find_map(|v| v.iter().find(|(vn, _)| vn == func_name).map(|(_, a)| a.clone())) {
                     let enum_name = env.enums.iter().find(|(_, v)| v.iter().any(|(vn, _)| vn == func_name)).map(|(n, _)| n.clone()).unwrap();
