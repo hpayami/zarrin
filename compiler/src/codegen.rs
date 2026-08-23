@@ -87,7 +87,7 @@ impl Interpreter {
     fn eval_stmt(&mut self, stmt: &Stmt, env: &mut Env) {
         match stmt {
             Stmt::Let { name, value, .. } => { let v = self.eval_expr(value, env); env.set(name, v); }
-            Stmt::Fn { .. } | Stmt::Struct { .. } | Stmt::Enum { .. } | Stmt::Trait { .. } | Stmt::Macro { .. } | Stmt::ExternFn { .. } | Stmt::Impl { .. } => {}
+            Stmt::Fn { .. } | Stmt::Struct { .. } | Stmt::Enum { .. } | Stmt::Trait { .. } | Stmt::Macro { .. } | Stmt::ExternFn { .. } | Stmt::Impl { .. } | Stmt::Import(_) => {}
             Stmt::Expr(e) => { self.eval_expr(e, env); }
             Stmt::Return(e) => { self.returned = Some(match e { Some(x) => self.eval_expr(x, env), None => Value::Unit }); }
             Stmt::While { cond, body } => {

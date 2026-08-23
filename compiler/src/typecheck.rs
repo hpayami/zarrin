@@ -164,7 +164,7 @@ impl TypeChecker {
                 env.current_return = prev;
                 env.pop_scope();
             }
-            Stmt::Struct { .. } | Stmt::Enum { .. } | Stmt::Trait { .. } | Stmt::Macro { .. } | Stmt::ExternFn { .. } | Stmt::Impl { .. } => {}
+            Stmt::Struct { .. } | Stmt::Enum { .. } | Stmt::Trait { .. } | Stmt::Macro { .. } | Stmt::ExternFn { .. } | Stmt::Impl { .. } | Stmt::Import(_) => {}
             Stmt::While { cond, body } => {
                 Self::check_expr(cond, env)?;
                 for s in body { Self::check_stmt(s, env)?; }

@@ -46,6 +46,15 @@ impl<'a> Parser<'a> {
             Token::Impl => self.parse_impl(),
             Token::Extern => self.parse_extern_fn(),
             Token::Macro => self.parse_macro(),
+            Token::Import => {
+                self.advance();
+                let path = match self.current.clone() {
+                    Token::Str(s) => { self.advance(); s }
+                    t => panic!("expected string path after import, found {:?}", t),
+                };
+                self.expect(Token::Semicolon);
+                Stmt::Import(path)
+            }
             Token::If => {
                 self.advance(); // if
                 let cond = self.parse_expr();

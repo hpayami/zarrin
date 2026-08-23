@@ -29,6 +29,7 @@ pub enum Token {
     Break,
     Continue,
     In,
+    Import,
     // symbols
     Colon,
     ColonColon,
@@ -274,6 +275,7 @@ impl<'a> Lexer<'a> {
                         "break" => Token::Break,
                         "continue" => Token::Continue,
                         "in" => Token::In,
+                        "import" => Token::Import,
                         "true" => Token::Bool(true),
                         "false" => Token::Bool(false),
                         _ => Token::Ident(id),

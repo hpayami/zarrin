@@ -150,6 +150,7 @@ pub enum Stmt {
     },
     Expr(Expr),
     Return(Option<Expr>),
+    Import(String),
 }
 
 #[derive(Debug, Clone, PartialEq)]

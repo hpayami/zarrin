@@ -15,7 +15,36 @@ mod typecheck;
 mod codegen_llvm;
 
 use std::fs;
+use std::path::Path;
 use std::process::exit;
+
+fn resolve_imports(program: &mut ast::Program, base_dir: &Path, visited: &mut Vec<String>) {
+    let mut new_stmts = Vec::new();
+    for stmt in &program.stmts {
+        if let ast::Stmt::Import(path) = stmt {
+            if visited.contains(path) {
+                continue;
+            }
+            visited.push(path.clone());
+            let full_path = base_dir.join(path);
+            let src = match fs::read_to_string(&full_path) {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("error reading import {}: {}", path, e);
+                    exit(1);
+                }
+            };
+            let mut p = parser::Parser::new(&src);
+            let mut imported = p.parse_program();
+            let import_dir = full_path.parent().unwrap_or(base_dir);
+            resolve_imports(&mut imported, import_dir, visited);
+            new_stmts.extend(imported.stmts);
+        } else {
+            new_stmts.push(stmt.clone());
+        }
+    }
+    program.stmts = new_stmts;
+}
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -35,7 +64,11 @@ fn main() {
     };
 
     let mut p = parser::Parser::new(&src);
-    let program = p.parse_program();
+    let mut program = p.parse_program();
+
+    let base_dir = Path::new(file).parent().unwrap_or(Path::new("."));
+    let mut visited = Vec::new();
+    resolve_imports(&mut program, base_dir, &mut visited);
 
     match cmd {
         "run" => {
