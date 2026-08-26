@@ -501,23 +501,25 @@ impl<'a> Parser<'a> {
         self.parse_range()
     }
 
+    /// Binding power, loosest to tightest: `||` < `&&` < comparison < `+ -` < `* / %`.
+    /// All levels are left-associative, hence the `prec + 1` on the right operand.
     fn parse_binop(&mut self, min_prec: u8) -> Expr {
         let mut left = self.parse_unary();
         loop {
             let (prec, op) = match self.current {
-                Token::Plus => (1, BinOp::Add),
-                Token::Minus => (1, BinOp::Sub),
-                Token::Star => (2, BinOp::Mul),
-                Token::Slash => (2, BinOp::Div),
-                Token::Percent => (2, BinOp::Mod),
-                Token::Eq => (0, BinOp::Eq),
-                Token::Ne => (0, BinOp::Ne),
-                Token::Lt => (0, BinOp::Lt),
-                Token::Le => (0, BinOp::Le),
-                Token::Gt => (0, BinOp::Gt),
-                Token::Ge => (0, BinOp::Ge),
-                Token::AmpAmp => (3, BinOp::And),
-                Token::PipePipe => (3, BinOp::Or),
+                Token::PipePipe => (1, BinOp::Or),
+                Token::AmpAmp => (2, BinOp::And),
+                Token::Eq => (3, BinOp::Eq),
+                Token::Ne => (3, BinOp::Ne),
+                Token::Lt => (3, BinOp::Lt),
+                Token::Le => (3, BinOp::Le),
+                Token::Gt => (3, BinOp::Gt),
+                Token::Ge => (3, BinOp::Ge),
+                Token::Plus => (4, BinOp::Add),
+                Token::Minus => (4, BinOp::Sub),
+                Token::Star => (5, BinOp::Mul),
+                Token::Slash => (5, BinOp::Div),
+                Token::Percent => (5, BinOp::Mod),
                 _ => break,
             };
             if prec < min_prec {
