@@ -1,4 +1,8 @@
 /target
-Cargo.lock
+
+# `zarrinc build` writes <out>, <out>.ll and <out>.o beside the source,
+# where <out> defaults to a.out.
+a.out
+*.ll
 *.o
 *.exe
