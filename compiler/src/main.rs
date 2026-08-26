@@ -6,6 +6,7 @@
 //!   zarrinc check <file.zr>      # parse + type-check placeholder
 
 mod ast;
+mod builtins;
 mod diagnostic;
 mod codegen;
 mod lexer;
@@ -80,6 +81,16 @@ fn resolve_imports(program: &mut ast::Program, base_dir: &Path, visited: &mut Ve
     program.stmts = new_stmts;
 }
 
+/// Type-check before executing or compiling. The checker used to be reachable
+/// only through `zarrinc check`, so `run` and `build` happily executed programs
+/// it would have rejected.
+fn check_or_exit(program: &ast::Program) {
+    if let Err(e) = typecheck::TypeChecker::check(program) {
+        eprintln!("error: {}", e);
+        exit(1);
+    }
+}
+
 fn main() {
     install_error_reporter();
     let args: Vec<String> = std::env::args().collect();
@@ -106,6 +117,7 @@ fn main() {
 
     match cmd {
         "run" => {
+            check_or_exit(&program);
             let mut interp = codegen::Interpreter::new(&program);
             interp.run(&program);
         }
@@ -123,6 +135,7 @@ fn main() {
         }
         #[cfg(feature = "llvm")]
         "build" => {
+            check_or_exit(&program);
             let out = if args.get(3).map(|s| s.as_str()) == Some("-o") {
                 args.get(4).cloned().unwrap_or_else(|| "a.out".into())
             } else {

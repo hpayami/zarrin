@@ -98,9 +98,3 @@ pub fn builtin_enums() -> Vec<(String, Vec<(String, Vec<Type>)>)> {
         ]),
     ]
 }
-
-/// The built-in payloads are declared `Inferred`, which stands for "any type"
-/// until the language grows real generics.
-pub fn payload_accepts(declared: &Type, actual: &Type) -> bool {
-    *declared == Type::Inferred || declared == actual
-}
