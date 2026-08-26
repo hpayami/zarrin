@@ -806,7 +806,18 @@ Expr::Match { scrutinee, arms } => {
                     self.builder.position_at_end(current_check);
                     let arm_bb = self.context.append_basic_block(parent, &format!("arm_{}", i));
                     let is_wildcard = patterns.iter().any(|p| matches!(p, Pattern::Wildcard | Pattern::Variable(_)));
-                    let is_last = is_wildcard || i == arms.len() - 1;
+                    // An irrefutable pattern is not the end of the road when it
+                    // carries a guard: the arm can still fail and control has to
+                    // reach the next one.
+                    let is_last = (is_wildcard && guard.is_none()) || i == arms.len() - 1;
+                    // One block for every way this arm can fail. The pattern test
+                    // and the guard each used to append their own, leaving one of
+                    // them branched to but never terminated.
+                    let next_check = if is_last {
+                        None
+                    } else {
+                        Some(self.context.append_basic_block(parent, &format!("match_check_{}", i + 1)))
+                    };
 
                     let mut any_matched_bb = arm_bb;
                     let mut check_bb = current_check;
@@ -823,12 +834,9 @@ Expr::Match { scrutinee, arms } => {
                                     self.builder.build_conditional_branch(cmp, arm_bb, next_pattern).unwrap();
                                     check_bb = next_pattern;
                                 } else {
-                                    if is_last {
-                                        self.builder.build_unconditional_branch(arm_bb).unwrap();
-                                    } else {
-                                        let next_check = self.context.append_basic_block(parent, &format!("match_check_{}", i + 1));
-                                        self.builder.build_conditional_branch(cmp, arm_bb, next_check).unwrap();
-                                        current_check = next_check;
+                                    match next_check {
+                                        None => { self.builder.build_unconditional_branch(arm_bb).unwrap(); }
+                                        Some(nc) => { self.builder.build_conditional_branch(cmp, arm_bb, nc).unwrap(); }
                                     }
                                 }
                             }
@@ -849,12 +857,9 @@ Expr::Match { scrutinee, arms } => {
                                     self.builder.build_conditional_branch(cmp, arm_bb, next_pattern).unwrap();
                                     check_bb = next_pattern;
                                 } else {
-                                    if is_last {
-                                        self.builder.build_unconditional_branch(arm_bb).unwrap();
-                                    } else {
-                                        let next_check = self.context.append_basic_block(parent, &format!("match_check_{}", i + 1));
-                                        self.builder.build_conditional_branch(cmp, arm_bb, next_check).unwrap();
-                                        current_check = next_check;
+                                    match next_check {
+                                        None => { self.builder.build_unconditional_branch(arm_bb).unwrap(); }
+                                        Some(nc) => { self.builder.build_conditional_branch(cmp, arm_bb, nc).unwrap(); }
                                     }
                                 }
                                 if !inner.is_empty() && sv_ptr.is_some() && !payload_types.is_empty() {
@@ -876,26 +881,6 @@ Expr::Match { scrutinee, arms } => {
                                             }
                                         }
                                     }
-                                    if let Some(g) = guard {
-                                        let gv = self.gen_expr(g);
-                                        let gc = self.to_i1(&gv);
-                                        let guard_fail = self.context.append_basic_block(parent, &format!("arm_{}_guard_fail", i));
-                                        self.builder.build_conditional_branch(gc, arm_bb, guard_fail).unwrap();
-                                        self.builder.position_at_end(guard_fail);
-                                        if !is_last {
-                                            let next_check = self.context.append_basic_block(parent, &format!("match_check_{}", i + 1));
-                                            self.builder.build_unconditional_branch(next_check).unwrap();
-                                            current_check = next_check;
-                                        } else {
-                                            self.builder.build_unconditional_branch(merge).unwrap();
-                                        }
-                                    } else {
-                                        let bv = self.gen_expr(body);
-                                        let bv_int = self.value_to_int(&bv);
-                                        arm_values.push((bv_int, arm_bb));
-                                        self.builder.build_unconditional_branch(merge).unwrap();
-                                    }
-                                    continue;
                                 }
                             }
                             Pattern::Wildcard | Pattern::Variable(_) => {
@@ -911,28 +896,43 @@ Expr::Match { scrutinee, arms } => {
                             self.named.insert(name.clone(), (ptr, "int".to_string()));
                         }
                     }
-                    if let Some(g) = guard {
+                    // With a guard the body needs its own block, so the guard
+                    // can branch past it. Branching to `arm_bb` from inside
+                    // `arm_bb` was a self-loop, and the body was never emitted
+                    // at all, leaving `merge` with a predecessor that fed the
+                    // phi no value.
+                    let body_bb = if let Some(g) = guard {
                         let gv = self.gen_expr(g);
                         let gc = self.to_i1(&gv);
-                        let guard_fail = self.context.append_basic_block(parent, &format!("arm_{}_guard_fail2", i));
-                        self.builder.build_conditional_branch(gc, arm_bb, guard_fail).unwrap();
+                        let body_bb = self.context.append_basic_block(parent, &format!("arm_{}_body", i));
+                        let guard_fail = self.context.append_basic_block(parent, &format!("arm_{}_guard_fail", i));
+                        self.builder.build_conditional_branch(gc, body_bb, guard_fail).unwrap();
                         self.builder.position_at_end(guard_fail);
-                        if !is_last {
-                            let next_check = self.context.append_basic_block(parent, &format!("match_check_{}", i + 1));
-                            self.builder.build_unconditional_branch(next_check).unwrap();
-                            current_check = next_check;
-                        } else {
-                            self.builder.build_unconditional_branch(merge).unwrap();
+                        match next_check {
+                            Some(nc) => { self.builder.build_unconditional_branch(nc).unwrap(); }
+                            None => {
+                                arm_values.push((self.i64.const_int(0, false), guard_fail));
+                                self.builder.build_unconditional_branch(merge).unwrap();
+                            }
                         }
+                        self.builder.position_at_end(body_bb);
+                        body_bb
                     } else {
-                        let bv = self.gen_expr(body);
-                        let bv_int = self.value_to_int(&bv);
-                        arm_values.push((bv_int, arm_bb));
-                        self.builder.build_unconditional_branch(merge).unwrap();
+                        arm_bb
+                    };
+                    let bv = self.gen_expr(body);
+                    let bv_int = self.value_to_int(&bv);
+                    arm_values.push((bv_int, body_bb));
+                    self.builder.build_unconditional_branch(merge).unwrap();
+                    if let Some(nc) = next_check {
+                        current_check = nc;
                     }
                 }
                 if current_check.get_terminator().is_none() {
                     self.builder.position_at_end(current_check);
+                    // Nothing matched. There is no exhaustiveness check yet, so
+                    // this edge still has to give the phi a value.
+                    arm_values.push((self.i64.const_int(0, false), current_check));
                     self.builder.build_unconditional_branch(merge).unwrap();
                 }
                 self.builder.position_at_end(merge);

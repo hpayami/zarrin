@@ -152,3 +152,94 @@ fn main() {
 "#,
     );
 }
+
+// --- match lowering ---------------------------------------------------------
+//
+// Every arm body used to be emitted twice for a payload-carrying pattern: the
+// `continue` meant to skip the arm only skipped the pattern, so control fell
+// into the shared tail and generated the body again. That gave the phi two
+// entries for one block and llc rejected the module.
+
+#[test]
+fn match_on_an_enum_with_payloads_compiles() {
+    assert_agrees_with_interpreter(
+        r#"
+enum S { C(int), R(int, int) }
+fn area(s: S) -> int { return match s { C(r) => r * r, R(w, h) => w * h }; }
+fn main() { print(area(C(5))); print(area(R(3, 4))); }
+"#,
+    );
+}
+
+#[test]
+fn match_with_literal_multi_pattern_and_wildcard_arms() {
+    assert_agrees_with_interpreter(
+        r#"
+fn f(n: int) -> int { return match n { 0 => 100, 1 | 2 => 200, _ => 300 }; }
+fn main() { print(f(0)); print(f(1)); print(f(2)); print(f(9)); }
+"#,
+    );
+}
+
+#[test]
+fn match_on_an_enum_without_payloads() {
+    assert_agrees_with_interpreter(
+        r#"
+enum C { R, G, B }
+fn f(c: C) -> int { return match c { R => 1, G => 2, B => 3 }; }
+fn main() { print(f(R)); print(f(G)); print(f(B)); }
+"#,
+    );
+}
+
+#[test]
+fn a_guarded_arm_falls_through_when_the_guard_fails() {
+    // The guard branched from `arm_bb` back to `arm_bb` — a self-loop — and the
+    // body was never emitted, so `merge` gained a predecessor that fed the phi
+    // nothing. A guarded irrefutable pattern was also treated as the last arm,
+    // so the arms after it were unreachable: f(3) returned 0 instead of 2.
+    assert_agrees_with_interpreter(
+        r#"
+fn f(n: int) -> int { return match n { x if x > 10 => 1, _ => 2 }; }
+fn main() { print(f(50)); print(f(3)); }
+"#,
+    );
+}
+
+#[test]
+fn a_guard_on_a_payload_pattern_compiles() {
+    // Pattern mismatch and guard failure each appended their own "next check"
+    // block; one of them was branched to and never terminated.
+    assert_agrees_with_interpreter(
+        r#"
+enum S { C(int), R(int, int) }
+fn f(s: S) -> int { return match s { C(r) if r > 100 => 999, C(r) => r, R(w, h) => w * h }; }
+fn main() { print(f(C(5))); print(f(C(500))); print(f(R(3, 4))); }
+"#,
+    );
+}
+
+#[test]
+fn a_guard_on_the_last_arm_compiles() {
+    assert_agrees_with_interpreter(
+        r#"
+fn f(n: int) -> int { return match n { 0 => 7, x if x > 10 => 1 }; }
+fn main() { print(f(0)); print(f(50)); }
+"#,
+    );
+}
+
+#[test]
+fn the_float_match_example_compiles() {
+    // examples/enum_match.zr, which llc used to reject outright. Output is not
+    // compared: this backend prints floats with printf's %f ("78.500000")
+    // while the interpreter uses Rust's shortest representation ("78.5").
+    let Some(out) = build_and_run(
+        r#"
+enum Shape { Circle(float), Rect(float, float) }
+fn area(s: Shape) -> float { return match s { Circle(r) => 3.14 * r * r, Rect(w, h) => w * h }; }
+fn main() { print(area(Circle(5.0))); print(area(Rect(3.0, 4.0))); }
+"#,
+    ) else { return };
+    assert!(out.starts_with("78.5"), "unexpected output: {}", out);
+}
