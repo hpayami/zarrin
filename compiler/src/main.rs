@@ -95,7 +95,16 @@ fn main() {
     install_error_reporter();
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 3 {
-        eprintln!("usage: zarrinc <run|emit-ast|check> <file.zr>");
+        eprintln!("usage: zarrinc <command> <file.zr>");
+        eprintln!();
+        eprintln!("  run <file.zr>              type-check, then run the interpreter");
+        eprintln!("  check <file.zr>            type-check only");
+        eprintln!("  emit-ast <file.zr>         print the parsed AST");
+        if cfg!(feature = "llvm") {
+            eprintln!("  build <file.zr> [-o out]   compile to a native executable");
+        } else {
+            eprintln!("  build <file.zr> [-o out]   unavailable: rebuild with --features llvm");
+        }
         exit(1);
     }
     let cmd = args[1].as_str();
