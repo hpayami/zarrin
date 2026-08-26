@@ -211,7 +211,8 @@ impl Interpreter {
                     for s in branch {
                         self.eval_stmt(s);
                         if self.returned.is_some() { self.pop_scope(); return; }
-                        if self.should_break { self.pop_scope(); return; }
+                        // Leave the flags set: the enclosing loop clears them.
+                        if self.should_break || self.should_continue { self.pop_scope(); return; }
                     }
                     self.pop_scope();
                 }
@@ -405,7 +406,7 @@ impl Interpreter {
                             self.should_break = false;
                             break;
                         }
-                        if self.should_continue { self.should_continue = false; continue; }
+                        if self.should_continue { self.should_continue = false; break; }
                         if self.returned.is_some() { self.pop_scope(); return self.returned.take().unwrap(); }
                     }
                     self.pop_scope();
@@ -435,7 +436,7 @@ impl Interpreter {
                                     self.pop_scope();
                                     break 'outer;
                                 }
-                                if self.should_continue { self.should_continue = false; continue; }
+                                if self.should_continue { self.should_continue = false; break; }
                                 if self.returned.is_some() { self.pop_scope(); return self.returned.take().unwrap(); }
                             }
                             self.pop_scope();
@@ -453,7 +454,7 @@ impl Interpreter {
                                     self.pop_scope();
                                     break 'outer2;
                                 }
-                                if self.should_continue { self.should_continue = false; continue; }
+                                if self.should_continue { self.should_continue = false; break; }
                                 if self.returned.is_some() { self.pop_scope(); return self.returned.take().unwrap(); }
                             }
                             self.pop_scope();
