@@ -1,5 +1,7 @@
 //! Lexer: turns Zarrin source text into a stream of tokens.
 
+use crate::diagnostic::{Diagnostic, Span};
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum Token {
     Int(i64),
@@ -64,27 +66,52 @@ pub enum Token {
 
 pub struct Lexer<'a> {
     chars: std::iter::Peekable<std::str::Chars<'a>>,
+    line: u32,
+    col: u32,
 }
 
 impl<'a> Lexer<'a> {
     pub fn new(src: &'a str) -> Self {
         Lexer {
             chars: src.chars().peekable(),
+            line: 1,
+            col: 1,
         }
+    }
+
+    /// Consume one character, keeping the line/column cursor in step. Every
+    /// read goes through here so positions cannot drift.
+    fn bump(&mut self) -> Option<char> {
+        let c = self.chars.next();
+        match c {
+            Some('\n') => { self.line += 1; self.col = 1; }
+            Some(_) => { self.col += 1; }
+            None => {}
+        }
+        c
+    }
+
+    /// Position of the next character to be read.
+    fn here(&self) -> Span {
+        Span::new(self.line, self.col)
+    }
+
+    fn error(&self, message: impl Into<String>, span: Span) -> Diagnostic {
+        Diagnostic::new(message, span)
     }
 
     fn skip_ignored(&mut self) {
         loop {
             match self.chars.peek() {
                 Some(' ') | Some('\t') | Some('\n') | Some('\r') => {
-                    self.chars.next();
+                    self.bump();
                 }
                 Some('/') => {
                     // line comment starting with //
                     let mut it = self.chars.clone();
                     it.next();
                     if it.peek() == Some(&'/') {
-                        for c in self.chars.by_ref() {
+                        while let Some(c) = self.bump() {
                             if c == '\n' {
                                 break;
                             }
@@ -98,15 +125,17 @@ impl<'a> Lexer<'a> {
         }
     }
 
-    pub fn next_token(&mut self) -> Token {
+    /// Returns the token together with the span of its first character.
+    pub fn next_token(&mut self) -> Result<(Token, Span), Diagnostic> {
         self.skip_ignored();
-        match self.chars.next() {
+        let start = self.here();
+        let token = match self.bump() {
             None => Token::Eof,
             Some(c) => match c {
                 '+' => Token::Plus,
                 '-' => {
                     if self.chars.peek() == Some(&'>') {
-                        self.chars.next();
+                        self.bump();
                         Token::Arrow
                     } else {
                         Token::Minus
@@ -117,15 +146,15 @@ impl<'a> Lexer<'a> {
                 '%' => Token::Percent,
                 '&' => {
                     if self.chars.peek() == Some(&'&') {
-                        self.chars.next();
+                        self.bump();
                         Token::AmpAmp
                     } else {
-                        panic!("unexpected character: '&', did you mean '&&'?");
+                        return Err(self.error("unexpected `&`; did you mean `&&`?", start));
                     }
                 }
                 '|' => {
                     if self.chars.peek() == Some(&'|') {
-                        self.chars.next();
+                        self.bump();
                         Token::PipePipe
                     } else {
                         Token::Pipe
@@ -141,10 +170,10 @@ impl<'a> Lexer<'a> {
                 ';' => Token::Semicolon,
                 '=' => {
                     if self.chars.peek() == Some(&'=') {
-                        self.chars.next();
+                        self.bump();
                         Token::Eq
                     } else if self.chars.peek() == Some(&'>') {
-                        self.chars.next();
+                        self.bump();
                         Token::FatArrow
                     } else {
                         Token::Assign
@@ -152,7 +181,7 @@ impl<'a> Lexer<'a> {
                 }
                 '!' => {
                     if self.chars.peek() == Some(&'=') {
-                        self.chars.next();
+                        self.bump();
                         Token::Ne
                     } else {
                         Token::Bang
@@ -160,7 +189,7 @@ impl<'a> Lexer<'a> {
                 }
                 '<' => {
                     if self.chars.peek() == Some(&'=') {
-                        self.chars.next();
+                        self.bump();
                         Token::Le
                     } else {
                         Token::Lt
@@ -168,7 +197,7 @@ impl<'a> Lexer<'a> {
                 }
                 '>' => {
                     if self.chars.peek() == Some(&'=') {
-                        self.chars.next();
+                        self.bump();
                         Token::Ge
                     } else {
                         Token::Gt
@@ -176,7 +205,7 @@ impl<'a> Lexer<'a> {
                 }
                 ':' => {
                     if self.chars.peek() == Some(&':') {
-                        self.chars.next();
+                        self.bump();
                         Token::ColonColon
                     } else {
                         Token::Colon
@@ -184,7 +213,7 @@ impl<'a> Lexer<'a> {
                 }
                 '.' => {
                     if self.chars.peek() == Some(&'.') {
-                        self.chars.next();
+                        self.bump();
                         Token::DotDot
                     } else {
                         Token::Dot
@@ -193,9 +222,11 @@ impl<'a> Lexer<'a> {
                 '"' => {
                     let mut s = String::new();
                     let mut has_interp = false;
+                    let mut closed = false;
                     while let Some(&ch) = self.chars.peek() {
                         if ch == '"' {
-                            self.chars.next();
+                            self.bump();
+                            closed = true;
                             break;
                         }
                         if ch == '{' {
@@ -205,7 +236,10 @@ impl<'a> Lexer<'a> {
                             // Will be handled during re-lexing in parser
                         }
                         s.push(ch);
-                        self.chars.next();
+                        self.bump();
+                    }
+                    if !closed {
+                        return Err(self.error("unterminated string literal", start));
                     }
                     if has_interp {
                         Token::InterpStr(s)
@@ -220,7 +254,7 @@ impl<'a> Lexer<'a> {
                     while let Some(&n) = self.chars.peek() {
                         if n.is_ascii_digit() {
                             num.push(n);
-                            self.chars.next();
+                            self.bump();
                         } else if n == '.' && !is_float {
                             let mut it = self.chars.clone();
                             it.next();
@@ -229,15 +263,22 @@ impl<'a> Lexer<'a> {
                             }
                             is_float = true;
                             num.push(n);
-                            self.chars.next();
+                            self.bump();
                         } else {
                             break;
                         }
                     }
                     if is_float {
-                        Token::Float(num.parse().unwrap())
+                        match num.parse() {
+                            Ok(f) => Token::Float(f),
+                            Err(_) => return Err(self.error(format!("invalid float literal `{}`", num), start)),
+                        }
                     } else {
-                        Token::Int(num.parse().unwrap())
+                        match num.parse() {
+                            Ok(i) => Token::Int(i),
+                            Err(_) => return Err(self.error(
+                                format!("integer literal `{}` does not fit in a 64-bit int", num), start)),
+                        }
                     }
                 }
                 ch if ch.is_alphabetic() || ch == '_' => {
@@ -246,7 +287,7 @@ impl<'a> Lexer<'a> {
                     while let Some(&n) = self.chars.peek() {
                         if n.is_alphanumeric() || n == '_' {
                             id.push(n);
-                            self.chars.next();
+                            self.bump();
                         } else {
                             break;
                         }
@@ -275,8 +316,9 @@ impl<'a> Lexer<'a> {
                         _ => Token::Ident(id),
                     }
                 }
-                other => panic!("unexpected character: {:?}", other),
+                other => return Err(self.error(format!("unexpected character `{}`", other), start)),
             },
-        }
+        };
+        Ok((token, start))
     }
 }

@@ -6,6 +6,7 @@
 //!   zarrinc check <file.zr>      # parse + type-check placeholder
 
 mod ast;
+mod diagnostic;
 mod codegen;
 mod lexer;
 mod parser;
@@ -18,6 +19,39 @@ mod codegen_llvm;
 use std::fs;
 use std::path::Path;
 use std::process::exit;
+
+/// Parse a source file, reporting any syntax error against its text and
+/// exiting, rather than unwinding a panic in the user's face.
+fn parse_or_exit(path: &Path, src: &str) -> ast::Program {
+    match parser::Parser::new(src).and_then(|mut p| p.parse_program()) {
+        Ok(program) => program,
+        Err(d) => {
+            eprint!("{}", d.render(&path.display().to_string(), src));
+            exit(1);
+        }
+    }
+}
+
+/// User-facing failures in the interpreter and type checker are still
+/// `panic!`s without source positions. Present them as plain errors instead of
+/// a Rust panic message; `RUST_BACKTRACE` restores the internal detail.
+fn install_error_reporter() {
+    if std::env::var_os("RUST_BACKTRACE").is_some() {
+        return;
+    }
+    let default = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let msg = info
+            .payload()
+            .downcast_ref::<String>()
+            .map(|s| s.as_str())
+            .or_else(|| info.payload().downcast_ref::<&str>().copied());
+        match msg {
+            Some(m) => eprintln!("error: {}", m),
+            None => default(info),
+        }
+    }));
+}
 
 fn resolve_imports(program: &mut ast::Program, base_dir: &Path, visited: &mut Vec<String>) {
     let mut new_stmts = Vec::new();
@@ -35,8 +69,7 @@ fn resolve_imports(program: &mut ast::Program, base_dir: &Path, visited: &mut Ve
                     exit(1);
                 }
             };
-            let mut p = parser::Parser::new(&src);
-            let mut imported = p.parse_program();
+            let mut imported = parse_or_exit(&full_path, &src);
             let import_dir = full_path.parent().unwrap_or(base_dir);
             resolve_imports(&mut imported, import_dir, visited);
             new_stmts.extend(imported.stmts);
@@ -48,6 +81,7 @@ fn resolve_imports(program: &mut ast::Program, base_dir: &Path, visited: &mut Ve
 }
 
 fn main() {
+    install_error_reporter();
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 3 {
         eprintln!("usage: zarrinc <run|emit-ast|check> <file.zr>");
@@ -64,8 +98,7 @@ fn main() {
         }
     };
 
-    let mut p = parser::Parser::new(&src);
-    let mut program = p.parse_program();
+    let mut program = parse_or_exit(Path::new(file), &src);
 
     let base_dir = Path::new(file).parent().unwrap_or(Path::new("."));
     let mut visited = Vec::new();
