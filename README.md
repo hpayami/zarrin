@@ -60,7 +60,14 @@ LLVM_SYS_180_PREFIX=$(brew --prefix llvm@18) \
   cargo run --features llvm --bin zarrinc -- build examples/hello.zr -o hello
 ```
 
-The test suite does not cover this backend; it exercises the interpreter.
+`compiler/tests/llvm_backend.rs` covers this backend, requiring each compiled
+program to print exactly what the interpreter prints. Those tests are skipped
+unless the feature is on, and on macOS they re-run each executable under Guard
+Malloc, which faults on a heap overrun instead of letting it pass unnoticed.
+
+Two known gaps: `print` on an enum shows its address rather than the variant
+name, and a `match` whose arms yield floats produces a malformed PHI node that
+`llc` rejects (`examples/enum_match.zr`).
 
 ## Tests
 

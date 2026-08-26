@@ -91,6 +91,30 @@ impl<'ctx> Codegen<'ctx> {
         }
     }
 
+    fn malloc_fn(&self) -> FunctionValue<'ctx> {
+        self.module.get_function("malloc").unwrap_or_else(|| {
+            let ty = self.context.ptr_type(AddressSpace::default()).fn_type(&[self.i64.into()], false);
+            self.module.add_function("malloc", ty, None)
+        })
+    }
+
+    /// Allocate `slots` 64-bit words on the heap.
+    ///
+    /// Structs and enum payloads are passed around as raw addresses, so they
+    /// have to outlive the frame that built them. They used to be `alloca`d:
+    /// a function returning one handed back a pointer into its own dead stack
+    /// frame, and the caller read whatever overwrote it. Nothing is freed —
+    /// the backend has no ownership model yet, and leaking beats corrupting.
+    fn heap_slots(&self, slots: u64, name: &str) -> PointerValue<'ctx> {
+        self.builder
+            .build_call(self.malloc_fn(), &[self.i64.const_int(slots * 8, false).into()], name)
+            .unwrap()
+            .try_as_basic_value()
+            .left()
+            .unwrap()
+            .into_pointer_value()
+    }
+
     /// Resolve a variant name to its enum. An ambiguous name is a hard error
     /// rather than whichever enum the hash map happened to yield first.
     fn resolve_variant(&self, name: &str) -> Option<Variant> {
@@ -151,7 +175,7 @@ impl<'ctx> Codegen<'ctx> {
                     let tag = variant.tag;
                     if variant.enum_has_payload {
                         let array_ty = self.i64.array_type(1);
-                        let alloca = self.builder.build_alloca(array_ty, &format!("enum_{}", name)).unwrap();
+                        let alloca = self.heap_slots(1, &format!("enum_{}", name));
                         let base_ptr = self.builder.build_bit_cast(alloca, self.context.ptr_type(AddressSpace::default()), "enum_base").unwrap().into_pointer_value();
                         let tag_ptr = unsafe {
                             self.builder.build_gep(array_ty, alloca, &[self.i64.const_int(0, false), self.i64.const_int(0, false)], "tag_ptr").unwrap()
@@ -350,9 +374,12 @@ impl<'ctx> Codegen<'ctx> {
                     ], false);
                     let memcpy_fn = self.module.get_function("memcpy").unwrap_or_else(|| self.module.add_function("memcpy", memcpy_type, None));
                     let old_len = self.builder.build_load(self.i64, arr_ptr, "old_len").unwrap().into_int_value();
-                    let new_len = self.builder.build_int_add(old_len, self.i64.const_int(1, false), "new_len").unwrap();
-                    let buf = self.builder.build_call(malloc_fn, &[new_len.into()], "new_arr").unwrap().try_as_basic_value().left().unwrap().into_pointer_value();
-                    let byte_count = self.builder.build_int_mul(new_len, self.i64.const_int(8, false), "bytes").unwrap();
+                    // Layout is [len, elem0, ..]; `slots` counts the header too.
+                    let slots = self.builder.build_int_add(old_len, self.i64.const_int(1, false), "slots").unwrap();
+                    // This asked malloc for `slots` *bytes* and then memcpy'd
+                    // `slots * 8` of them, overrunning the allocation eightfold.
+                    let byte_count = self.builder.build_int_mul(slots, self.i64.const_int(8, false), "bytes").unwrap();
+                    let buf = self.builder.build_call(malloc_fn, &[byte_count.into()], "new_arr").unwrap().try_as_basic_value().left().unwrap().into_pointer_value();
                     self.builder.build_call(memcpy_fn, &[buf.into(), arr_ptr_val.into(), byte_count.into()], "cp").unwrap();
                     let elem_off = self.builder.build_int_add(idx_int, self.i64.const_int(1, false), "elem_off").unwrap();
                     let elem_ptr = unsafe {
@@ -587,7 +614,7 @@ impl<'ctx> Codegen<'ctx> {
                     }
                     let num_fields = (payload_types.len() + 1) as u32;
                     let array_ty = self.i64.array_type(num_fields);
-                    let alloca = self.builder.build_alloca(array_ty, &format!("enum_{}", name)).unwrap();
+                    let alloca = self.heap_slots(num_fields as u64, &format!("enum_{}", name));
                     let base_ptr = self.builder.build_bit_cast(alloca, self.context.ptr_type(AddressSpace::default()), "enum_base").unwrap().into_pointer_value();
                     let tag_ptr = unsafe {
                         self.builder.build_gep(array_ty, alloca, &[self.i64.const_int(0, false), self.i64.const_int(0, false)], "tag_ptr").unwrap()
@@ -642,7 +669,7 @@ impl<'ctx> Codegen<'ctx> {
                     .unwrap_or_else(|| panic!("unknown struct: {}", name));
                 let num_fields = field_defs.len() as u64;
                 let array_ty = self.i64.array_type(num_fields as u32);
-                let alloca = self.builder.build_alloca(array_ty, &format!("{}_struct", name)).unwrap();
+                let alloca = self.heap_slots(num_fields, &format!("{}_struct", name));
                 let base_ptr = self.builder.build_bit_cast(alloca, self.context.ptr_type(AddressSpace::default()), "base_ptr").unwrap().into_pointer_value();
                 for (i, (fname, fexpr)) in fields.iter().enumerate() {
                     let fv = self.gen_expr(fexpr);
@@ -1061,10 +1088,9 @@ Expr::Match { scrutinee, arms } => {
             }
             Expr::ArrayLit(elems) => {
                 let len = elems.len() as u64;
-                let malloc_type = self.context.ptr_type(AddressSpace::default()).fn_type(&[self.i64.into()], false);
-                let malloc_fn = self.module.get_function("malloc").unwrap_or_else(|| self.module.add_function("malloc", malloc_type, None));
-                let total = self.i64.const_int(len + 1, false);
-                let buf = self.builder.build_call(malloc_fn, &[total.into()], "arr_alloc").unwrap().try_as_basic_value().left().unwrap().into_pointer_value();
+                // Layout is [len, elem0, ..]. This asked malloc for `len + 1`
+                // *bytes* and then wrote that many 64-bit words into it.
+                let buf = self.heap_slots(len + 1, "arr_alloc");
                 let buf_i64 = self.builder.build_ptr_to_int(buf, self.i64, "arr_buf").unwrap();
                 let len_ptr = self.builder.build_int_to_ptr(buf_i64, self.context.ptr_type(AddressSpace::default()), "arr_len_ptr").unwrap();
                 self.builder.build_store(len_ptr, self.i64.const_int(len, false)).unwrap();
