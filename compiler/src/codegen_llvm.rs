@@ -678,6 +678,34 @@ impl<'ctx> Codegen<'ctx> {
             }
             Expr::MethodCall(obj, method, args) => {
                 let obj_val = self.gen_expr(obj);
+                if method == "unwrap" || method == "is_some" || method == "is_none" || method == "is_ok" || method == "is_err" {
+                    let obj_int = self.value_to_int(&obj_val);
+                    let sv_ptr = self.builder.build_int_to_ptr(obj_int, self.context.ptr_type(AddressSpace::default()), "enum_ptr").unwrap();
+                    let tag_ptr = unsafe {
+                        self.builder.build_gep(self.i64, sv_ptr, &[self.i64.const_int(0, false)], "tag_ptr").unwrap()
+                    };
+                    let tag = self.builder.build_load(self.i64, tag_ptr, "tag").unwrap().into_int_value();
+                    let is_variant0 = self.builder.build_int_compare(inkwell::IntPredicate::EQ, tag, self.i64.const_int(0, false), "is_v0").unwrap();
+                    match method.as_str() {
+                        "unwrap" => {
+                            let data_ptr = unsafe {
+                                self.builder.build_gep(self.i64, sv_ptr, &[self.i64.const_int(1, false)], "data_ptr").unwrap()
+                            };
+                            let data = self.builder.build_load(self.i64, data_ptr, "data").unwrap().into_int_value();
+                            return CgValue::Int(data);
+                        }
+                        "is_some" | "is_ok" => {
+                            let zext = self.builder.build_int_z_extend(is_variant0, self.i64, "result").unwrap();
+                            return CgValue::Int(zext);
+                        }
+                        "is_none" | "is_err" => {
+                            let not_v0 = self.builder.build_not(is_variant0, "not_v0").unwrap();
+                            let zext = self.builder.build_int_z_extend(not_v0, self.i64, "result").unwrap();
+                            return CgValue::Int(zext);
+                        }
+                        _ => {}
+                    }
+                }
                 let mut meta_args: Vec<BasicMetadataValueEnum> = Vec::new();
                 match &obj_val {
                     CgValue::Int(v) => meta_args.push((*v).into()),

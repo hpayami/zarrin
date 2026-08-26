@@ -231,6 +231,40 @@ impl Interpreter {
             }
             Expr::MethodCall(obj, method, args) => {
                 let obj_val = self.eval_expr(obj, env);
+                if method == "unwrap" {
+                    match &obj_val {
+                        Value::EnumVariant { enum_name, variant, args: inner } if enum_name == "Option" => {
+                            if variant == "Some" { return inner[0].clone(); }
+                            panic!("unwrap() called on None");
+                        }
+                        Value::EnumVariant { enum_name, variant, args: inner } if enum_name == "Result" => {
+                            if variant == "Ok" { return inner[0].clone(); }
+                            if variant == "Err" { panic!("unwrap() called on Err"); }
+                            panic!("unknown Result variant: {}", variant);
+                        }
+                        _ => {}
+                    }
+                }
+                if method == "is_some" {
+                    if let Value::EnumVariant { variant, .. } = &obj_val {
+                        return Value::Bool(variant == "Some");
+                    }
+                }
+                if method == "is_none" {
+                    if let Value::EnumVariant { variant, .. } = &obj_val {
+                        return Value::Bool(variant == "None");
+                    }
+                }
+                if method == "is_ok" {
+                    if let Value::EnumVariant { variant, .. } = &obj_val {
+                        return Value::Bool(variant == "Ok");
+                    }
+                }
+                if method == "is_err" {
+                    if let Value::EnumVariant { variant, .. } = &obj_val {
+                        return Value::Bool(variant == "Err");
+                    }
+                }
                 let type_name = match &obj_val {
                     Value::Struct { name, .. } => name.clone(),
                     Value::EnumVariant { enum_name, .. } => enum_name.clone(),
