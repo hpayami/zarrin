@@ -1,6 +1,7 @@
 //! Type checker for the Zarrin language.
 
 use crate::ast::*;
+use crate::variants::{payload_accepts, Lookup, VariantIndex};
 use std::collections::HashMap;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -14,6 +15,7 @@ pub enum TypeError {
     WrongArity { name: String, expected: usize, found: usize },
     UnknownField { ty: String, field: String },
     MissingImpl { trait_name: String, type_name: String, method: String },
+    AmbiguousVariant { name: String, candidates: Vec<String> },
 }
 
 impl std::fmt::Display for TypeError {
@@ -28,6 +30,12 @@ impl std::fmt::Display for TypeError {
             TypeError::WrongArity { name, expected, found } => write!(f, "`{}` expects {} args, found {}", name, expected, found),
             TypeError::UnknownField { ty, field } => write!(f, "type `{}` has no field `{}`", ty, field),
             TypeError::MissingImpl { trait_name, type_name, method } => write!(f, "trait `{}` for `{}` missing method `{}`", trait_name, type_name, method),
+            TypeError::AmbiguousVariant { name, candidates } => write!(
+                f,
+                "variant `{}` is declared by {}; rename one of them to disambiguate",
+                name,
+                candidates.iter().map(|c| format!("`{}`", c)).collect::<Vec<_>>().join(" and ")
+            ),
         }
     }
 }
@@ -36,7 +44,7 @@ struct TypeEnv {
     scopes: Vec<HashMap<String, Type>>,
     functions: HashMap<String, (Vec<Type>, Type)>,
     structs: HashMap<String, Vec<(String, Type)>>,
-    enums: HashMap<String, Vec<(String, Vec<Type>)>>,
+    variants: VariantIndex,
     traits: HashMap<String, Vec<TraitMethod>>,
     impls: Vec<(String, String, Vec<Stmt>)>,
     extern_fns: HashMap<String, (Vec<Type>, Type)>,
@@ -44,12 +52,12 @@ struct TypeEnv {
 }
 
 impl TypeEnv {
-    fn new() -> Self {
+    fn new(program: &Program) -> Self {
         TypeEnv {
             scopes: vec![HashMap::new()],
             functions: HashMap::new(),
             structs: HashMap::new(),
-            enums: HashMap::new(),
+            variants: VariantIndex::build(program),
             traits: HashMap::new(),
             impls: Vec::new(),
             extern_fns: HashMap::new(),
@@ -91,7 +99,7 @@ pub struct TypeChecker;
 
 impl TypeChecker {
     pub fn check(program: &Program) -> Result<(), TypeError> {
-        let mut env = TypeEnv::new();
+        let mut env = TypeEnv::new(program);
 
         for s in &program.stmts {
             match s {
@@ -101,9 +109,6 @@ impl TypeChecker {
                 }
                 Stmt::Struct { name, fields, .. } => {
                     env.structs.insert(name.clone(), fields.clone());
-                }
-                Stmt::Enum { name, variants } => {
-                    env.enums.insert(name.clone(), variants.clone());
                 }
                 Stmt::Trait { name, methods } => {
                     env.traits.insert(name.clone(), methods.clone());
@@ -221,10 +226,12 @@ impl TypeChecker {
             Expr::Bool(_) => Ok(Type::Bool),
             Expr::Str(_) => Ok(Type::String),
             Expr::Ident(name) => {
-                if let Some((_, variants)) = env.enums.iter().find(|(_, v)| v.iter().any(|(vn, _)| vn == name)) {
-                    let enum_name = env.enums.iter().find(|(_, v)| v.iter().any(|(vn, _)| vn == name)).map(|(n, _)| n.clone()).unwrap();
-                    let _ = variants;
-                    return Ok(Type::Named(enum_name));
+                match env.variants.lookup(name) {
+                    Lookup::Unique(v) => return Ok(Type::Named(v.enum_name)),
+                    Lookup::Ambiguous(candidates) => {
+                        return Err(TypeError::AmbiguousVariant { name: name.clone(), candidates })
+                    }
+                    Lookup::Unknown => {}
                 }
                 env.lookup(name).ok_or_else(|| TypeError::UndefinedVariable(name.clone()))
             }
@@ -290,14 +297,19 @@ impl TypeChecker {
                     for a in args.iter() { Self::check_expr(a, env)?; }
                     return Ok(Type::String);
                 }
-                if let Some(variant_args) = env.enums.values().find_map(|v| v.iter().find(|(vn, _)| vn == func_name).map(|(_, a)| a.clone())) {
-                    let enum_name = env.enums.iter().find(|(_, v)| v.iter().any(|(vn, _)| vn == func_name)).map(|(n, _)| n.clone()).unwrap();
-                    if variant_args.len() != args.len() { return Err(TypeError::WrongArity { name: func_name.clone(), expected: variant_args.len(), found: args.len() }); }
-                    for (arg, expected) in args.iter().zip(variant_args.iter()) {
-                        let arg_ty = Self::check_expr(arg, env)?;
-                        if arg_ty != *expected { return Err(TypeError::TypeMismatch { expected: format!("{:?}", expected), found: format!("{:?}", arg_ty) }); }
+                match env.variants.lookup(func_name) {
+                    Lookup::Unique(v) => {
+                        if v.payload.len() != args.len() { return Err(TypeError::WrongArity { name: func_name.clone(), expected: v.payload.len(), found: args.len() }); }
+                        for (arg, expected) in args.iter().zip(v.payload.iter()) {
+                            let arg_ty = Self::check_expr(arg, env)?;
+                            if !payload_accepts(expected, &arg_ty) { return Err(TypeError::TypeMismatch { expected: format!("{:?}", expected), found: format!("{:?}", arg_ty) }); }
+                        }
+                        return Ok(Type::Named(v.enum_name));
                     }
-                    return Ok(Type::Named(enum_name));
+                    Lookup::Ambiguous(candidates) => {
+                        return Err(TypeError::AmbiguousVariant { name: func_name.clone(), candidates })
+                    }
+                    Lookup::Unknown => {}
                 }
                 if let Some((param_tys, ret_ty)) = env.functions.get(func_name).cloned().or_else(|| env.extern_fns.get(func_name).cloned()) {
                     if param_tys.len() != args.len() { return Err(TypeError::WrongArity { name: func_name.clone(), expected: param_tys.len(), found: args.len() }); }
@@ -437,17 +449,17 @@ impl TypeChecker {
             Pattern::Variable(name) => { env.define(name, expected_ty.clone()); Ok(()) }
             Pattern::Wildcard => Ok(()),
             Pattern::EnumVariant { name, inner } => {
-                let enum_name = env.enums.iter().find(|(_, v)| v.iter().any(|(vn, _)| vn == name)).map(|(n, _)| n.clone());
-                if let Some(en) = enum_name {
-                    if *expected_ty != Type::Named(en) { return Err(TypeError::TypeMismatch { expected: format!("{:?}", expected_ty), found: format!("Enum {}", name) }); }
-                    let variant_args = env.enums.iter().find_map(|(_, v)| v.iter().find(|(vn, _)| vn == name).map(|(_, a)| a.clone())).unwrap();
-                    if variant_args.len() != inner.len() { return Err(TypeError::WrongArity { name: name.clone(), expected: variant_args.len(), found: inner.len() }); }
-                    for (pat, arg_ty) in inner.iter().zip(variant_args.iter()) {
-                        Self::check_pattern(pat, arg_ty, env)?;
+                match env.variants.lookup(name) {
+                    Lookup::Unique(v) => {
+                        if *expected_ty != Type::Named(v.enum_name.clone()) { return Err(TypeError::TypeMismatch { expected: format!("{:?}", expected_ty), found: format!("Enum {}", v.enum_name) }); }
+                        if v.payload.len() != inner.len() { return Err(TypeError::WrongArity { name: name.clone(), expected: v.payload.len(), found: inner.len() }); }
+                        for (pat, arg_ty) in inner.iter().zip(v.payload.iter()) {
+                            Self::check_pattern(pat, arg_ty, env)?;
+                        }
+                        Ok(())
                     }
-                    Ok(())
-                } else {
-                    Err(TypeError::UndefinedType(name.clone()))
+                    Lookup::Ambiguous(candidates) => Err(TypeError::AmbiguousVariant { name: name.clone(), candidates }),
+                    Lookup::Unknown => Err(TypeError::UndefinedType(name.clone())),
                 }
             }
         }

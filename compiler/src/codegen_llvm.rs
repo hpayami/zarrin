@@ -7,6 +7,7 @@
 #![cfg(feature = "llvm")]
 
 use crate::ast::*;
+use crate::variants::{Lookup, Variant, VariantIndex};
 use inkwell::builder::Builder;
 use inkwell::context::Context;
 use inkwell::module::Module;
@@ -46,6 +47,7 @@ pub struct Codegen<'ctx> {
     struct_fields: HashMap<String, Vec<String>>,
     var_struct_type: HashMap<String, String>,
     enum_variants: HashMap<String, Vec<(String, Vec<Type>)>>,
+    variants: VariantIndex,
     loop_exit: Vec<BasicBlock<'ctx>>,
     loop_continue: Vec<BasicBlock<'ctx>>,
     loop_result_ptr: Vec<PointerValue<'ctx>>,
@@ -56,7 +58,7 @@ pub struct Codegen<'ctx> {
 }
 
 impl<'ctx> Codegen<'ctx> {
-    fn new(context: &'ctx Context) -> Self {
+    fn new(context: &'ctx Context, program: &Program) -> Self {
         let module = context.create_module("zarrin");
         let builder = context.create_builder();
         let i64 = context.i64_type();
@@ -78,6 +80,7 @@ impl<'ctx> Codegen<'ctx> {
             struct_fields: HashMap::new(),
             var_struct_type: HashMap::new(),
             enum_variants: HashMap::new(),
+            variants: VariantIndex::build(program),
             loop_exit: Vec::new(),
             loop_continue: Vec::new(),
             loop_result_ptr: Vec::new(),
@@ -85,6 +88,16 @@ impl<'ctx> Codegen<'ctx> {
             i8: context.i8_type(),
             f64,
             i1,
+        }
+    }
+
+    /// Resolve a variant name to its enum. An ambiguous name is a hard error
+    /// rather than whichever enum the hash map happened to yield first.
+    fn resolve_variant(&self, name: &str) -> Option<Variant> {
+        match self.variants.lookup(name) {
+            Lookup::Unique(v) => Some(v),
+            Lookup::Unknown => None,
+            Lookup::Ambiguous(c) => panic!("variant `{}` is declared by {}; rename one of them to disambiguate", name, c.join(" and ")),
         }
     }
 
@@ -134,10 +147,9 @@ impl<'ctx> Codegen<'ctx> {
                             CgValue::Int(v.into_int_value())
                         }
                     }
-                } else if let Some((_, variants)) = self.enum_variants.iter().find(|(_, v)| v.iter().any(|(vn, _)| vn == name)) {
-                    let tag = variants.iter().position(|(vn, _)| vn == name).unwrap();
-                    let has_data = variants.iter().any(|(_, pt)| !pt.is_empty());
-                    if has_data {
+                } else if let Some(variant) = self.resolve_variant(name) {
+                    let tag = variant.tag;
+                    if variant.enum_has_payload {
                         let array_ty = self.i64.array_type(1);
                         let alloca = self.builder.build_alloca(array_ty, &format!("enum_{}", name)).unwrap();
                         let base_ptr = self.builder.build_bit_cast(alloca, self.context.ptr_type(AddressSpace::default()), "enum_base").unwrap().into_pointer_value();
@@ -567,11 +579,10 @@ impl<'ctx> Codegen<'ctx> {
                     self.builder.position_at_end(extract_done);
                     return CgValue::Int(self.builder.build_ptr_to_int(arr_buf, self.i64, "arr_ret").unwrap());
                 }
-                if let Some((_, variants)) = self.enum_variants.iter().find(|(_, v)| v.iter().any(|(vn, _)| vn == name)) {
-                    let tag = variants.iter().position(|(vn, _)| vn == name).unwrap();
-                    let (_, payload_types) = variants.iter().find(|(vn, _)| vn == name).unwrap();
-                    let has_data = variants.iter().any(|(_, pt)| !pt.is_empty());
-                    if !has_data {
+                if let Some(variant) = self.resolve_variant(name) {
+                    let tag = variant.tag;
+                    let payload_types = &variant.payload;
+                    if !variant.enum_has_payload {
                         return CgValue::Int(self.i64.const_int(tag as u64, false));
                     }
                     let num_fields = (payload_types.len() + 1) as u32;
@@ -1708,7 +1719,7 @@ fn expand_macro_call_inline_single(stmt: &Stmt, arg_map: &HashMap<String, Expr>,
 pub fn compile_to_executable(program: &Program, out_path: &str) {
     let program = expand_macros_program(program);
     let context = Context::create();
-    let mut cg = Codegen::new(&context);
+    let mut cg = Codegen::new(&context, &program);
 
     // Register struct fields and enum variants
     for s in &program.stmts {

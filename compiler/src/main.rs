@@ -10,6 +10,7 @@ mod codegen;
 mod lexer;
 mod parser;
 mod typecheck;
+mod variants;
 
 #[cfg(feature = "llvm")]
 mod codegen_llvm;

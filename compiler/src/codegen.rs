@@ -1,6 +1,7 @@
 //! Minimal tree-walk interpreter used as the default backend.
 
 use crate::ast::*;
+use crate::variants::{Lookup, VariantIndex};
 use std::collections::HashMap;
 
 #[derive(Debug, Clone)]
@@ -22,7 +23,7 @@ pub struct Interpreter {
     // Static program context: fixed once the program is loaded.
     fns: HashMap<String, Stmt>,
     structs: HashMap<String, Vec<(String, Type)>>,
-    enums: HashMap<String, Vec<(String, Vec<Type>)>>,
+    variants: VariantIndex,
     impls: Vec<(String, String, Vec<Stmt>)>,
     macros: HashMap<String, Stmt>,
     extern_fns: HashMap<String, Stmt>,
@@ -42,7 +43,7 @@ impl Interpreter {
         let mut interp = Interpreter {
             fns: HashMap::new(),
             structs: HashMap::new(),
-            enums: HashMap::new(),
+            variants: VariantIndex::build(program),
             impls: Vec::new(),
             macros: HashMap::new(),
             extern_fns: HashMap::new(),
@@ -53,19 +54,10 @@ impl Interpreter {
             should_continue: false,
             break_value: None,
         };
-        interp.enums.insert("Option".to_string(), vec![
-            ("Some".to_string(), vec![]),
-            ("None".to_string(), vec![]),
-        ]);
-        interp.enums.insert("Result".to_string(), vec![
-            ("Ok".to_string(), vec![]),
-            ("Err".to_string(), vec![]),
-        ]);
         for s in &program.stmts {
             match s {
                 Stmt::Fn { name, .. } => { interp.fns.insert(name.clone(), s.clone()); }
                 Stmt::Struct { name, fields, .. } => { interp.structs.insert(name.clone(), fields.clone()); }
-                Stmt::Enum { name, variants } => { interp.enums.insert(name.clone(), variants.clone()); }
                 Stmt::Impl { trait_name, type_name, methods } => { interp.impls.push((trait_name.clone(), type_name.clone(), methods.clone())); }
                 Stmt::Macro { name, .. } => { interp.macros.insert(name.clone(), s.clone()); }
                 Stmt::ExternFn { name, .. } => { interp.extern_fns.insert(name.clone(), s.clone()); }
@@ -73,6 +65,16 @@ impl Interpreter {
             }
         }
         interp
+    }
+
+    /// Resolve a variant name to its enum, or `None` if it isn't one.
+    /// An ambiguous name is a hard error rather than a coin flip.
+    fn resolve_variant(&self, name: &str) -> Option<crate::variants::Variant> {
+        match self.variants.lookup(name) {
+            Lookup::Unique(v) => Some(v),
+            Lookup::Unknown => None,
+            Lookup::Ambiguous(c) => panic!("variant `{}` is declared by {}; rename one of them to disambiguate", name, c.join(" and ")),
+        }
     }
 
     fn push_scope(&mut self) { self.scopes.push(HashMap::new()); }
@@ -227,9 +229,8 @@ impl Interpreter {
             Expr::Bool(b) => Value::Bool(*b),
             Expr::Str(s) => Value::Str(s.clone()),
             Expr::Ident(name) => {
-                if let Some(_) = self.enums.values().find_map(|v| v.iter().find(|(vn, _)| vn == name)) {
-                    let enum_name = self.enums.iter().find(|(_, v)| v.iter().any(|(vn, _)| vn == name)).map(|(n, _)| n.clone()).unwrap();
-                    return Value::EnumVariant { enum_name, variant: name.clone(), args: Vec::new() };
+                if let Some(v) = self.resolve_variant(name) {
+                    return Value::EnumVariant { enum_name: v.enum_name, variant: v.name, args: Vec::new() };
                 }
                 self.lookup(name)
             }
@@ -259,11 +260,9 @@ impl Interpreter {
                 if name == "split" { let s = self.eval_expr(&args[0]); let delim = self.eval_expr(&args[1]); if let (Value::Str(s), Value::Str(delim)) = (s, delim) { return Value::Array(s.split(&delim).map(|part| Value::Str(part.to_string())).collect()); } else { panic!("split expects string, string"); } }
                 if name == "trim" { let s = self.eval_expr(&args[0]); if let Value::Str(s) = s { return Value::Str(s.trim().to_string()); } else { panic!("trim expects string"); } }
                 if name == "char_at" { let s = self.eval_expr(&args[0]); let idx = self.eval_expr(&args[1]); if let (Value::Str(s), Value::Int(i)) = (s, idx) { let ch = s.chars().nth(i as usize).unwrap_or('\0'); return Value::Str(ch.to_string()); } else { panic!("char_at expects string, int"); } }
-                if let Some(vdef) = self.enums.values().find_map(|v| v.iter().find(|(vn, _)| vn == name)) {
-                    let _ = vdef;
+                if let Some(v) = self.resolve_variant(name) {
                     let eval_args: Vec<Value> = args.iter().map(|a| self.eval_expr(a)).collect();
-                    let enum_name = self.enums.iter().find(|(_, v)| v.iter().any(|(vn, _)| vn == name)).map(|(n, _)| n.clone()).unwrap();
-                    return Value::EnumVariant { enum_name, variant: name.clone(), args: eval_args };
+                    return Value::EnumVariant { enum_name: v.enum_name, variant: v.name, args: eval_args };
                 }
                 if let Some(macro_stmt) = self.macros.get(name).cloned() {
                     return self.expand_macro(&macro_stmt, args);
@@ -530,8 +529,9 @@ impl Interpreter {
             Pattern::Variable(name) => { self.declare(name, value.clone()); true }
             Pattern::Wildcard => true,
             Pattern::EnumVariant { name, inner } => {
-                if let Value::EnumVariant { variant, args, .. } = value {
-                    if variant == name && args.len() == inner.len() {
+                let pat = match self.resolve_variant(name) { Some(v) => v, None => return false };
+                if let Value::EnumVariant { enum_name, variant, args } = value {
+                    if *enum_name == pat.enum_name && *variant == pat.name && args.len() == inner.len() {
                         for (pat, arg) in inner.iter().zip(args.iter()) {
                             if !self.match_pattern(pat, arg) { return false; }
                         }
