@@ -24,6 +24,21 @@ cargo run --bin zarrinc -- run examples/hello.zr
 cargo run -- bin zarrinc -- emit-ast examples/hello.zr
 ```
 
+## Tests
+
+```sh
+cargo test
+```
+
+`compiler/tests/regressions.rs` holds one test per bug that has been found and
+fixed, each stating the behaviour that was wrong. `compiler/tests/examples.rs`
+runs every program in `examples/` and compares its output against a recorded
+golden file. When an example legitimately changes, re-record with:
+
+```sh
+UPDATE_GOLDEN=1 cargo test
+```
+
 ## License
 
 MIT — see [LICENSE](LICENSE).
