@@ -179,8 +179,16 @@ impl<'a> Parser<'a> {
                 } else if self.current == Token::Semicolon {
                     self.advance()?;
                     Stmt::Expr(e)
-                } else {
+                } else if self.current == Token::RBrace || self.current == Token::Eof {
+                    // A trailing expression is the value of its block. Allowed
+                    // only in the last position: accepting it anywhere turned a
+                    // forgotten `;` into a silent early return.
                     Stmt::Return(Some(e))
+                } else {
+                    return Err(self.error(format!(
+                        "expected `;`, found {}",
+                        describe(&self.current)
+                    )));
                 }
             }
         })

@@ -444,3 +444,35 @@ fn type_checker_rejects_a_real_mismatch() {
 fn unknown_function_is_reported() {
     assert_run_fails(r#"fn main() { nope(1); }"#, "undefined function");
 }
+
+// ---------------------------------------------------------------------------
+// Trailing expressions
+//
+// An expression statement without `;` becomes the block's value. That was
+// accepted in any position, so a forgotten semicolon silently turned into an
+// early return and the rest of the function never ran.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_forgotten_semicolon_is_an_error_not_an_early_return() {
+    let r = run("fn main() {\n    print(\"a\")\n    print(\"b\");\n    print(\"c\");\n}\n");
+    assert!(!r.success, "accepted a missing semicolon; printed:\n{}", r.stdout);
+    assert!(r.stderr.contains("expected `;`"), "wrong diagnostic:\n{}", r.stderr);
+    // the giveaway symptom: it used to print only "a"
+    assert!(!r.stdout.contains('a'), "program ran before failing:\n{}", r.stdout);
+}
+
+#[test]
+fn a_trailing_expression_is_still_the_value_of_its_block() {
+    assert_output("fn double(x: int) -> int {\n    x * 2\n}\nfn main() { print(double(21)); }\n", &["42"]);
+    assert_output("fn main() {\n    let r = if true { 100 } else { 0 };\n    print(r);\n}\n", &["100"]);
+    assert_output("fn main() {\n    let v = match 2 { 1 => 10, _ => 20 };\n    print(v);\n}\n", &["20"]);
+}
+
+#[test]
+fn a_trailing_expression_at_top_level_is_allowed() {
+    // The rule is "last thing in its block"; at top level that means EOF.
+    let r = run("fn f() -> int { return 7; }\nprint(f())\n");
+    assert!(r.success, "rejected a top-level trailing expression:\n{}", r.stderr);
+    assert_eq!(r.lines().as_slice(), &["7"]);
+}
