@@ -37,6 +37,18 @@ fn add(x: int, y: int) -> int {
     return x + y;
 }
 
+// A second type implementing the same trait: which `show` runs is decided by
+// the value it is called on.
+struct Tag {
+    text: string
+}
+
+impl Show for Tag {
+    fn show(self) -> string {
+        return "Tag";
+    }
+}
+
 fn main() {
     print("=== Zarrin Feature Test ===");
 
@@ -66,6 +78,7 @@ fn main() {
     print(c2);
 
     // Match
+    print(Tag { text: "t" }.show());
     let v = match c {
         Red => 1,
         Green => 2,

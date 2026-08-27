@@ -21,6 +21,12 @@ use inkwell::AddressSpace;
 use std::collections::HashMap;
 use std::process::Command;
 
+/// A method's name inside the module: its type, then the method. Two `impl`
+/// blocks may declare the same method name, and only the type tells them apart.
+fn method_key(type_name: &str, method: &str) -> String {
+    format!("{}.{}", type_name, method)
+}
+
 /// How `strcmp`'s answer is read for each comparison. `None` for operators
 /// that mean something else on strings, like `+`.
 fn string_compare_predicate(op: &BinOp) -> Option<inkwell::IntPredicate> {
@@ -1858,13 +1864,23 @@ impl<'ctx> Codegen<'ctx> {
                     let a_val = self.gen_expr(a);
                     meta_args.push(self.value_to_int(&a_val).into());
                 }
-                let func = self.functions.get(method)
+                // Which type's method this is comes from the receiver, not
+                // from the method's name alone.
+                let owner = self.named_of_kind(obj, |_, _| true).map(|(n, _)| n);
+                let key = owner.map(|n| method_key(&n, method));
+                let func = key
+                    .as_ref()
+                    .and_then(|k| self.functions.get(k))
+                    .or_else(|| self.functions.get(method))
                     .copied()
                     .unwrap_or_else(|| panic!("undefined method: {}", method));
                 let call = self.builder.build_call(func, &meta_args, method).unwrap();
                 match call.try_as_basic_value() {
                     Either::Left(v) => {
-                        let ret_type = self.fn_ret_types.get(method);
+                        let ret_type = key
+                            .as_ref()
+                            .and_then(|k| self.fn_ret_types.get(k))
+                            .or_else(|| self.fn_ret_types.get(method));
                         if matches!(ret_type, Some(Type::String)) && v.is_int_value() {
                             let int_val = v.into_int_value();
                             let ptr = self.builder.build_int_to_ptr(
@@ -3368,7 +3384,7 @@ pub fn compile_to_executable(program: &Program, out_path: &str, src_path: &str, 
                 cg.functions.insert(name.clone(), func);
                 cg.fn_ret_types.insert(name.clone(), ret.clone());
             }
-            StmtKind::Impl { methods, .. } => {
+            StmtKind::Impl { methods, type_name, .. } => {
                 for m in methods {
                     if let StmtKind::Fn { name, params, ret, .. } = &m.kind {
                         let param_types: Vec<BasicMetadataTypeEnum> = params.iter().map(|_| cg.i64.into()).collect();
@@ -3377,9 +3393,14 @@ pub fn compile_to_executable(program: &Program, out_path: &str, src_path: &str, 
                         } else {
                             cg.i64.fn_type(&param_types, false)
                         };
-                        let func = cg.module.add_function(name, fn_type, None);
-                        cg.functions.insert(name.clone(), func);
-                        cg.fn_ret_types.insert(name.clone(), ret.clone());
+                        // A method belongs to its type. Registered under its
+                        // bare name, a second `impl` of the same trait shared
+                        // the first one's function: `A.show()` and `B.show()`
+                        // both answered "A".
+                        let key = method_key(type_name, name);
+                        let func = cg.module.add_function(&key, fn_type, None);
+                        cg.functions.insert(key.clone(), func);
+                        cg.fn_ret_types.insert(key, ret.clone());
                     }
                 }
             }
@@ -3432,7 +3453,7 @@ pub fn compile_to_executable(program: &Program, out_path: &str, src_path: &str, 
             StmtKind::Impl { methods, type_name, .. } => {
                 for m in methods {
                     if let StmtKind::Fn { name, params, body, ret, .. } = &m.kind {
-                        let func = cg.functions[name];
+                        let func = cg.functions[&method_key(type_name, name)];
                         let entry = context.append_basic_block(func, "entry");
                         cg.builder.position_at_end(entry);
                         cg.named.clear();

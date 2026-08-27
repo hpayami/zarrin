@@ -1583,3 +1583,63 @@ fn main() {
 "#,
     );
 }
+
+// ---------------------------------------------------------------------------
+// Which type's method
+//
+// Methods were registered by their bare name, so a second `impl` of the same
+// trait shared the first one's function: `A.show()` and `B.show()` both
+// answered "A", with no error anywhere.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn each_type_gets_its_own_method() {
+    assert_agrees_with_interpreter(
+        r#"
+struct A { n: int }
+struct B { n: int }
+trait Show { fn show(self) -> string; }
+impl Show for A { fn show(self) -> string { return "A"; } }
+impl Show for B { fn show(self) -> string { return "B"; } }
+fn main() {
+    print(A { n: 1 }.show());
+    print(B { n: 2 }.show());
+}
+"#,
+    );
+}
+
+#[test]
+fn two_methods_of_one_name_may_return_different_types() {
+    assert_agrees_with_interpreter(
+        r#"
+struct P { n: int }
+struct Q { n: float }
+impl P { fn get(self) -> int { return self.n; } }
+impl Q { fn get(self) -> float { return self.n; } }
+fn main() {
+    print(P { n: 3 }.get());
+    print(Q { n: 1.5 }.get());
+}
+"#,
+    );
+}
+
+#[test]
+fn an_inherent_impl_still_dispatches() {
+    assert_agrees_with_interpreter(
+        r#"
+struct C { n: int }
+impl C {
+    fn double(self) -> int { return self.n * 2; }
+    fn plus(self, k: int) -> int { return self.n + k; }
+}
+fn main() {
+    let c = C { n: 5 };
+    print(c.double());
+    print(c.plus(3));
+    print(c.double() + c.plus(1));
+}
+"#,
+    );
+}

@@ -72,6 +72,11 @@ against a `TypeEnv` the backend keeps in step with the locals in scope. Do not
 add a rule that infers a type from the shape of an expression — that is what
 the checker is for, and the two drifted apart every time it was tried.
 
+A method is registered under its type and its name, `method_key`, not its name
+alone — two `impl` blocks may declare the same method and only the type tells
+them apart. The call site works out which by asking the checker what the
+receiver is.
+
 A block in the native backend is `open_block` / `close_block`: it owns what it
 declares and releases it at the end, and the names it binds go back to what
 they were. Every construct with a body needs the pair — an `if` branch and a
