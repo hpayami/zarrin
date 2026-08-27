@@ -895,6 +895,88 @@ fn main() {
     );
 }
 
+// --- reference counting -------------------------------------------------------
+
+#[test]
+fn values_bound_in_a_loop_are_reclaimed() {
+    // Each of these allocated once an iteration and kept it. A local holds one
+    // reference and gives it up when its block ends, so the loop is now flat:
+    // a struct went from 7.5 MB over 200k iterations to the 1.4 MB baseline,
+    // an array from 13.6 MB, to_string from 14.7 MB.
+    for src in [
+        "struct P { x: int, y: int }\nfn main() { let i = 0; while i < 3 { let p = P { x: i, y: i }; i = i + 1; } }\n",
+        "fn main() { let i = 0; while i < 3 { let s = \"a\" + \"b\"; i = i + 1; } }\n",
+        "fn main() { let i = 0; while i < 3 { let a = [1, 2, 3, 4]; i = i + 1; } }\n",
+        "enum E { V(int) }\nfn main() { let i = 0; while i < 3 { let e = V(i); i = i + 1; } }\n",
+    ] {
+        let Some(ir) = emitted_ir(src) else { return };
+        assert!(ir.contains("call void @zarrin.release"), "nothing is released:\n{}", src);
+        // the slot itself belongs to the frame, not to each iteration
+        let body: String = ir.lines().skip_while(|l| !l.starts_with("while_body")).take(30).collect::<Vec<_>>().join("\n");
+        assert!(!body.contains("= alloca"), "a slot is allocated per iteration:\n{}", body);
+    }
+}
+
+#[test]
+fn two_names_for_one_value_both_stay_valid() {
+    // The second binding takes a reference of its own, so neither release
+    // frees a value the other is still holding.
+    assert_agrees_with_interpreter(
+        r#"
+struct P { x: int, y: int }
+enum E { V(string), N }
+fn keep(s: string) -> string { return s; }
+fn build(n: int) -> P { return P { x: n, y: n + 1 }; }
+fn main() {
+    let a = "one" + "!";
+    let b = a;
+    print(a); print(b);
+    let p = build(3);
+    print(p.x); print(p.y);
+    let s = keep(a);
+    print(s); print(a);
+    let e = V("payload" + "!");
+    print(e);
+    let arr = ["x" + "1", "y" + "2"];
+    print(arr[0]); print(arr[1]);
+    let i = 0;
+    while i < 3 { let inner = "loop" + to_string(i); print(inner); i = i + 1; }
+    print(a); print(b); print(s);
+}
+"#,
+    );
+}
+
+#[test]
+fn a_string_constant_is_never_freed() {
+    // Constants are laid out like heap values but with a count that does not
+    // move, so holding one in a variable and letting it go is a no-op.
+    assert_agrees_with_interpreter(
+        r#"
+fn main() {
+    let i = 0;
+    while i < 3 { let s = "constant"; print(s); i = i + 1; }
+    let t = "kept";
+    let u = t;
+    print(t); print(u);
+}
+"#,
+    );
+}
+
+#[test]
+fn a_value_owned_by_an_aggregate_outlives_its_local() {
+    // The struct owns the string, so the string's own binding going out of
+    // scope must not free it.
+    assert_agrees_with_interpreter(
+        r#"
+struct Box { s: string, n: int }
+fn wrap() -> Box { let inner = "held" + "!"; return Box { s: inner, n: 1 }; }
+fn main() { let b = wrap(); print(b.s); print(b.n); print(b.s); }
+"#,
+    );
+}
+
 // --- every example, both backends -------------------------------------------
 
 /// Walk `examples/` and require the native executable to behave exactly like

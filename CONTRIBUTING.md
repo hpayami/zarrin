@@ -53,10 +53,17 @@ Three backends have to agree on the language's semantics — the type checker,
 the interpreter and the LLVM backend. When you change behaviour in one, check
 the other two.
 
-Nothing in the native backend frees, so prefer the frame for anything that does
-not outlive the expression producing it: `entry_alloca` reserves it once per
-call rather than once per loop iteration. Reach for `heap_bytes` only when the
-value escapes, and size it to what is needed.
+Heap values in the native backend are reference counted, so two rules matter
+when touching allocation there. A stack slot goes through `entry_alloca`, never
+`build_alloca` at the point of use — inside a loop the latter grows the stack
+once per iteration, which is how several leaks survived being "fixed". And a
+pointer handed to `gen_release` must be the start of the allocation, because
+the header sits immediately before it; returning an interior pointer, as the
+integer formatter once did, hands `free` the wrong address.
+
+Ownership follows one rule: an expression that builds something new hands over
+the reference it already has, and one that merely names something existing does
+not, so whoever records it takes its own. `produces_owned` answers which.
 
 The LLVM backend erases every value to i64, so it has to know an expression's
 type to emit the right code. It asks the type checker: `TypeChecker::type_of`,

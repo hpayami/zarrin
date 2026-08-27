@@ -64,6 +64,9 @@ pub struct Codegen<'ctx> {
     /// Allocations made under it go on the frame and are released when the
     /// statement ends, instead of being heap-allocated and left.
     transient: bool,
+    /// Names bound in each open block, innermost last, so a block can release
+    /// what it introduced. The backend had no block scoping before this.
+    owned: Vec<Vec<String>>,
     enum_variants: HashMap<String, Vec<(String, Vec<Type>)>>,
     variants: VariantIndex,
     loop_exit: Vec<BasicBlock<'ctx>>,
@@ -102,6 +105,7 @@ impl<'ctx> Codegen<'ctx> {
             src: String::new(),
             current_span: Span::new(1, 1),
             transient: false,
+            owned: Vec::new(),
             enum_variants: HashMap::new(),
             variants: VariantIndex::build(program),
             loop_exit: Vec::new(),
@@ -251,14 +255,305 @@ impl<'ctx> Codegen<'ctx> {
         }
     }
 
+    fn field_type(&self, struct_name: &str, field: &str) -> Option<Type> {
+        self.struct_fields.get(struct_name)?.iter().find(|(n, _)| n == field).map(|(_, t)| t.clone())
+    }
+
+    /// Does a value of this type live behind a counted pointer?
+    /// Does evaluating this expression hand back a reference nobody else
+    /// holds? A fresh allocation does; naming something that already exists
+    /// does not, and has to be retained before a second owner records it.
+    fn produces_owned(&mut self, e: &Expr) -> bool {
+        match e {
+            Expr::Ident(_) | Expr::FieldAccess(..) | Expr::Index(..) => false,
+            Expr::If { then_body, .. } => self.produces_owned(then_body),
+            Expr::Match { arms, .. } => arms.first().map(|(_, _, b)| b.clone()).map(|b| self.produces_owned(&b)).unwrap_or(true),
+            _ => true,
+        }
+    }
+
+    fn open_block(&mut self) {
+        self.owned.push(Vec::new());
+    }
+
+    /// The pointer a managed local currently holds.
+    fn managed_ptr(&self, name: &str) -> Option<(PointerValue<'ctx>, Type)> {
+        let (_, ty) = self.named.get(name)?;
+        let ty = ty.clone();
+        if !self.is_managed(&ty) {
+            return None;
+        }
+        let v = self.load_local(name)?;
+        let p = match v {
+            CgValue::Str(p) => p,
+            other => {
+                let raw = self.value_to_int(&other);
+                self.builder
+                    .build_int_to_ptr(raw, self.context.ptr_type(AddressSpace::default()), "as_ptr")
+                    .unwrap()
+            }
+        };
+        Some((p, ty))
+    }
+
+    /// An aggregate becomes an owner of what it is given. A value built on the
+    /// spot hands over the reference it already has; one that is merely named
+    /// still belongs to whoever named it, so the aggregate takes its own.
+    fn retain_stored(&mut self, raw: IntValue<'ctx>, ty: &Type, from: &Expr) {
+        if !self.is_managed(ty) || self.produces_owned(from) {
+            return;
+        }
+        let p = self.builder
+            .build_int_to_ptr(raw, self.context.ptr_type(AddressSpace::default()), "stored")
+            .unwrap();
+        self.gen_retain(p);
+    }
+
+    fn record_owned(&mut self, name: &str) {
+        if let Some(block) = self.owned.last_mut() {
+            block.push(name.to_string());
+        }
+    }
+
+    /// Release everything the block introduced, innermost first.
+    fn close_block(&mut self) {
+        let Some(names) = self.owned.pop() else { return };
+        self.release_names(&names);
+    }
+
+    /// Leaving early: everything every open block introduced goes, but the
+    /// blocks stay open because code generation is still inside them.
+    fn release_all_open(&mut self) {
+        for block in self.owned.clone().iter().rev() {
+            self.release_names(block);
+        }
+    }
+
+    fn release_names(&mut self, names: &[String]) {
+        for name in names.iter().rev() {
+            if let Some((p, ty)) = self.managed_ptr(name) {
+                self.gen_release(p, &ty);
+            }
+        }
+    }
+
+    fn is_managed(&self, ty: &Type) -> bool {
+        match ty {
+            Type::String | Type::Array(_) => true,
+            Type::Named(n) => self.struct_fields.contains_key(n) || self.enum_has_body(n),
+            _ => false,
+        }
+    }
+
+    /// An enum is behind a pointer only when some variant carries a payload;
+    /// otherwise a value of it is just the tag.
+    fn enum_has_body(&self, name: &str) -> bool {
+        self.is_enum(name) && self.variants_of(name).iter().any(|(_, p)| !p.is_empty())
+    }
+
+    fn header_of(&self, p: PointerValue<'ctx>) -> PointerValue<'ctx> {
+        unsafe {
+            self.builder
+                .build_in_bounds_gep(self.i8, p, &[self.i64.const_int(Self::HEADER, false).const_neg()], "hdr")
+                .unwrap()
+        }
+    }
+
+    /// One more owner.
+    fn gen_retain(&self, p: PointerValue<'ctx>) {
+        let f = self.builder.get_insert_block().unwrap().get_parent().unwrap();
+        let bump = self.context.append_basic_block(f, "retain");
+        let done = self.context.append_basic_block(f, "retain_done");
+        let hdr = self.header_of(p);
+        let n = self.builder.build_load(self.i64, hdr, "rc").unwrap().into_int_value();
+        let immortal = self.builder
+            .build_int_compare(inkwell::IntPredicate::EQ, n, self.i64.const_int(Self::IMMORTAL, false), "immortal")
+            .unwrap();
+        self.builder.build_conditional_branch(immortal, done, bump).unwrap();
+        self.builder.position_at_end(bump);
+        let inc = self.builder.build_int_add(n, self.i64.const_int(1, false), "rc1").unwrap();
+        self.builder.build_store(hdr, inc).unwrap();
+        self.builder.build_unconditional_branch(done).unwrap();
+        self.builder.position_at_end(done);
+    }
+
+    /// A key naming the release function for a type. One function per type,
+    /// generated on demand, because what a value owns depends on its shape.
+    fn release_key(&self, ty: &Type) -> String {
+        match ty {
+            Type::String => "str".into(),
+            Type::Array(el) => format!("arr.{}", self.release_key(el)),
+            Type::Named(n) => format!("t.{}", n),
+            other => format!("{:?}", other),
+        }
+    }
+
+    /// One fewer owner; at zero, let go of what it owns and free it.
+    fn release_fn(&mut self, ty: &Type) -> FunctionValue<'ctx> {
+        let name = format!("zarrin.release.{}", self.release_key(ty));
+        if let Some(f) = self.module.get_function(&name) {
+            return f;
+        }
+        let ptr_ty = self.context.ptr_type(AddressSpace::default());
+        let func = self.module.add_function(&name, self.context.void_type().fn_type(&[ptr_ty.into()], false), None);
+        // Registered before the body is built, so a type that owns its own kind
+        // does not send this into a loop.
+        let saved = self.builder.get_insert_block();
+        let entry = self.context.append_basic_block(func, "entry");
+        let drop_bb = self.context.append_basic_block(func, "drop");
+        let done = self.context.append_basic_block(func, "done");
+        self.builder.position_at_end(entry);
+
+        let p = func.get_nth_param(0).unwrap().into_pointer_value();
+        let hdr = self.header_of(p);
+        let n = self.builder.build_load(self.i64, hdr, "rc").unwrap().into_int_value();
+        // Test before touching the count. Decrementing first corrupted the
+        // sentinel on a constant, and the second release then freed it.
+        let mortal_bb = self.context.append_basic_block(func, "mortal");
+        let immortal = self.builder
+            .build_int_compare(inkwell::IntPredicate::EQ, n, self.i64.const_int(Self::IMMORTAL, false), "immortal")
+            .unwrap();
+        self.builder.build_conditional_branch(immortal, done, mortal_bb).unwrap();
+
+        self.builder.position_at_end(mortal_bb);
+        let dec = self.builder.build_int_sub(n, self.i64.const_int(1, false), "rc1").unwrap();
+        self.builder.build_store(hdr, dec).unwrap();
+        let last = self.builder
+            .build_int_compare(inkwell::IntPredicate::SLE, dec, self.i64.const_zero(), "last")
+            .unwrap();
+        self.builder.build_conditional_branch(last, drop_bb, done).unwrap();
+
+        self.builder.position_at_end(drop_bb);
+        self.gen_release_children(p, ty);
+        let free_ty = self.context.void_type().fn_type(&[ptr_ty.into()], false);
+        let free_fn = self.module.get_function("free").unwrap_or_else(|| self.module.add_function("free", free_ty, None));
+        self.builder.build_call(free_fn, &[hdr.into()], "").unwrap();
+        self.builder.build_unconditional_branch(done).unwrap();
+
+        self.builder.position_at_end(done);
+        self.builder.build_return(None).unwrap();
+        if let Some(b) = saved {
+            self.builder.position_at_end(b);
+        }
+        func
+    }
+
+    /// Release whatever a value of this type holds on to.
+    fn gen_release_children(&mut self, p: PointerValue<'ctx>, ty: &Type) {
+        match ty {
+            Type::String => {}
+            Type::Array(el) => {
+                if !self.is_managed(el) {
+                    return;
+                }
+                let el = (**el).clone();
+                let child = self.release_fn(&el);
+                let f = self.builder.get_insert_block().unwrap().get_parent().unwrap();
+                let head = self.context.append_basic_block(f, "elems");
+                let body = self.context.append_basic_block(f, "elem");
+                let out = self.context.append_basic_block(f, "elems_done");
+                let len = self.builder.build_load(self.i64, p, "len").unwrap().into_int_value();
+                let i = self.entry_alloca(self.i64.into(), "i");
+                self.builder.build_store(i, self.i64.const_int(1, false)).unwrap();
+                self.builder.build_unconditional_branch(head).unwrap();
+
+                self.builder.position_at_end(head);
+                let iv = self.builder.build_load(self.i64, i, "iv").unwrap().into_int_value();
+                let limit = self.builder.build_int_add(len, self.i64.const_int(1, false), "limit").unwrap();
+                let more = self.builder.build_int_compare(inkwell::IntPredicate::SLT, iv, limit, "more").unwrap();
+                self.builder.build_conditional_branch(more, body, out).unwrap();
+
+                self.builder.position_at_end(body);
+                let slot = unsafe { self.builder.build_gep(self.i64, p, &[iv], "slot").unwrap() };
+                let raw = self.builder.build_load(self.i64, slot, "elem").unwrap().into_int_value();
+                let cp = self.builder.build_int_to_ptr(raw, self.context.ptr_type(AddressSpace::default()), "elemp").unwrap();
+                self.builder.build_call(child, &[cp.into()], "").unwrap();
+                let next = self.builder.build_int_add(iv, self.i64.const_int(1, false), "i1").unwrap();
+                self.builder.build_store(i, next).unwrap();
+                self.builder.build_unconditional_branch(head).unwrap();
+                self.builder.position_at_end(out);
+            }
+            Type::Named(n) => {
+                if let Some(fields) = self.struct_fields.get(n).cloned() {
+                    for (idx, (_, fty)) in fields.iter().enumerate() {
+                        if !self.is_managed(fty) {
+                            continue;
+                        }
+                        let child = self.release_fn(fty);
+                        let slot = unsafe {
+                            self.builder.build_gep(self.i64, p, &[self.i64.const_int(idx as u64, false)], "field").unwrap()
+                        };
+                        let raw = self.builder.build_load(self.i64, slot, "fieldv").unwrap().into_int_value();
+                        let cp = self.builder.build_int_to_ptr(raw, self.context.ptr_type(AddressSpace::default()), "fieldp").unwrap();
+                        self.builder.build_call(child, &[cp.into()], "").unwrap();
+                    }
+                } else if self.enum_has_body(n) {
+                    // Only the live variant's payload is owned, so switch on the tag.
+                    let variants = self.variants_of(n);
+                    let f = self.builder.get_insert_block().unwrap().get_parent().unwrap();
+                    let after = self.context.append_basic_block(f, "variant_done");
+                    let tag = self.builder.build_load(self.i64, p, "tag").unwrap().into_int_value();
+                    for (vi, (vname, payload)) in variants.iter().enumerate() {
+                        if !payload.iter().any(|t| self.is_managed(t)) {
+                            continue;
+                        }
+                        let hit = self.context.append_basic_block(f, &format!("drop_{}", vname));
+                        let miss = self.context.append_basic_block(f, &format!("not_{}", vname));
+                        let eq = self.builder
+                            .build_int_compare(inkwell::IntPredicate::EQ, tag, self.i64.const_int(vi as u64, false), "is_v")
+                            .unwrap();
+                        self.builder.build_conditional_branch(eq, hit, miss).unwrap();
+                        self.builder.position_at_end(hit);
+                        for (j, pty) in payload.iter().enumerate() {
+                            if !self.is_managed(pty) {
+                                continue;
+                            }
+                            let child = self.release_fn(pty);
+                            let slot = unsafe {
+                                self.builder.build_gep(self.i64, p, &[self.i64.const_int((j + 1) as u64, false)], "payload").unwrap()
+                            };
+                            let raw = self.builder.build_load(self.i64, slot, "payloadv").unwrap().into_int_value();
+                            let cp = self.builder.build_int_to_ptr(raw, self.context.ptr_type(AddressSpace::default()), "payloadp").unwrap();
+                            self.builder.build_call(child, &[cp.into()], "").unwrap();
+                        }
+                        self.builder.build_unconditional_branch(after).unwrap();
+                        self.builder.position_at_end(miss);
+                    }
+                    self.builder.build_unconditional_branch(after).unwrap();
+                    self.builder.position_at_end(after);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn gen_release(&mut self, p: PointerValue<'ctx>, ty: &Type) {
+        // Inside a consumed expression every allocation is on the frame and has
+        // no header to read; the stack mark reclaims it instead.
+        if self.transient {
+            return;
+        }
+        let f = self.release_fn(ty);
+        self.builder.build_call(f, &[p.into()], "").unwrap();
+    }
+
     fn heap_bytes(&self, bytes: IntValue<'ctx>, name: &str) -> PointerValue<'ctx> {
-        self.builder
-            .build_call(self.malloc_fn(), &[bytes.into()], name)
+        let total = self.builder
+            .build_int_add(bytes, self.i64.const_int(Self::HEADER, false), "with_header")
+            .unwrap();
+        let base = self.builder
+            .build_call(self.malloc_fn(), &[total.into()], name)
             .unwrap()
             .try_as_basic_value()
             .left()
             .unwrap()
-            .into_pointer_value()
+            .into_pointer_value();
+        self.builder.build_store(base, self.i64.const_int(1, false)).unwrap();
+        unsafe {
+            self.builder
+                .build_in_bounds_gep(self.i8, base, &[self.i64.const_int(Self::HEADER, false)], name)
+                .unwrap()
+        }
     }
 
     /// Allocate `slots` 64-bit words on the heap.
@@ -269,13 +564,9 @@ impl<'ctx> Codegen<'ctx> {
     /// frame, and the caller read whatever overwrote it. Nothing is freed —
     /// the backend has no ownership model yet, and leaking beats corrupting.
     fn heap_slots(&self, slots: u64, name: &str) -> PointerValue<'ctx> {
-        self.builder
-            .build_call(self.malloc_fn(), &[self.i64.const_int(slots * 8, false).into()], name)
-            .unwrap()
-            .try_as_basic_value()
-            .left()
-            .unwrap()
-            .into_pointer_value()
+        // Through heap_bytes, so this gets a header like every other heap
+        // value; releasing one allocated without a header reads rubbish.
+        self.heap_bytes(self.i64.const_int(slots * 8, false), name)
     }
 
     /// Variants of `enum_name`, including the predeclared `Option`/`Result`,
@@ -344,7 +635,9 @@ impl<'ctx> Codegen<'ctx> {
             Type::String => self.context.ptr_type(AddressSpace::default()).into(),
             _ => self.i64.into(),
         };
-        let ptr = self.builder.build_alloca(slot_ty, name).unwrap();
+        // In the entry block: a `let` inside a loop runs every iteration, and a
+        // slot allocated there would grow the stack instead of being reused.
+        let ptr = self.entry_alloca(slot_ty, name);
         self.store_into(ptr, ty, v);
         self.named.insert(name.to_string(), (ptr, ty.clone()));
         self.types.define(name, ty.clone());
@@ -392,7 +685,7 @@ impl<'ctx> Codegen<'ctx> {
         let has_payload = variants.iter().any(|(_, p)| !p.is_empty());
         let f = self.builder.get_insert_block().unwrap().get_parent().unwrap();
         let done = self.context.append_basic_block(f, "enum_str_done");
-        let slot = self.builder.build_alloca(ptr_ty, "enum_str").unwrap();
+        let slot = self.entry_alloca(ptr_ty.into(), "enum_str");
 
         // A payload-free enum is just its tag; otherwise the tag is the first word.
         let (tag, base) = if has_payload {
@@ -411,7 +704,7 @@ impl<'ctx> Codegen<'ctx> {
 
             self.builder.position_at_end(case);
             if ptypes.is_empty() || base.is_none() {
-                let text = self.builder.build_global_string_ptr(vname, "variant_name").unwrap().as_pointer_value();
+                let text = self.string_global(vname);
                 self.builder.build_store(slot, text).unwrap();
             } else {
                 let mut parts: Vec<PointerValue<'ctx>> = Vec::new();
@@ -486,12 +779,37 @@ impl<'ctx> Codegen<'ctx> {
         }
     }
 
+    /// Every heap value carries a reference count in the 16 bytes before it,
+    /// so a pointer can be retained and released without knowing where it came
+    /// from. Constants get the same shape with a count that never moves.
+    const HEADER: u64 = 16;
+    const IMMORTAL: u64 = u64::MAX;
+
+    /// A string constant, laid out like a heap value so it can be held in a
+    /// variable and released like one — the release is a no-op on it.
     fn string_global(&self, s: &str) -> PointerValue<'ctx> {
         let c = format!("{}\0", s);
-        let arr = self.context.const_string(c.as_bytes(), false);
-        let g = self.module.add_global(arr.get_type(), None, "strlit");
-        g.set_initializer(&arr);
-        g.as_pointer_value()
+        let bytes = self.context.const_string(c.as_bytes(), false);
+        let pad = self.i8.array_type((Self::HEADER - 8) as u32).const_zero();
+        let ty = self.context.struct_type(
+            &[self.i64.into(), pad.get_type().into(), bytes.get_type().into()],
+            false,
+        );
+        let g = self.module.add_global(ty, None, "strlit");
+        g.set_initializer(&self.context.const_struct(
+            &[self.i64.const_int(Self::IMMORTAL, false).into(), pad.into(), bytes.into()],
+            false,
+        ));
+        unsafe {
+            self.builder
+                .build_in_bounds_gep(
+                    self.i8,
+                    g.as_pointer_value(),
+                    &[self.i64.const_int(Self::HEADER, false)],
+                    "strlit_body",
+                )
+                .unwrap()
+        }
     }
 
 
@@ -529,17 +847,36 @@ impl<'ctx> Codegen<'ctx> {
                 let lv = self.gen_expr(l);
                 let rv = self.gen_expr(r);
                 if matches!(op, BinOp::Add) {
-                    match (&lv, &rv) {
-                        (CgValue::Str(a), CgValue::Str(b)) => return self.gen_string_concat(*a, *b),
+                    // Joining reads both sides and produces something new, so an
+                    // operand built on the spot has no owner afterwards. Without
+                    // this the intermediate in `"v" + to_string(i)` was left.
+                    let (drop_l, drop_r) = (self.produces_owned(l), self.produces_owned(r));
+                    let mut spent: Vec<PointerValue<'ctx>> = Vec::new();
+                    let joined = match (&lv, &rv) {
+                        (CgValue::Str(a), CgValue::Str(b)) => {
+                            if drop_l { spent.push(*a); }
+                            if drop_r { spent.push(*b); }
+                            Some(self.gen_string_concat(*a, *b))
+                        }
                         (CgValue::Str(a), CgValue::Int(b)) => {
                             let b_str = self.gen_int_to_str(*b);
-                            return self.gen_string_concat(*a, b_str);
+                            if drop_l { spent.push(*a); }
+                            spent.push(b_str);
+                            Some(self.gen_string_concat(*a, b_str))
                         }
                         (CgValue::Int(a), CgValue::Str(b)) => {
                             let a_str = self.gen_int_to_str(*a);
-                            return self.gen_string_concat(a_str, *b);
+                            spent.push(a_str);
+                            if drop_r { spent.push(*b); }
+                            Some(self.gen_string_concat(a_str, *b))
                         }
-                        _ => {}
+                        _ => None,
+                    };
+                    if let Some(v) = joined {
+                        for p in spent {
+                            self.gen_release(p, &Type::String);
+                        }
+                        return v;
                     }
                 }
                 match (&lv, &rv, op) {
@@ -887,10 +1224,10 @@ impl<'ctx> Codegen<'ctx> {
 
                     let delim_len_val = self.builder.build_call(strlen_fn, &[delim_ptr.into()], "delim_len").unwrap().try_as_basic_value().left().unwrap().into_int_value();
 
-                    let count_ptr = self.builder.build_alloca(self.i64, "split_count").unwrap();
+                    let count_ptr = self.entry_alloca(self.i64.into(), "split_count");
                     self.builder.build_store(count_ptr, self.i64.const_int(1, false)).unwrap();
 
-                    let cur_ptr_ptr = self.builder.build_alloca(byte_ptr_ty, "split_cur").unwrap();
+                    let cur_ptr_ptr = self.entry_alloca(byte_ptr_ty.into(), "split_cur");
                     self.builder.build_store(cur_ptr_ptr, s_ptr).unwrap();
 
                     let loop_bb = self.context.append_basic_block(fn_val, "split_loop");
@@ -921,14 +1258,14 @@ impl<'ctx> Codegen<'ctx> {
                     let arr_buf = self.scratch_bytes(arr_alloc_size, "arr_buf");
                     self.builder.build_store(arr_buf, total_count).unwrap();
 
-                    let idx_ptr = self.builder.build_alloca(self.i64, "split_idx").unwrap();
+                    let idx_ptr = self.entry_alloca(self.i64.into(), "split_idx");
                     self.builder.build_store(idx_ptr, self.i64.const_int(0, false)).unwrap();
 
                     let extract_loop = self.context.append_basic_block(fn_val, "split_extract_loop");
                     let extract_body = self.context.append_basic_block(fn_val, "split_extract_body");
                     let extract_done = self.context.append_basic_block(fn_val, "split_extract_done");
 
-                    let s_cur2 = self.builder.build_alloca(byte_ptr_ty, "split_s_cur2").unwrap();
+                    let s_cur2 = self.entry_alloca(byte_ptr_ty.into(), "split_s_cur2");
                     self.builder.build_store(s_cur2, s_ptr).unwrap();
 
                     self.builder.build_unconditional_branch(extract_loop).unwrap();
@@ -1013,6 +1350,9 @@ impl<'ctx> Codegen<'ctx> {
                             self.builder.build_gep(array_ty, alloca, &[self.i64.const_int(0, false), self.i64.const_int((j + 1) as u64, false)], &format!("{}_{}", name, j)).unwrap()
                         };
                         self.builder.build_store(field_ptr, av_int).unwrap();
+                        if let Some(pty) = payload_types.get(j).cloned() {
+                            self.retain_stored(av_int, &pty, arg);
+                        }
                     }
                     return CgValue::Int(self.builder.build_ptr_to_int(base_ptr, self.i64, "enum_ptr").unwrap());
                 }
@@ -1074,6 +1414,9 @@ impl<'ctx> Codegen<'ctx> {
                         self.builder.build_gep(array_ty, alloca, &[self.i64.const_int(0, false), self.i64.const_int(i as u64, false)], &format!("{}_{}", name, fname)).unwrap()
                     };
                     self.builder.build_store(field_ptr, fv_int).unwrap();
+                    if let Some(fty) = self.field_type(name, fname) {
+                        self.retain_stored(fv_int, &fty, fexpr);
+                    }
                 }
                 CgValue::Int(self.builder.build_ptr_to_int(base_ptr, self.i64, "struct_ptr").unwrap())
             }
@@ -1100,11 +1443,7 @@ impl<'ctx> Codegen<'ctx> {
                 // Fields are stored as raw words; the declared type says how to
                 // read one back. Without this a float field printed its bit
                 // pattern and a string field its address.
-                match field_ty {
-                    Type::Float => CgValue::Float(self.builder.build_bit_cast(raw, self.f64, "f_field").unwrap().into_float_value()),
-                    Type::String => CgValue::Str(self.builder.build_int_to_ptr(raw, self.context.ptr_type(AddressSpace::default()), "s_field").unwrap()),
-                    _ => CgValue::Int(raw),
-                }
+                self.typed_value(raw, &field_ty)
             }
             Expr::MethodCall(obj, method, args) => {
                 let obj_val = self.gen_expr(obj);
@@ -1280,7 +1619,7 @@ Expr::Match { scrutinee, arms } => {
                                                 ], &format!("{}_{}", name, j)).unwrap()
                                             };
                                             let field_val = self.builder.build_load(self.i64, field_ptr, vname).unwrap().into_int_value();
-                                            let ptr = self.builder.build_alloca(self.i64, vname).unwrap();
+                                            let ptr = self.entry_alloca(self.i64.into(), vname);
                                             self.builder.build_store(ptr, field_val).unwrap();
                                             let pty = payload_types.get(j).cloned().unwrap_or(Type::Int);
                                             self.named.insert(vname.clone(), (ptr, pty.clone()));
@@ -1297,7 +1636,7 @@ Expr::Match { scrutinee, arms } => {
                     self.builder.position_at_end(arm_bb);
                     if let Some(first_pat) = patterns.first() {
                         if let Pattern::Variable(name) = first_pat {
-                            let ptr = self.builder.build_alloca(self.i64, name).unwrap();
+                            let ptr = self.entry_alloca(self.i64.into(), name);
                             self.builder.build_store(ptr, sv_tag).unwrap();
                             self.named.insert(name.clone(), (ptr, Type::Int));
                             self.types.define(name, Type::Int);
@@ -1400,7 +1739,7 @@ Expr::Match { scrutinee, arms } => {
                 let body_bb = self.context.append_basic_block(fn_val, "while_expr_body");
                 let after_bb = self.context.append_basic_block(fn_val, "while_expr_end");
 
-                let result_ptr = self.builder.build_alloca(self.i64, "while_result").unwrap();
+                let result_ptr = self.entry_alloca(self.i64.into(), "while_result");
                 self.builder.build_store(result_ptr, self.i64.const_int(0, false)).unwrap();
 
                 self.builder.build_unconditional_branch(loop_bb).unwrap();
@@ -1436,20 +1775,20 @@ Expr::Match { scrutinee, arms } => {
                 let iter_val = self.gen_expr(iter);
                 let iter_int = self.value_to_int(&iter_val);
 
-                let arr_ptr_val = self.builder.build_alloca(self.i64, "for_arr_ptr").unwrap();
-                let is_array = self.builder.build_alloca(self.i64, "for_is_array").unwrap();
+                let arr_ptr_val = self.entry_alloca(self.i64.into(), "for_arr_ptr");
+                let is_array = self.entry_alloca(self.i64.into(), "for_is_array");
 
                 let loop_bb = self.context.append_basic_block(fn_val, "for_loop");
                 let body_bb = self.context.append_basic_block(fn_val, "for_body");
                 let inc_bb = self.context.append_basic_block(fn_val, "for_inc");
                 let after_bb = self.context.append_basic_block(fn_val, "for_end");
 
-                let result_ptr = self.builder.build_alloca(self.i64, "for_result").unwrap();
+                let result_ptr = self.entry_alloca(self.i64.into(), "for_result");
                 self.builder.build_store(result_ptr, self.i64.const_int(0, false)).unwrap();
                 self.builder.build_store(is_array, self.i64.const_int(0, false)).unwrap();
                 self.builder.build_store(arr_ptr_val, self.i64.const_int(0, false)).unwrap();
 
-                let idx_ptr = self.builder.build_alloca(self.i64, "for_idx").unwrap();
+                let idx_ptr = self.entry_alloca(self.i64.into(), "for_idx");
                 self.builder.build_store(idx_ptr, self.i64.const_int(0, false)).unwrap();
 
                 self.builder.build_unconditional_branch(loop_bb).unwrap();
@@ -1471,7 +1810,7 @@ Expr::Match { scrutinee, arms } => {
 
                 self.builder.position_at_end(body_bb);
                 let elem = cur_idx;
-                let var_ptr = self.builder.build_alloca(self.i64, var).unwrap();
+                let var_ptr = self.entry_alloca(self.i64.into(), var);
                 self.builder.build_store(var_ptr, elem).unwrap();
                 self.named.insert(var.clone(), (var_ptr, Type::Int));
                 self.types.define(var, Type::Int);
@@ -1517,6 +1856,9 @@ Expr::Match { scrutinee, arms } => {
                         self.builder.build_gep(self.i64, buf, &[offset], &format!("arr_{}", i)).unwrap()
                     };
                     self.builder.build_store(elem_ptr, ev_int).unwrap();
+                    if let Some(ety) = self.type_of(elem) {
+                        self.retain_stored(ev_int, &ety, elem);
+                    }
                 }
                 CgValue::Int(buf_i64)
             }
@@ -1532,7 +1874,14 @@ Expr::Match { scrutinee, arms } => {
                 let elem_ptr = unsafe {
                     self.builder.build_gep(self.i64, arr_ptr, &[elem_offset], "elem_ptr").unwrap()
                 };
-                CgValue::Int(self.builder.build_load(self.i64, elem_ptr, "arr_elem").unwrap().into_int_value())
+                let raw = self.builder.build_load(self.i64, elem_ptr, "arr_elem").unwrap().into_int_value();
+                // Elements keep their declared type, as struct fields do; the
+                // load came back as a plain int whatever the array held.
+                let elem_ty = match self.type_of(arr) {
+                    Some(Type::Array(el)) => (*el).clone(),
+                    _ => Type::Int,
+                };
+                self.typed_value(raw, &elem_ty)
             }
         }
     }
@@ -1590,9 +1939,9 @@ Expr::Match { scrutinee, arms } => {
         ]);
         let abs = abs_phi.as_basic_value().into_int_value();
 
-        let idx_ptr = self.builder.build_alloca(self.i64, "itoa_idx").unwrap();
+        let idx_ptr = self.entry_alloca(self.i64.into(), "itoa_idx");
         self.builder.build_store(idx_ptr, self.i64.const_int(30, false)).unwrap();
-        let val_ptr = self.builder.build_alloca(self.i64, "itoa_val").unwrap();
+        let val_ptr = self.entry_alloca(self.i64.into(), "itoa_val");
         self.builder.build_store(val_ptr, abs).unwrap();
 
         self.builder.build_unconditional_branch(loop_bb).unwrap();
@@ -1651,10 +2000,25 @@ Expr::Match { scrutinee, arms } => {
         };
         self.builder.build_store(null_ptr, self.i8.const_int(0, false)).unwrap();
 
-        let result_ptr = unsafe {
-            self.builder.build_gep(self.i8, buf_byte_ptr2, &[fd], "result_ptr").unwrap()
+        // The digits were built backwards from the end of the buffer. Move them
+        // to the front so the string starts where the allocation does —
+        // releasing an interior pointer would hand `free` the wrong address.
+        let start = unsafe {
+            self.builder.build_gep(self.i8, buf_byte_ptr2, &[fd], "digits").unwrap()
         };
-        result_ptr
+        let ptr_ty = self.context.ptr_type(AddressSpace::default());
+        let strlen = self.module.get_function("strlen").unwrap_or_else(|| {
+            self.module.add_function("strlen", self.i64.fn_type(&[ptr_ty.into()], false), None)
+        });
+        let memmove = self.module.get_function("memmove").unwrap_or_else(|| {
+            let ty = self.context.void_type().fn_type(&[ptr_ty.into(), ptr_ty.into(), self.i64.into()], false);
+            self.module.add_function("memmove", ty, None)
+        });
+        let n = self.builder.build_call(strlen, &[start.into()], "digits_len").unwrap()
+            .try_as_basic_value().left().unwrap().into_int_value();
+        let with_nul = self.builder.build_int_add(n, self.i64.const_int(1, false), "digits_n").unwrap();
+        self.builder.build_call(memmove, &[buf_byte_ptr2.into(), start.into(), with_nul.into()], "").unwrap();
+        buf_byte_ptr2
     }
 
     /// Format a float the way the interpreter does: the shortest decimal that
@@ -1718,7 +2082,7 @@ Expr::Match { scrutinee, arms } => {
         self.builder.position_at_end(num_bb);
 
         // --- shortest number of decimals that round-trips -------------------
-        let d_ptr = self.builder.build_alloca(self.i64, "fd").unwrap();
+        let d_ptr = self.entry_alloca(self.i64.into(), "fd");
         self.builder.build_store(d_ptr, self.i64.const_zero()).unwrap();
         let (d_head, d_next, d_done) = (bb("fd_head"), bb("fd_next"), bb("fd_done"));
         self.builder.build_unconditional_branch(d_head).unwrap();
@@ -1758,7 +2122,7 @@ Expr::Match { scrutinee, arms } => {
         let is_neg = self.builder.build_int_compare(inkwell::IntPredicate::EQ, first, self.i8.const_int('-' as u64, false), "is_neg").unwrap();
         let neg = self.builder.build_int_z_extend(is_neg, self.i64, "neg").unwrap();
 
-        let p_ptr = self.builder.build_alloca(self.i64, "fp").unwrap();
+        let p_ptr = self.entry_alloca(self.i64.into(), "fp");
         self.builder.build_store(p_ptr, self.i64.const_int(1, false)).unwrap();
         let (p_head, p_next, p_done) = (bb("fp_head"), bb("fp_next"), bb("fp_done"));
         self.builder.build_unconditional_branch(p_head).unwrap();
@@ -1786,9 +2150,9 @@ Expr::Match { scrutinee, arms } => {
         self.builder.build_call(snprintf, &[ebuf.into(), self.i64.const_int(64, false).into(), fmt_e.into(), pm1_32.into(), val.into()], "").unwrap();
 
         // copy p digits out of "d.ddde+XX", skipping the point
-        let j_ptr = self.builder.build_alloca(self.i64, "j").unwrap();
-        let k_ptr = self.builder.build_alloca(self.i64, "k").unwrap();
-        let g_ptr = self.builder.build_alloca(self.i64, "got").unwrap();
+        let j_ptr = self.entry_alloca(self.i64.into(), "j");
+        let k_ptr = self.entry_alloca(self.i64.into(), "k");
+        let g_ptr = self.entry_alloca(self.i64.into(), "got");
         self.builder.build_store(j_ptr, neg).unwrap();
         self.builder.build_store(k_ptr, neg).unwrap();
         self.builder.build_store(g_ptr, self.i64.const_zero()).unwrap();
@@ -1865,6 +2229,17 @@ Expr::Match { scrutinee, arms } => {
     /// Every branch of a match or an if is merged through an i64 phi. Put the
     /// result back into whatever shape the branches produced, or a string arm
     /// comes out as the number its pointer happens to be.
+    /// Read a raw word back as the type it was stored as.
+    fn typed_value(&self, raw: IntValue<'ctx>, ty: &Type) -> CgValue<'ctx> {
+        match ty {
+            Type::Float => CgValue::Float(self.builder.build_bit_cast(raw, self.f64, "as_f").unwrap().into_float_value()),
+            Type::String => CgValue::Str(
+                self.builder.build_int_to_ptr(raw, self.context.ptr_type(AddressSpace::default()), "as_s").unwrap(),
+            ),
+            _ => CgValue::Int(raw),
+        }
+    }
+
     fn reshape_like(&self, merged: IntValue<'ctx>, sample: Option<&CgValue<'ctx>>) -> CgValue<'ctx> {
         match sample {
             Some(CgValue::Str(_)) => CgValue::Str(
@@ -1879,8 +2254,8 @@ Expr::Match { scrutinee, arms } => {
 
     fn gen_bool_to_str(&self, v: IntValue<'ctx>) -> PointerValue<'ctx> {
         let ptr_ty = self.context.ptr_type(AddressSpace::default());
-        let t = self.builder.build_global_string_ptr("true", "true_txt").unwrap().as_pointer_value();
-        let f = self.builder.build_global_string_ptr("false", "false_txt").unwrap().as_pointer_value();
+        let t = self.string_global("true");
+        let f = self.string_global("false");
         let zero = self.i64.const_zero();
         let is_true = self.builder.build_int_compare(inkwell::IntPredicate::NE, v, zero, "is_true").unwrap();
         self.builder.build_select(is_true, t, f, "bool_txt").unwrap().into_pointer_value()
@@ -1961,14 +2336,37 @@ Expr::Match { scrutinee, arms } => {
                     CgValue::Float(_) => Type::Float,
                     CgValue::Int(_) => Type::Int,
                 });
+                let borrowed = !self.produces_owned(value);
                 self.bind_local(name, &ty, &v);
+                if self.is_managed(&ty) {
+                    if borrowed {
+                        if let Some((p, t)) = self.managed_ptr(name) {
+                            let _ = t;
+                            self.gen_retain(p);
+                        }
+                    }
+                    self.record_owned(name);
+                }
             }
             StmtKind::Assign { name, value } => {
                 let v = self.gen_expr(value);
                 if let Some((ptr, ty)) = self.named.get(name).map(|(p, t)| (*p, t.clone())) {
+                    let managed = self.is_managed(&ty);
+                    let old = if managed { self.managed_ptr(name) } else { None };
                     // Convert to the slot's representation; storing the value
                     // raw would put a float's bits into an integer slot.
                     self.store_into(ptr, &ty, &v);
+                    if managed {
+                        if !self.produces_owned(value) {
+                            if let Some((p, _)) = self.managed_ptr(name) {
+                                self.gen_retain(p);
+                            }
+                        }
+                        // after the store, so rebinding a name to itself is safe
+                        if let Some((p, t)) = old {
+                            self.gen_release(p, &t);
+                        }
+                    }
                 } else {
                     panic!("undefined variable for assign: {}", name);
                 }
@@ -1980,6 +2378,14 @@ Expr::Match { scrutinee, arms } => {
                 match e {
                     Some(x) => {
                         let v = self.gen_expr(x);
+                        if let Some(t) = self.type_of(x) {
+                            if self.is_managed(&t) && !self.produces_owned(x) {
+                                let raw = self.value_to_int(&v);
+                                let p = self.builder.build_int_to_ptr(raw, self.context.ptr_type(AddressSpace::default()), "ret_ptr").unwrap();
+                                self.gen_retain(p);
+                            }
+                        }
+                        self.release_all_open();
                         match v {
                             CgValue::Int(v) => { self.builder.build_return(Some(&v)).unwrap(); }
                             CgValue::Float(v) => {
@@ -2054,10 +2460,12 @@ Expr::Match { scrutinee, arms } => {
 
                 self.builder.position_at_end(body_bb);
                 let mut body_terminated = false;
+                self.open_block();
                 for s in body {
                     self.gen_stmt(s, fn_val, &mut body_terminated);
                     if body_terminated { break; }
                 }
+                if !body_terminated { self.close_block(); } else { self.owned.pop(); }
                 if !body_terminated {
                     self.builder.build_unconditional_branch(loop_bb).unwrap();
                 }
@@ -2099,7 +2507,7 @@ Expr::Match { scrutinee, arms } => {
                     let cont_bb = self.context.append_basic_block(fn_val, "for_cont");
                     let exit_bb = self.context.append_basic_block(fn_val, "for_exit");
 
-                    let counter_ptr = self.builder.build_alloca(self.i64, var).unwrap();
+                    let counter_ptr = self.entry_alloca(self.i64.into(), var);
                     self.builder.build_store(counter_ptr, start_val.as_basic()).unwrap();
 
                     self.builder.build_unconditional_branch(entry_bb).unwrap();
@@ -2114,10 +2522,12 @@ Expr::Match { scrutinee, arms } => {
                     self.loop_continue.push(cont_bb);
                     self.builder.position_at_end(body_bb);
                     let mut body_terminated = false;
+                    self.open_block();
                     for s in body {
                         self.gen_stmt(s, fn_val, &mut body_terminated);
                         if body_terminated { break; }
                     }
+                    if !body_terminated { self.close_block(); } else { self.owned.pop(); }
                     if !body_terminated {
                         self.builder.build_unconditional_branch(cont_bb).unwrap();
                     }
@@ -2460,6 +2870,7 @@ pub fn compile_to_executable(program: &Program, out_path: &str, src_path: &str, 
                 cg.types.push_scope();
 
                 let mut terminated = false;
+                cg.open_block();
                 for (i, (pname, pty)) in params.iter().enumerate() {
                     // Every parameter arrives as an i64; its declared type says
                     // how to unpack it. Tagging them all "int" meant a `float`
@@ -2475,6 +2886,8 @@ pub fn compile_to_executable(program: &Program, out_path: &str, src_path: &str, 
                 for s in body {
                     cg.gen_stmt(s, func, &mut terminated);
                 }
+                // falling off the end: let go of the locals before returning
+                if !terminated { cg.close_block(); } else { cg.owned.pop(); }
                 if !terminated {
                     if matches!(ret, Type::Unit) {
                         cg.builder.build_return(None).unwrap();
@@ -2496,6 +2909,7 @@ pub fn compile_to_executable(program: &Program, out_path: &str, src_path: &str, 
                         cg.types.pop_scope();
                         cg.types.push_scope();
                         let mut terminated = false;
+                        cg.open_block();
                         for (i, (pname, pty)) in params.iter().enumerate() {
                             // The parser types a `self` parameter as `Self`;
                             // the impl block is what says which type that is.
@@ -2514,6 +2928,8 @@ pub fn compile_to_executable(program: &Program, out_path: &str, src_path: &str, 
                         for s in body {
                             cg.gen_stmt(s, func, &mut terminated);
                         }
+                        // falling off the end: let go of the locals before returning
+                        if !terminated { cg.close_block(); } else { cg.owned.pop(); }
                         if !terminated {
                             if matches!(ret, Type::Unit) {
                                 cg.builder.build_return(None).unwrap();

@@ -34,13 +34,16 @@ differently there.
 
 Not yet: generics, which are parsed and then ignored.
 
-The native backend never frees. A value that cannot outlive the expression
-building it goes on the frame and is released when the statement ends, so
-anything a program prints — however much string, enum or struct it builds to
-get there — costs nothing. A value bound to a variable escapes that expression,
-so it is allocated and left, and a loop building those grows without bound.
-Closing that gap needs a decision about how the language reclaims memory, which
-is what "optional explicit memory control" above points at.
+Memory in the native backend is reference counted. A value that cannot outlive
+the expression building it goes on the frame instead and is released when the
+statement ends; everything else carries a count in the 16 bytes ahead of it,
+gains an owner when a name or an aggregate takes it, and is freed — along with
+whatever it owns — when the last one lets go. Reference cycles are not
+constructible in Zarrin, so nothing is left behind by construction. String
+constants carry a count that never moves.
+
+Not covered: a value produced and then discarded without ever being named, and
+one returned into an expression that drops it. Both leak.
 
 ## Build
 
