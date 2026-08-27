@@ -796,3 +796,42 @@ fn char_at_past_the_end_is_an_error() {
     assert_run_fails("fn main() { print(char_at(\"abc\", 3)); }\n", "char_at index 3 is out of bounds");
     assert_run_fails("fn main() { print(char_at(\"\", 0)); }\n", "char_at index 0 is out of bounds");
 }
+
+// ---------------------------------------------------------------------------
+// Operators the interpreter did not have
+//
+// Comparing two floats was a run-time failure — "unsupported float op" — and
+// had always worked in the native backend, so `1.0 == 1.0` depended on which
+// one ran the program. `!` on an integer answered with 1 or 0 rather than a
+// bool, though the checker had already said the answer was a bool.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn floats_compare() {
+    assert_output(
+        "fn main() {\n\
+         \x20   print(1.0 == 1.0); print(1.0 != 2.0);\n\
+         \x20   print(1.0 < 2.0); print(2.0 <= 2.0);\n\
+         \x20   print(3.0 > 2.0); print(2.0 >= 3.0);\n}\n",
+        &["true", "true", "true", "true", "true", "false"],
+    );
+}
+
+#[test]
+fn floats_have_a_remainder() {
+    assert_output("fn main() { print(2.5 % 1.0); print(7.5 % 2.0); }\n", &["0.5", "1.5"]);
+}
+
+#[test]
+fn not_on_an_integer_answers_with_a_bool() {
+    assert_output("fn main() { print(!0); print(!1); print(!true); }\n", &["true", "false", "false"]);
+}
+
+#[test]
+fn and_or_need_something_that_can_be_true_or_false() {
+    // A float or a string here type-checked and then failed differently in
+    // each backend.
+    assert_check_error("fn main() { print(1.0 && 2.0); }\n", "expected `bool`, found `float`");
+    assert_check_error("fn main() { print(\"a\" || \"b\"); }\n", "expected `bool`, found `string`");
+    assert_checks("fn main() { print(1 && 0); print(true || false); }\n");
+}

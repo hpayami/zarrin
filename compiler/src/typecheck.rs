@@ -453,7 +453,17 @@ impl TypeChecker {
                 match op {
                     BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Mod => Ok(lt),
                     BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge => Ok(Type::Bool),
-                    BinOp::And | BinOp::Or => Ok(Type::Bool),
+                    // Only something that can be true or false. A float or a
+                    // string here was accepted and then failed differently in
+                    // each backend — an unreachable branch in one, "expected
+                    // int operand" in the other.
+                    BinOp::And | BinOp::Or => match lt {
+                        Type::Bool | Type::Int | Type::Inferred => Ok(Type::Bool),
+                        other => Err(TypeError::TypeMismatch {
+                            expected: "bool".into(),
+                            found: other.to_string(),
+                        }),
+                    },
                 }
             }
             ExprKind::Unary(op, e) => {

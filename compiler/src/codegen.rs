@@ -305,7 +305,9 @@ impl Interpreter {
                     },
                     (UnaryOp::Neg, Value::Float(f)) => Value::Float(-f),
                     (UnaryOp::Not, Value::Bool(b)) => Value::Bool(!b),
-                    (UnaryOp::Not, Value::Int(n)) => Value::Int(if *n == 0 { 1 } else { 0 }),
+                    // `!` answers a question, so it answers with a bool. This
+                    // handed back 1 and 0, which printed as numbers.
+                    (UnaryOp::Not, Value::Int(n)) => Value::Bool(*n == 0),
                     _ => rt_fail!(self, "invalid unary operation {:?} on {:?}", op, v),
                 }
             }
@@ -681,6 +683,13 @@ fn eval_binop(&self, l: &Value, op: &BinOp, r: &Value) -> Value {
         (Value::Float(a), Value::Float(b)) => match op {
             BinOp::Add => Value::Float(a + b), BinOp::Sub => Value::Float(a - b),
             BinOp::Mul => Value::Float(a * b), BinOp::Div => Value::Float(a / b),
+            BinOp::Mod => Value::Float(a % b),
+            // These were a run-time failure here and had always worked in the
+            // native backend, so `1.0 == 1.0` answered differently depending on
+            // which one ran the program.
+            BinOp::Eq => Value::Bool(a == b), BinOp::Ne => Value::Bool(a != b),
+            BinOp::Lt => Value::Bool(a < b), BinOp::Le => Value::Bool(a <= b),
+            BinOp::Gt => Value::Bool(a > b), BinOp::Ge => Value::Bool(a >= b),
             _ => rt_fail!(self, "unsupported float op"),
         },
         (Value::Bool(a), Value::Bool(b)) => match op {

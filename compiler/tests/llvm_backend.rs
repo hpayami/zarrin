@@ -1898,3 +1898,25 @@ fn main() {
 "#,
     );
 }
+
+#[test]
+fn float_and_boolean_operators_agree() {
+    assert_agrees_with_interpreter(
+        r#"
+fn main() {
+    print(1.0 == 1.0);
+    print(1.0 != 2.0);
+    print(1.0 < 2.0);
+    print(2.0 <= 2.0);
+    print(3.0 > 2.0);
+    print(2.0 >= 3.0);
+    print(2.5 % 1.0);
+    print(!0);
+    print(!1);
+    print(!true);
+    print(1 && 0);
+    print(true || false);
+}
+"#,
+    );
+}
