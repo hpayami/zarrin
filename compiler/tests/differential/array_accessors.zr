@@ -1,0 +1,11 @@
+// `array_set` answered with an unknown type, so what it returned could not be
+// indexed, and `array_get` handed every element back as an integer.
+fn main() {
+    let xs = [1, 2, 3];
+    print(array_set(xs, 1, 9)[1]);
+    print(array_get(xs, 0) + 1);
+    print(len(array_set(xs, 0, 5)));
+    let names = ["a", "b"];
+    print(array_get(names, 1) + "!");
+    print(array_get([1.5, 2.5], 0));
+}

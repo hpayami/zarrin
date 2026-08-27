@@ -502,8 +502,17 @@ impl TypeChecker {
                     if args.len() != arity {
                         return Err(TypeError::WrongArity { name: func_name.clone(), expected: arity, found: args.len() });
                     }
-                    for a in args.iter() { Self::check_expr(a, env)?; }
-                    return Ok(ret);
+                    let mut arg_types = Vec::new();
+                    for a in args.iter() { arg_types.push(Self::check_expr(a, env)?); }
+                    // What these two answer with depends on the array they were
+                    // given, which the table of signatures cannot see. Left as
+                    // unknown, indexing what `array_set` returned was a type
+                    // error, so the older accessors could not be chained.
+                    return Ok(match (func_name.as_str(), arg_types.first()) {
+                        ("array_set", Some(t)) => t.clone(),
+                        ("array_get", Some(Type::Array(el))) => (**el).clone(),
+                        _ => ret,
+                    });
                 }
                 if let Some(arity) = env.macros.get(func_name).copied() {
                     if args.len() != arity {

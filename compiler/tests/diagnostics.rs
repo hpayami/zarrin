@@ -147,13 +147,17 @@ fn run_reports_type_errors_with_a_position_too() {
 
 #[test]
 fn runtime_failures_report_a_position() {
-    // A match the checker cannot prove complete: `array_get` has no element
-    // type to reason about, so this is one of the few ways an unmatched value
-    // still reaches run time.
+    // A match the checker cannot prove complete. A macro's result is the last
+    // thing with no type to reason about, so it is now the only way an
+    // unmatched value reaches run time — `array_get` used to be another, until
+    // it learned the element type of the array it was given.
+    //
+    // The position is the macro's body, which is the expression that was
+    // actually matched.
     assert_diagnostic(
-        "fn main() {\n    let a = [1, 2];\n    let v = match array_get(a, 0) { 5 => 10, 6 => 20 };\n}\n",
+        "macro same(x) {\n    return x;\n}\nfn main() {\n    let v = match same(7) { 5 => 10, 6 => 20 };\n}\n",
         "no matching pattern",
-        3,
+        2,
         5,
     );
 }

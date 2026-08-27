@@ -1,0 +1,8 @@
+// `match Green {` used to be read as a literal of a struct called `Green`.
+enum Color { Red, Green, Blue }
+struct P { x: int, y: int }
+fn main() {
+    print(match Green { Red => 0, Green => 1, Blue => 2 });
+    print((P { x: 5, y: 6 }).y);
+    print(match (P { x: 7, y: 8 }).x { 7 => "seven", _ => "no" });
+}

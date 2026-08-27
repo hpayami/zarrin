@@ -12,13 +12,16 @@ pub struct Parser<'a> {
     /// Span of the token `advance` most recently returned. Errors that report
     /// a token already consumed must point here, not at what follows it.
     prev_span: Span,
+    /// Between the keyword and the block of a `match`, `if`, `while` or `for`,
+    /// where a `{` opens that block rather than a struct literal.
+    in_header: bool,
 }
 
 impl<'a> Parser<'a> {
     pub fn new(src: &'a str) -> Result<Self, Diagnostic> {
         let mut lexer = Lexer::new(src);
         let (current, span) = lexer.next_token()?;
-        Ok(Parser { lexer, current, span, prev_span: span })
+        Ok(Parser { lexer, current, span, prev_span: span, in_header: false })
     }
 
     fn advance(&mut self) -> Result<Token, Diagnostic> {
@@ -82,7 +85,7 @@ impl<'a> Parser<'a> {
             }
             Token::If => {
                 self.advance()?; // if
-                let cond = self.parse_expr()?;
+                let cond = self.header(|p| p.parse_expr())?;
                 self.expect(Token::LBrace)?;
                 let mut then_body = Vec::new();
                 while self.current != Token::RBrace {
@@ -111,7 +114,7 @@ impl<'a> Parser<'a> {
             }
             Token::While => {
                 self.advance()?; // while
-                let cond = self.parse_expr()?;
+                let cond = self.header(|p| p.parse_expr())?;
                 self.expect(Token::LBrace)?;
                 let mut body = Vec::new();
                 while self.current != Token::RBrace {
@@ -127,7 +130,7 @@ impl<'a> Parser<'a> {
                     t => return Err(self.error_at_prev(format!("expected variable name after for, found {}", describe(&t)))),
                 };
                 self.expect(Token::In)?;
-                let iter = self.parse_expr()?;
+                let iter = self.header(|p| p.parse_expr())?;
                 self.expect(Token::LBrace)?;
                 let mut body = Vec::new();
                 while self.current != Token::RBrace {
@@ -520,6 +523,26 @@ impl<'a> Parser<'a> {
         Ok(args)
     }
 
+    /// `match c {` opens the arms, not a struct literal. Between the keyword
+    /// and the block of a `match`, `if`, `while` or `for`, a `{` belongs to the
+    /// construct — so `match Green { Red => .. }` used to be read as a literal
+    /// of a struct called `Green` and failed at the first `=>`.
+    fn header<T>(&mut self, f: impl FnOnce(&mut Self) -> Result<T, Diagnostic>) -> Result<T, Diagnostic> {
+        let outer = std::mem::replace(&mut self.in_header, true);
+        let r = f(self);
+        self.in_header = outer;
+        r
+    }
+
+    /// Inside brackets the block is unambiguous again, so a struct literal is
+    /// allowed: `if (P { x: 1 }).x` and `f(P { x: 1 })` both read.
+    fn nested<T>(&mut self, f: impl FnOnce(&mut Self) -> Result<T, Diagnostic>) -> Result<T, Diagnostic> {
+        let outer = std::mem::replace(&mut self.in_header, false);
+        let r = f(self);
+        self.in_header = outer;
+        r
+    }
+
     fn parse_type(&mut self) -> Result<Type, Diagnostic> {
         Ok(match self.current.clone() {
             Token::Ident(n) => {
@@ -681,6 +704,7 @@ impl<'a> Parser<'a> {
             Token::Ident(name) => {
                 self.advance()?;
                 if self.current == Token::LBrace
+                    && !self.in_header
                     && name.chars().next().map(|c| c.is_uppercase()).unwrap_or(false)
                 {
                     return Ok(self.parse_struct_lit(name)?);
@@ -689,7 +713,7 @@ impl<'a> Parser<'a> {
                     self.advance()?;
                     let mut args = Vec::new();
                     while self.current != Token::RParen {
-                        args.push(self.parse_expr()?);
+                        args.push(self.nested(|p| p.parse_expr())?);
                         if self.current == Token::Comma {
                             self.advance()?;
                         }
@@ -701,7 +725,7 @@ impl<'a> Parser<'a> {
             }
             Token::LParen => {
                 self.advance()?;
-                let e = self.parse_expr()?;
+                let e = self.nested(|p| p.parse_expr())?;
                 self.expect(Token::RParen)?;
                 e
             }
@@ -826,7 +850,7 @@ impl<'a> Parser<'a> {
     fn parse_match(&mut self) -> Result<Expr, Diagnostic> {
         let at = self.span;
         self.advance()?;
-        let scrutinee = self.parse_expr()?;
+        let scrutinee = self.header(|p| p.parse_expr())?;
         self.expect(Token::LBrace)?;
         let mut arms = Vec::new();
         while self.current != Token::RBrace {
@@ -855,7 +879,7 @@ impl<'a> Parser<'a> {
     fn parse_if_expr(&mut self) -> Result<Expr, Diagnostic> {
         let at = self.span;
         self.advance()?; // if
-        let cond = self.parse_expr()?;
+        let cond = self.header(|p| p.parse_expr())?;
         self.expect(Token::LBrace)?;
         let mut stmts = Vec::new();
         while self.current != Token::RBrace {
@@ -901,7 +925,7 @@ impl<'a> Parser<'a> {
     fn parse_while_expr(&mut self) -> Result<Expr, Diagnostic> {
         let at = self.span;
         self.advance()?; // while
-        let cond = self.parse_expr()?;
+        let cond = self.header(|p| p.parse_expr())?;
         self.expect(Token::LBrace)?;
         let mut body = Vec::new();
         while self.current != Token::RBrace {
@@ -919,7 +943,7 @@ impl<'a> Parser<'a> {
             t => return Err(self.error_at_prev(format!("expected variable name after for, found {}", describe(&t)))),
         };
         self.expect(Token::In)?;
-        let iter = self.parse_expr()?;
+        let iter = self.header(|p| p.parse_expr())?;
         self.expect(Token::LBrace)?;
         let mut body = Vec::new();
         while self.current != Token::RBrace {

@@ -1,4 +1,0 @@
-// `1.0e3` lexes as two tokens, so this reads as a call with two arguments.
-fn main() {
-    print(1.0e3);
-}

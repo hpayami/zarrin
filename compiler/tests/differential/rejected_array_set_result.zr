@@ -1,7 +1,0 @@
-// `array_set` answers with an unknown type, so indexing what it returns is a
-// type error.
-fn main() {
-    let xs = [1, 2, 3];
-    let ys = array_set(xs, 1, 99);
-    print(ys[1]);
-}

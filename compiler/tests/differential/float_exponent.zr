@@ -1,0 +1,10 @@
+// `1.0e3` used to lex as `1.0` and then the identifier `e3`.
+fn main() {
+    print(1.0e3);
+    print(1e3);
+    print(2.5e-2);
+    print(1.0E2);
+    print(5e+1);
+    let e3 = 7;
+    print(e3);
+}

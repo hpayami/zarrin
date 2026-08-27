@@ -1704,6 +1704,13 @@ impl<'ctx> Codegen<'ctx> {
                     return CgValue::Int(len);
                 }
                 if name == "array_get" {
+                    // The element's type says how to read the word back; this
+                    // handed everything over as an integer, so a string came
+                    // out as its address.
+                    let elem_ty = match self.type_of(&args[0]) {
+                        Some(Type::Array(el)) => (*el).clone(),
+                        _ => Type::Int,
+                    };
                     let arr_val = self.gen_expr(&args[0]);
                     let arr_ptr_val = self.value_to_int(&arr_val);
                     let arr_ptr = self.builder.build_int_to_ptr(arr_ptr_val, self.i64.ptr_type(AddressSpace::default()), "arr_ptr").unwrap();
@@ -1715,7 +1722,8 @@ impl<'ctx> Codegen<'ctx> {
                     let elem_ptr = unsafe {
                         self.builder.build_gep(self.i64, arr_ptr, &[elem_off], "elem_ptr").unwrap()
                     };
-                    return CgValue::Int(self.builder.build_load(self.i64, elem_ptr, "arr_elem").unwrap().into_int_value());
+                    let raw = self.builder.build_load(self.i64, elem_ptr, "arr_elem").unwrap().into_int_value();
+                    return self.typed_value(raw, &elem_ty);
                 }
                 if name == "array_set" {
                     let arr_val = self.gen_expr(&args[0]);

@@ -229,9 +229,23 @@ fn both_booleans_or_a_catch_all() {
 
 #[test]
 fn an_unknown_scrutinee_type_is_left_alone() {
-    // `array_get` has no element type to reason about, so nothing can be
-    // proven and nothing is claimed.
-    assert_checks("fn main() { let a = [1, 2]; let v = match array_get(a, 0) { 5 => 10, 6 => 20 }; }\n");
+    // A macro's result has no type to reason about, so nothing can be proven
+    // and nothing is claimed. `array_get` used to be like this too, until it
+    // learned the element type of the array it was given.
+    assert_checks("macro same(x) {\n    return x;\n}\nfn main() { let v = match same(7) { 5 => 10, 6 => 20 }; }\n");
+}
+
+#[test]
+fn the_array_accessors_know_what_the_array_holds() {
+    // `array_set` answered with an unknown type, so indexing what it returned
+    // was a type error and the older accessors could not be chained.
+    assert_checks(
+        "fn main() {\n         \x20   let xs = [1, 2, 3];\n         \x20   print(array_set(xs, 1, 9)[1]);\n         \x20   print(array_get(xs, 0) + 1);\n         \x20   print(len(array_set(xs, 0, 5)));\n}\n",
+    );
+    assert_check_error(
+        "fn main() { let names = [\"a\"]; let n: int = array_get(names, 0); print(n); }\n",
+        "expected `int`, found `string`",
+    );
 }
 
 // ---------------------------------------------------------------------------

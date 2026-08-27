@@ -291,6 +291,31 @@ impl<'a> Lexer<'a> {
                             is_float = true;
                             num.push(n);
                             self.bump();
+                        } else if (n == 'e' || n == 'E') && !num.ends_with('e') && !num.ends_with('E') {
+                            // An exponent, if a digit or a sign follows it.
+                            // `1.0e3` used to lex as `1.0` and then the
+                            // identifier `e3`, so it read as two arguments.
+                            let mut it = self.chars.clone();
+                            it.next();
+                            let after = it.peek().copied();
+                            let exponent = match after {
+                                Some(d) if d.is_ascii_digit() => true,
+                                Some('+') | Some('-') => {
+                                    it.next();
+                                    it.peek().map(|d| d.is_ascii_digit()).unwrap_or(false)
+                                }
+                                _ => false,
+                            };
+                            if !exponent {
+                                break;
+                            }
+                            is_float = true;
+                            num.push(n);
+                            self.bump();
+                            if matches!(self.chars.peek(), Some('+') | Some('-')) {
+                                num.push(self.chars.peek().copied().unwrap());
+                                self.bump();
+                            }
                         } else {
                             break;
                         }

@@ -835,3 +835,43 @@ fn and_or_need_something_that_can_be_true_or_false() {
     assert_check_error("fn main() { print(\"a\" || \"b\"); }\n", "expected `bool`, found `string`");
     assert_checks("fn main() { print(1 && 0); print(true || false); }\n");
 }
+
+// ---------------------------------------------------------------------------
+// Two things the parser and lexer could not read
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_float_may_have_an_exponent() {
+    // `1.0e3` lexed as `1.0` and then the identifier `e3`, so it read as two
+    // arguments and the error said so.
+    assert_output(
+        "fn main() { print(1.0e3); print(1e3); print(2.5e-2); print(1.0E2); print(5e+1); }\n",
+        &["1000", "1000", "0.025", "100", "50"],
+    );
+    // an identifier that starts with `e` is still an identifier
+    assert_output("fn main() { let e3 = 7; print(e3); }\n", &["7"]);
+}
+
+#[test]
+fn match_on_a_variant_name_reads_as_a_match() {
+    // `match Green {` was read as a literal of a struct called `Green`, and
+    // failed at the first `=>`.
+    assert_output(
+        "enum Color { Red, Green, Blue }\n\
+         fn main() { print(match Green { Red => 0, Green => 1, Blue => 2 }); }\n",
+        &["1"],
+    );
+}
+
+#[test]
+fn a_struct_literal_still_reads_where_it_is_unambiguous() {
+    assert_output(
+        "struct P { x: int, y: int }\n\
+         fn main() {\n\
+         \x20   let p = P { x: 1, y: 2 };\n\
+         \x20   print((P { x: 5, y: 6 }).y);\n\
+         \x20   print(match (P { x: 7, y: 8 }).x { 7 => \"seven\", _ => \"no\" });\n\
+         \x20   print(match p.x { 1 => P { x: 9, y: 9 }, _ => P { x: 0, y: 0 } });\n}\n",
+        &["6", "seven", "P { x: 9, y: 9 }"],
+    );
+}

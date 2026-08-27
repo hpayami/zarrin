@@ -603,10 +603,10 @@ fn main() {
 fn an_unmatched_value_stops_the_program() {
     // The last arm used to run whatever its pattern, so an unmatched value
     // produced a plausible wrong answer. The checker rejects most incomplete
-    // matches outright now; this one it cannot, because `array_get` gives it
-    // no element type to reason about.
+    // matches outright now; this one it cannot, because a macro's result has
+    // no type to reason about.
     assert_fails_like_the_interpreter(
-        "fn main() {\n    let a = [7, 8];\n    print(array_get(a, 0));\n    print(match array_get(a, 0) { 5 => 10, 6 => 20 });\n}\n",
+        "macro same(x) {\n    return x;\n}\nfn main() {\n    print(7);\n    print(match same(7) { 5 => 10, 6 => 20 });\n}\n",
     );
 }
 
@@ -2034,6 +2034,26 @@ fn main() {
         i = i + 1;
     }
     print(last);
+}
+"#,
+    );
+}
+
+#[test]
+fn the_array_accessors_agree_on_what_they_answer_with() {
+    // `array_get` handed everything back as an integer, so once the checker
+    // knew the element type a string came out as its address.
+    assert_agrees_with_interpreter(
+        r#"
+fn main() {
+    let names = ["a", "b"];
+    print(array_get(names, 1) + "!");
+    let fs = [1.5, 2.5];
+    print(array_get(fs, 0));
+    let xs = [1, 2, 3];
+    print(array_get(array_set(xs, 1, 9), 1));
+    print(array_set(xs, 2, 7)[2]);
+    print(len(array_set(xs, 0, 5)));
 }
 "#,
     );
