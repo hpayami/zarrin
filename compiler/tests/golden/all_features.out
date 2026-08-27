@@ -16,6 +16,9 @@ true
 padded
 tab	sep
 a brace { stays put }
+true
+true
+greeted
 20
 3
 [10, 20, 30]

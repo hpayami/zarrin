@@ -104,6 +104,11 @@ fn main() {
     print(trim("  padded  "));
     print("tab\tsep");
     print("a brace \{ stays put \}");
+    // strings compare by their characters, and sort by them too
+    let greeting = "hello";
+    print(greeting == "hello");
+    print("apple" < "banana");
+    print(match greeting { "hello" => "greeted", _ => "not" });
 
     // arrays
     let xs = [10, 20, 30];

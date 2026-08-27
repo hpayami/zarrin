@@ -1366,3 +1366,89 @@ fn main() {
 "#,
     );
 }
+
+// ---------------------------------------------------------------------------
+// Comparing strings
+//
+// A string is an address natively, and `==` compared the two addresses — it
+// asked whether both sides were the same allocation, which two equal strings
+// built separately never are. `x == "hello"` did not even compile, because the
+// operand was not an integer. A string pattern in a `match` had the same fault
+// and silently fell through to the wildcard.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn strings_compare_by_their_characters() {
+    assert_agrees_with_interpreter(
+        r#"
+fn main() {
+    let x = "hello";
+    print(x == "hello");
+    print(x == "world");
+    print(x != "world");
+    print("a" + "b" == "ab");
+    print("" == "");
+}
+"#,
+    );
+}
+
+#[test]
+fn strings_order_the_way_they_sort() {
+    assert_agrees_with_interpreter(
+        r#"
+fn main() {
+    print("a" < "b");
+    print("b" > "a");
+    print("a" <= "a");
+    print("a" >= "b");
+    print("abc" > "ab");
+    for n in ["carol", "alice", "bob"] {
+        if n < "c" { print(n); }
+    }
+}
+"#,
+    );
+}
+
+#[test]
+fn a_string_pattern_matches_by_its_characters() {
+    assert_agrees_with_interpreter(
+        r#"
+fn classify(s: string) -> string {
+    return match s {
+        "a" => "first",
+        "b" | "c" => "middle",
+        _ => "other",
+    };
+}
+fn main() {
+    print(classify("a"));
+    print(classify("b"));
+    print(classify("c"));
+    print(classify("z"));
+    print(match "a" + "b" { "ab" => "joined", _ => "no" });
+}
+"#,
+    );
+}
+
+#[test]
+fn comparing_keeps_neither_side() {
+    // Both operands are read and dropped. Left alone, the built-up string grew
+    // the heap once per turn; released twice, Guard Malloc would fault.
+    assert_agrees_with_interpreter(
+        r#"
+fn main() {
+    let hits = 0;
+    let i = 0;
+    while i < 500 {
+        if "v" + to_string(i) == "v7" { hits = hits + 1; }
+        if to_string(i) < "2" { hits = hits + 1; }
+        i = i + 1;
+    }
+    print(hits);
+}
+"#,
+    );
+}

@@ -21,6 +21,21 @@ use inkwell::AddressSpace;
 use std::collections::HashMap;
 use std::process::Command;
 
+/// How `strcmp`'s answer is read for each comparison. `None` for operators
+/// that mean something else on strings, like `+`.
+fn string_compare_predicate(op: &BinOp) -> Option<inkwell::IntPredicate> {
+    use inkwell::IntPredicate::*;
+    match op {
+        BinOp::Eq => Some(EQ),
+        BinOp::Ne => Some(NE),
+        BinOp::Lt => Some(SLT),
+        BinOp::Le => Some(SLE),
+        BinOp::Gt => Some(SGT),
+        BinOp::Ge => Some(SGE),
+        _ => None,
+    }
+}
+
 /// What one `for` loop walks over.
 struct ForSource<'ctx> {
     start: IntValue<'ctx>,
@@ -941,6 +956,18 @@ impl<'ctx> Codegen<'ctx> {
         buf
     }
 
+    /// `strcmp`: negative, zero or positive as the first string sorts before,
+    /// with, or after the second.
+    fn gen_strcmp(&self, a: PointerValue<'ctx>, b: PointerValue<'ctx>) -> IntValue<'ctx> {
+        let ptr_ty = self.context.ptr_type(AddressSpace::default());
+        let f = self.module.get_function("strcmp").unwrap_or_else(|| {
+            let ty = self.context.i32_type().fn_type(&[ptr_ty.into(), ptr_ty.into()], false);
+            self.module.add_function("strcmp", ty, None)
+        });
+        self.builder.build_call(f, &[a.into(), b.into()], "strcmp").unwrap()
+            .try_as_basic_value().left().unwrap().into_int_value()
+    }
+
     /// The two words a range is made of.
     fn range_bounds(&self, p: PointerValue<'ctx>) -> (IntValue<'ctx>, IntValue<'ctx>) {
         let start = self.builder.build_load(self.i64, p, "range_start").unwrap().into_int_value();
@@ -1161,6 +1188,21 @@ impl<'ctx> Codegen<'ctx> {
                             self.gen_release(p, &Type::String);
                         }
                         return v;
+                    }
+                }
+                if let (CgValue::Str(a), CgValue::Str(b)) = (&lv, &rv) {
+                    if let Some(pred) = string_compare_predicate(op) {
+                        // Two strings are two addresses, and comparing those
+                        // asks whether they are the same allocation — never
+                        // what `x == "hello"` means.
+                        let (a, b) = (*a, *b);
+                        let order = self.gen_strcmp(a, b);
+                        let zero = self.context.i32_type().const_zero();
+                        let answer = self.builder.build_int_compare(pred, order, zero, "str_cmp").unwrap();
+                        // Comparing reads both sides and keeps neither.
+                        if self.produces_owned(l) { self.gen_release(a, &Type::String); }
+                        if self.produces_owned(r) { self.gen_release(b, &Type::String); }
+                        return CgValue::Int(self.builder.build_int_z_extend(answer, self.i64, "bool_ext").unwrap());
                     }
                 }
                 match (&lv, &rv, op) {
@@ -1879,8 +1921,22 @@ ExprKind::Match { scrutinee, arms } => {
                         match pattern {
                             Pattern::Literal(e) => {
                                 let pv = self.gen_expr(e);
-                                let pv_int = self.value_to_int(&pv);
-                                let cmp = self.builder.build_int_compare(inkwell::IntPredicate::EQ, sv_tag, pv_int, "match_cmp").unwrap();
+                                // A string pattern is matched by its characters
+                                // like `==` is; comparing the two addresses only
+                                // ever asked whether it was the same allocation.
+                                let cmp = match &pv {
+                                    CgValue::Str(p) => {
+                                        let ptr_ty = self.context.ptr_type(AddressSpace::default());
+                                        let sv = self.builder.build_int_to_ptr(sv_tag, ptr_ty, "match_s").unwrap();
+                                        let order = self.gen_strcmp(sv, *p);
+                                        let zero = self.context.i32_type().const_zero();
+                                        self.builder.build_int_compare(inkwell::IntPredicate::EQ, order, zero, "match_str").unwrap()
+                                    }
+                                    _ => {
+                                        let pv_int = self.value_to_int(&pv);
+                                        self.builder.build_int_compare(inkwell::IntPredicate::EQ, sv_tag, pv_int, "match_cmp").unwrap()
+                                    }
+                                };
                                 if pi < patterns.len() - 1 {
                                     let next_pattern = self.context.append_basic_block(parent, &format!("arm_{}_pat_{}", i, pi + 1));
                                     self.builder.build_conditional_branch(cmp, arm_bb, next_pattern).unwrap();

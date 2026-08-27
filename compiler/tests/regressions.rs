@@ -554,3 +554,18 @@ fn the_field_order_is_the_same_every_run() {
         assert_output(src, want);
     }
 }
+
+// ---------------------------------------------------------------------------
+// Ordering strings
+//
+// `<` on two strings was a run-time failure — "unsupported string op" — which
+// is a surprising answer to `"a" < "b"`.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn strings_can_be_ordered() {
+    assert_output(
+        "fn main() { print(\"a\" < \"b\"); print(\"b\" <= \"a\"); print(\"abc\" > \"ab\"); }\n",
+        &["true", "false", "true"],
+    );
+}

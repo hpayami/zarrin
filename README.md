@@ -31,6 +31,9 @@ down.
 `[1, 2, 3]`, a struct as `Point { x: 1, y: 2 }` with its fields in declaration
 order, an enum as its variant name and payload.
 
+Strings compare by their characters: `==` and `!=`, and `<` through `>=` in the
+order they sort. A string pattern in a `match` is matched the same way.
+
 A range is a value of its own type, `range`: it can be bound, passed, returned,
 printed as `1..4`, and walked later. A `for` walks a range, an array, or an
 integer — counting from zero — and the loop variable takes the element's type.

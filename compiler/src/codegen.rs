@@ -640,6 +640,10 @@ fn eval_binop(&self, l: &Value, op: &BinOp, r: &Value) -> Value {
         (Value::Str(a), Value::Str(b)) => match op {
             BinOp::Add => Value::Str(format!("{}{}", a, b)),
             BinOp::Eq => Value::Bool(a == b), BinOp::Ne => Value::Bool(a != b),
+            // Ordering is by character, the order `sort` would use. It used to
+            // be a run-time failure, which is a surprising answer to `"a" < "b"`.
+            BinOp::Lt => Value::Bool(a < b), BinOp::Le => Value::Bool(a <= b),
+            BinOp::Gt => Value::Bool(a > b), BinOp::Ge => Value::Bool(a >= b),
             _ => rt_fail!(self, "unsupported string op"),
         },
         (Value::Str(a), Value::Int(b)) => match op {

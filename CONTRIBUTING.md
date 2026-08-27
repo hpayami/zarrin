@@ -72,6 +72,11 @@ against a `TypeEnv` the backend keeps in step with the locals in scope. Do not
 add a rule that infers a type from the shape of an expression — that is what
 the checker is for, and the two drifted apart every time it was tried.
 
+A string is an address in the native backend, so any question about its
+contents goes through `strcmp` — `==`, the ordering operators, and a string
+pattern in a `match`. Comparing two addresses asks whether both sides are the
+same allocation, which two equal strings built separately never are.
+
 A `for` loop's iterator goes through `for_source`, which answers with bounds,
 an array to index if there is one, and whatever the loop itself has to release
 afterwards. Both the statement and the expression form of `for` use it, because
