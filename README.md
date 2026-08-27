@@ -34,12 +34,13 @@ differently there.
 
 Not yet: generics, which are parsed and then ignored.
 
-The native backend never frees. Values that outlive the expression building
-them — structs, enum payloads, arrays, strings — are allocated and left, so a
-long-running loop that builds them grows without bound. Scratch that does *not*
-outlive its expression lives on the frame instead, which is why printing is
-flat; the rest waits on a decision about how the language reclaims memory, and
-the README's "optional explicit memory control" is the goal it points at.
+The native backend never frees. A value that cannot outlive the expression
+building it goes on the frame and is released when the statement ends, so
+anything a program prints — however much string, enum or struct it builds to
+get there — costs nothing. A value bound to a variable escapes that expression,
+so it is allocated and left, and a loop building those grows without bound.
+Closing that gap needs a decision about how the language reclaims memory, which
+is what "optional explicit memory control" above points at.
 
 ## Build
 

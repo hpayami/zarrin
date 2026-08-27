@@ -60,6 +60,10 @@ pub struct Codegen<'ctx> {
     path: String,
     src: String,
     current_span: Span,
+    /// Set while building a value that is consumed on the spot and discarded.
+    /// Allocations made under it go on the frame and are released when the
+    /// statement ends, instead of being heap-allocated and left.
+    transient: bool,
     enum_variants: HashMap<String, Vec<(String, Vec<Type>)>>,
     variants: VariantIndex,
     loop_exit: Vec<BasicBlock<'ctx>>,
@@ -97,6 +101,7 @@ impl<'ctx> Codegen<'ctx> {
             path: String::new(),
             src: String::new(),
             current_span: Span::new(1, 1),
+            transient: false,
             enum_variants: HashMap::new(),
             variants: VariantIndex::build(program),
             loop_exit: Vec::new(),
@@ -154,7 +159,9 @@ impl<'ctx> Codegen<'ctx> {
         let fmt = self.builder.build_global_string_ptr(&text, "abort_fmt").unwrap().as_pointer_value();
 
         let cap = self.i64.const_int(4096, false);
-        let buf = self.heap_bytes(cap, "abort_buf");
+        // This block ends in exit, so the frame is the right place and the
+        // allocation cannot accumulate.
+        let buf = self.builder.build_array_alloca(self.i8, cap, "abort_buf").unwrap();
         let mut call_args: Vec<BasicMetadataValueEnum> = vec![buf.into(), cap.into(), fmt.into()];
         for a in args { call_args.push((*a).into()); }
         let n = self.builder.build_call(snprintf, &call_args, "abort_len").unwrap()
@@ -192,6 +199,56 @@ impl<'ctx> Codegen<'ctx> {
             None => b.position_at_end(entry),
         }
         b.build_alloca(ty, name).unwrap()
+    }
+
+    /// Space for a value that cannot outlive the expression producing it.
+    /// Inside a consumed expression that is the frame; anywhere else it has to
+    /// be the heap, because the value may escape.
+    /// Mark the stack, so frame allocations made while building a consumed
+    /// value are released again. Without this a `print` inside a loop would
+    /// grow the stack instead of the heap, which is no better.
+    fn stack_mark(&self) -> PointerValue<'ctx> {
+        let ptr_ty = self.context.ptr_type(AddressSpace::default());
+        let save = self.module.get_function("llvm.stacksave.p0").unwrap_or_else(|| {
+            self.module.add_function("llvm.stacksave.p0", ptr_ty.fn_type(&[], false), None)
+        });
+        self.builder.build_call(save, &[], "sp").unwrap()
+            .try_as_basic_value().left().unwrap().into_pointer_value()
+    }
+
+    fn stack_release(&self, mark: PointerValue<'ctx>) {
+        let ptr_ty = self.context.ptr_type(AddressSpace::default());
+        let restore = self.module.get_function("llvm.stackrestore.p0").unwrap_or_else(|| {
+            self.module.add_function("llvm.stackrestore.p0", self.context.void_type().fn_type(&[ptr_ty.into()], false), None)
+        });
+        self.builder.build_call(restore, &[mark.into()], "").unwrap();
+    }
+
+    /// Build `f`'s value knowing it is consumed here and kept by nobody.
+    fn consumed<R>(&mut self, f: impl FnOnce(&mut Self) -> R) -> R {
+        let outer = self.transient;
+        let mark = self.stack_mark();
+        self.transient = true;
+        let r = f(self);
+        self.transient = outer;
+        self.stack_release(mark);
+        r
+    }
+
+    fn scratch_bytes(&self, bytes: IntValue<'ctx>, name: &str) -> PointerValue<'ctx> {
+        if self.transient {
+            self.builder.build_array_alloca(self.i8, bytes, name).unwrap()
+        } else {
+            self.heap_bytes(bytes, name)
+        }
+    }
+
+    fn scratch_slots(&self, slots: u64, name: &str) -> PointerValue<'ctx> {
+        if self.transient {
+            self.builder.build_alloca(self.i64.array_type(slots as u32), name).unwrap()
+        } else {
+            self.heap_slots(slots, name)
+        }
     }
 
     fn heap_bytes(&self, bytes: IntValue<'ctx>, name: &str) -> PointerValue<'ctx> {
@@ -386,7 +443,7 @@ impl<'ctx> Codegen<'ctx> {
                     .try_as_basic_value().left().unwrap().into_int_value();
                 let need64 = self.builder.build_int_s_extend(need, self.i64, "need64").unwrap();
                 let cap = self.builder.build_int_add(need64, self.i64.const_int(1, false), "cap").unwrap();
-                let buf = self.heap_bytes(cap, "variant_buf");
+                let buf = self.scratch_bytes(cap, "variant_buf");
                 let mut write: Vec<BasicMetadataValueEnum> = vec![buf.into(), cap.into(), fmt.into()];
                 for p in &parts { write.push((*p).into()); }
                 self.builder.build_call(snprintf, &write, "").unwrap();
@@ -454,7 +511,7 @@ impl<'ctx> Codegen<'ctx> {
                     let tag = variant.tag;
                     if variant.enum_has_payload {
                         let array_ty = self.i64.array_type(1);
-                        let alloca = self.heap_slots(1, &format!("enum_{}", name));
+                        let alloca = self.scratch_slots(1, &format!("enum_{}", name));
                         let base_ptr = self.builder.build_bit_cast(alloca, self.context.ptr_type(AddressSpace::default()), "enum_base").unwrap().into_pointer_value();
                         let tag_ptr = unsafe {
                             self.builder.build_gep(array_ty, alloca, &[self.i64.const_int(0, false), self.i64.const_int(0, false)], "tag_ptr").unwrap()
@@ -560,6 +617,10 @@ impl<'ctx> Codegen<'ctx> {
                     _ => panic!("cannot call non-function"),
                 };
                 if name == "print" {
+                    let arg = args[0].clone();
+                    return self.consumed(|cg| cg.gen_print_arg(&arg));
+                }
+                if name == "print_unreachable" {
                     if self.is_bool_expr(&args[0]) {
                         let v = self.gen_expr(&args[0]);
                         let iv = self.value_to_int(&v);
@@ -685,7 +746,7 @@ impl<'ctx> Codegen<'ctx> {
                     // This asked malloc for `slots` *bytes* and then memcpy'd
                     // `slots * 8` of them, overrunning the allocation eightfold.
                     let byte_count = self.builder.build_int_mul(slots, self.i64.const_int(8, false), "bytes").unwrap();
-                    let buf = self.builder.build_call(malloc_fn, &[byte_count.into()], "new_arr").unwrap().try_as_basic_value().left().unwrap().into_pointer_value();
+                    let buf = self.scratch_bytes(byte_count, "new_arr");
                     self.builder.build_call(memcpy_fn, &[buf.into(), arr_ptr_val.into(), byte_count.into()], "cp").unwrap();
                     let elem_off = self.builder.build_int_add(idx_int, self.i64.const_int(1, false), "elem_off").unwrap();
                     let elem_ptr = unsafe {
@@ -729,7 +790,7 @@ impl<'ctx> Codegen<'ctx> {
                     ], false);
                     let memcpy_fn = self.module.get_function("memcpy").unwrap_or_else(|| self.module.add_function("memcpy", memcpy_type, None));
                     let sub_len = self.builder.build_int_sub(end, start, "sub_len").unwrap();
-                    let buf = self.builder.build_call(malloc_fn, &[self.builder.build_int_add(sub_len, self.i64.const_int(1, false), "sub_alloc").unwrap().into()], "sub_buf").unwrap().try_as_basic_value().left().unwrap().into_pointer_value();
+                    let buf = self.scratch_bytes(self.builder.build_int_add(sub_len, self.i64.const_int(1, false), "sub_alloc").unwrap(), "sub_buf");
                     let src_ptr = unsafe {
                         self.builder.build_gep(self.i8, s_ptr, &[start], "src_ptr").unwrap()
                     };
@@ -777,7 +838,7 @@ impl<'ctx> Codegen<'ctx> {
                         self.i64.into(),
                     ], false);
                     let memcpy_fn = self.module.get_function("memcpy").unwrap_or_else(|| self.module.add_function("memcpy", memcpy_type, None));
-                    let buf = self.builder.build_call(malloc_fn, &[self.builder.build_int_add(len_after, self.i64.const_int(1, false), "trim_alloc").unwrap().into()], "trim_buf").unwrap().try_as_basic_value().left().unwrap().into_pointer_value();
+                    let buf = self.scratch_bytes(self.builder.build_int_add(len_after, self.i64.const_int(1, false), "trim_alloc").unwrap(), "trim_buf");
                     self.builder.build_call(memcpy_fn, &[buf.into(), trimmed_start.into(), len_after.into()], "trim_cp").unwrap();
                     let null_ptr = unsafe {
                         self.builder.build_gep(self.i8, buf, &[len_after], "null_ptr").unwrap()
@@ -797,7 +858,7 @@ impl<'ctx> Codegen<'ctx> {
                     let buf = {
                         let malloc_type = self.context.ptr_type(AddressSpace::default()).fn_type(&[self.i64.into()], false);
                         let malloc_fn = self.module.get_function("malloc").unwrap_or_else(|| self.module.add_function("malloc", malloc_type, None));
-                        self.builder.build_call(malloc_fn, &[self.i64.const_int(2, false).into()], "char_buf").unwrap().try_as_basic_value().left().unwrap().into_pointer_value()
+                        self.scratch_bytes(self.i64.const_int(2, false), "char_buf")
                     };
                     let ch = self.builder.build_load(self.i8, char_ptr, "ch").unwrap().into_int_value();
                     let buf_byte = self.builder.build_bit_cast(buf, self.i8.ptr_type(AddressSpace::default()), "buf_byte").unwrap().into_pointer_value();
@@ -857,7 +918,7 @@ impl<'ctx> Codegen<'ctx> {
                     let total_count = self.builder.build_load(self.i64, count_ptr, "total_count").unwrap().into_int_value();
 
                     let arr_alloc_size = self.builder.build_int_mul(self.builder.build_int_add(total_count, self.i64.const_int(1, false), "arr_size_tmp").unwrap(), self.i64.const_int(8, false), "arr_bytes").unwrap();
-                    let arr_buf = self.builder.build_call(malloc_fn, &[arr_alloc_size.into()], "arr_buf").unwrap().try_as_basic_value().left().unwrap().into_pointer_value();
+                    let arr_buf = self.scratch_bytes(arr_alloc_size, "arr_buf");
                     self.builder.build_store(arr_buf, total_count).unwrap();
 
                     let idx_ptr = self.builder.build_alloca(self.i64, "split_idx").unwrap();
@@ -887,7 +948,7 @@ impl<'ctx> Codegen<'ctx> {
 
                     self.builder.position_at_end(part_start_bb);
                     let part_len = self.builder.build_ptr_diff(self.i8, efound, ecur, "part_len").unwrap();
-                    let part_buf = self.builder.build_call(malloc_fn, &[self.builder.build_int_add(part_len, self.i64.const_int(1, false), "part_alloc").unwrap().into()], "part_buf").unwrap().try_as_basic_value().left().unwrap().into_pointer_value();
+                    let part_buf = self.scratch_bytes(self.builder.build_int_add(part_len, self.i64.const_int(1, false), "part_alloc").unwrap(), "part_buf");
                     self.builder.build_call(memcpy_fn, &[part_buf.into(), ecur.into(), part_len.into()], "part_cp").unwrap();
                     let part_null_ptr = unsafe {
                         self.builder.build_gep(self.i8, part_buf, &[part_len], "part_null").unwrap()
@@ -909,7 +970,7 @@ impl<'ctx> Codegen<'ctx> {
 
                     self.builder.position_at_end(part_null_bb);
                     let ecur_len = self.builder.build_call(strlen_fn, &[ecur.into()], "ecur_len").unwrap().try_as_basic_value().left().unwrap().into_int_value();
-                    let last_buf = self.builder.build_call(malloc_fn, &[self.builder.build_int_add(ecur_len, self.i64.const_int(1, false), "last_alloc").unwrap().into()], "last_buf").unwrap().try_as_basic_value().left().unwrap().into_pointer_value();
+                    let last_buf = self.scratch_bytes(self.builder.build_int_add(ecur_len, self.i64.const_int(1, false), "last_alloc").unwrap(), "last_buf");
                     self.builder.build_call(memcpy_fn, &[last_buf.into(), ecur.into(), ecur_len.into()], "last_cp").unwrap();
                     let last_null_ptr = unsafe {
                         self.builder.build_gep(self.i8, last_buf, &[ecur_len], "last_null").unwrap()
@@ -939,7 +1000,7 @@ impl<'ctx> Codegen<'ctx> {
                     }
                     let num_fields = (payload_types.len() + 1) as u32;
                     let array_ty = self.i64.array_type(num_fields);
-                    let alloca = self.heap_slots(num_fields as u64, &format!("enum_{}", name));
+                    let alloca = self.scratch_slots(num_fields as u64, &format!("enum_{}", name));
                     let base_ptr = self.builder.build_bit_cast(alloca, self.context.ptr_type(AddressSpace::default()), "enum_base").unwrap().into_pointer_value();
                     let tag_ptr = unsafe {
                         self.builder.build_gep(array_ty, alloca, &[self.i64.const_int(0, false), self.i64.const_int(0, false)], "tag_ptr").unwrap()
@@ -995,7 +1056,7 @@ impl<'ctx> Codegen<'ctx> {
                 let field_defs: Vec<String> = field_defs.into_iter().map(|(n, _)| n).collect();
                 let num_fields = field_defs.len() as u64;
                 let array_ty = self.i64.array_type(num_fields as u32);
-                let alloca = self.heap_slots(num_fields, &format!("{}_struct", name));
+                let alloca = self.scratch_slots(num_fields, &format!("{}_struct", name));
                 let base_ptr = self.builder.build_bit_cast(alloca, self.context.ptr_type(AddressSpace::default()), "base_ptr").unwrap().into_pointer_value();
                 for (i, (fname, fexpr)) in fields.iter().enumerate() {
                     let fv = self.gen_expr(fexpr);
@@ -1444,7 +1505,7 @@ Expr::Match { scrutinee, arms } => {
                 let len = elems.len() as u64;
                 // Layout is [len, elem0, ..]. This asked malloc for `len + 1`
                 // *bytes* and then wrote that many 64-bit words into it.
-                let buf = self.heap_slots(len + 1, "arr_alloc");
+                let buf = self.scratch_slots(len + 1, "arr_alloc");
                 let buf_i64 = self.builder.build_ptr_to_int(buf, self.i64, "arr_buf").unwrap();
                 let len_ptr = self.builder.build_int_to_ptr(buf_i64, self.context.ptr_type(AddressSpace::default()), "arr_len_ptr").unwrap();
                 self.builder.build_store(len_ptr, self.i64.const_int(len, false)).unwrap();
@@ -1494,7 +1555,7 @@ Expr::Match { scrutinee, arms } => {
         let len_b = self.builder.build_call(strlen_fn, &[b.into()], "len_b").unwrap().try_as_basic_value().left().unwrap().into_int_value();
         let total = self.builder.build_int_add(len_a, len_b, "total_len").unwrap();
         let total_plus1 = self.builder.build_int_add(total, self.i64.const_int(1, false), "total1").unwrap();
-        let buf = self.builder.build_call(malloc_fn, &[total_plus1.into()], "buf").unwrap().try_as_basic_value().left().unwrap().into_pointer_value();
+        let buf = self.scratch_bytes(total_plus1, "buf");
         self.builder.build_call(memcpy_fn, &[buf.into(), a.into(), len_a.into()], "cp_a").unwrap();
         let offset = unsafe { self.builder.build_gep(self.i8, buf, &[len_a], "offset").unwrap() };
         self.builder.build_call(memcpy_fn, &[offset.into(), b.into(), self.builder.build_int_add(len_b, self.i64.const_int(1, false), "nb1").unwrap().into()], "cp_b").unwrap();
@@ -1504,7 +1565,7 @@ Expr::Match { scrutinee, arms } => {
     fn gen_int_to_str(&self, val: IntValue<'ctx>) -> PointerValue<'ctx> {
         let malloc_type = self.context.ptr_type(AddressSpace::default()).fn_type(&[self.i64.into()], false);
         let malloc_fn = self.module.get_function("malloc").unwrap_or_else(|| self.module.add_function("malloc", malloc_type, None));
-        let buf = self.builder.build_call(malloc_fn, &[self.i64.const_int(32, false).into()], "int_buf").unwrap().try_as_basic_value().left().unwrap().into_pointer_value();
+        let buf = self.scratch_bytes(self.i64.const_int(32, false), "int_buf");
 
         let fn_val = self.builder.get_insert_block().unwrap().get_parent().unwrap();
         let entry_bb = self.builder.get_insert_block().unwrap();
@@ -1796,7 +1857,7 @@ Expr::Match { scrutinee, arms } => {
         let len = self.builder.build_call(strlen, &[scratch.into()], "flen").unwrap()
             .try_as_basic_value().left().unwrap().into_int_value();
         let size = self.builder.build_int_add(len, self.i64.const_int(1, false), "fsize").unwrap();
-        let owned = self.heap_bytes(size, "float_owned");
+        let owned = self.scratch_bytes(size, "float_owned");
         self.builder.build_call(memcpy, &[owned.into(), scratch.into(), size.into()], "").unwrap();
         owned
     }
@@ -1831,6 +1892,28 @@ Expr::Match { scrutinee, arms } => {
             CgValue::Float(val) => self.builder.build_bit_cast(*val, self.i64, "f2i").unwrap().into_int_value(),
             CgValue::Str(p) => self.builder.build_ptr_to_int(*p, self.i64, "p2i").unwrap(),
         }
+    }
+
+    /// Print one value. Booleans and enums need their text built first; the
+    /// caller runs this inside `consumed`, so those buffers live on the frame.
+    fn gen_print_arg(&mut self, arg: &Expr) -> CgValue<'ctx> {
+        if self.is_bool_expr(arg) {
+            let v = self.gen_expr(arg);
+            let iv = self.value_to_int(&v);
+            let text = self.gen_bool_to_str(iv);
+            let fmt = self.string_global("%s\n");
+            self.builder.build_call(self.printf, &[fmt.into(), text.into()], "call_printf").unwrap();
+        } else if let Some(en) = self.infer_enum_type(arg) {
+            let v = self.gen_expr(arg);
+            let iv = self.value_to_int(&v);
+            let text = self.gen_enum_to_str(iv, &en, 0);
+            let fmt = self.string_global("%s\n");
+            self.builder.build_call(self.printf, &[fmt.into(), text.into()], "call_printf").unwrap();
+        } else {
+            let v = self.gen_expr(arg);
+            self.gen_print(&v);
+        }
+        CgValue::Int(self.i64.const_int(0, false))
     }
 
     fn gen_print(&self, val: &CgValue<'ctx>) {

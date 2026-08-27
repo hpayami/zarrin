@@ -836,6 +836,65 @@ fn main() {
     );
 }
 
+#[test]
+fn a_printed_expression_allocates_nothing() {
+    // printf reads the text and returns, so nothing built to feed it can
+    // outlive the call. Those buffers go on the frame and are released when
+    // the statement ends. Printing an interpolated string in a loop used to
+    // leak 80 bytes an iteration, and printing an enum 98.
+    for src in [
+        r#"fn main() { print("a" + "b"); }"#,
+        r#"fn main() { let i = 1; print("n is {i}"); }"#,
+        r#"fn main() { print(substring("hello world", 0, 5)); }"#,
+        r#"enum E { V(int) } fn main() { print(V(1)); }"#,
+    ] {
+        let Some(ir) = emitted_ir(&format!("{}\n", src)) else { return };
+        assert_eq!(
+            ir.matches("call ptr @malloc").count(),
+            0,
+            "still allocates: {}\n{}",
+            src,
+            ir
+        );
+        assert!(ir.contains("llvm.stackrestore"), "frame space is never released: {}", src);
+    }
+}
+
+#[test]
+fn a_value_that_leaves_a_function_is_still_allocated() {
+    // The frame belongs to the call that built it, so a returned string has to
+    // be on the heap however it is used at the call site.
+    let Some(ir) = emitted_ir("fn make(n: int) -> string { return \"v\" + to_string(n); }\nfn main() { print(make(7)); }\n") else { return };
+    assert!(ir.contains("call ptr @malloc"), "a returned string was put on the frame:\n{}", ir);
+}
+
+#[test]
+fn values_built_for_a_print_stay_valid_through_it() {
+    assert_agrees_with_interpreter(
+        r#"
+enum E { V(int) }
+struct S { a: string }
+macro shout(x) { return "[" + x + "]"; }
+fn make(n: int) -> string { return "v" + to_string(n); }
+fn main() {
+    let s = make(7);
+    print(s);
+    print(make(8));
+    print(s);
+    print("outer " + to_string(1) + " " + to_string(2));
+    print(S { a: "x" }.a);
+    print(V(3));
+    let n = 5;
+    print(if n > 3 { "big " + to_string(n) } else { "small" });
+    print(match n { 5 => "five " + to_string(n), _ => "other" });
+    print(shout("hi"));
+    let k = shout("kept");
+    print(k);
+}
+"#,
+    );
+}
+
 // --- every example, both backends -------------------------------------------
 
 /// Walk `examples/` and require the native executable to behave exactly like
