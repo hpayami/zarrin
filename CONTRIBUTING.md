@@ -72,6 +72,11 @@ against a `TypeEnv` the backend keeps in step with the locals in scope. Do not
 add a rule that infers a type from the shape of an expression — that is what
 the checker is for, and the two drifted apart every time it was tried.
 
+Arithmetic that can fail is checked on both sides, and the two carry the same
+message: `gen_checked` in the native backend uses LLVM's overflow intrinsics,
+and the interpreter uses Rust's `checked_*`. Anything added here needs both, or
+the backends part company at exactly the point a program goes wrong.
+
 Every value carries the 16-byte header, wherever it lives. A frame allocation
 gets one too, with the immortal count, so retain and release are no-ops on it.
 The header is not optional: a function compiled once cannot know whether its

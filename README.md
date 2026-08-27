@@ -47,8 +47,10 @@ the bits of a float. Write the argument where a signature needs it —
 accepts any payload but cannot say what it holds. `unwrap` and a `match` arm
 both hand back the payload at that type.
 
-Dividing an integer by zero stops the program with a diagnostic, on both
-backends. Float division follows IEEE: `1.0 / 0.0` is `inf`.
+Integer arithmetic is checked. Overflow stops the program with a diagnostic
+rather than wrapping, the same way an index out of range or a zero divisor
+does. Dividing an integer by zero stops it too. Float arithmetic follows IEEE:
+`1.0 / 0.0` is `inf`, and nothing about it is checked.
 
 Errors — syntax, type, and run time — are reported against the source with a
 line, a column and the offending line quoted. A type error points at the

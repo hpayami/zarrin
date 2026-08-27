@@ -174,6 +174,21 @@ impl<'ctx> Codegen<'ctx> {
     /// The frame — path, line, the quoted source line, the caret — is known at
     /// compile time and baked into the format string.
     /// `\x01` in `message` marks a value filled in at run time.
+    const ABORT_CAP: u64 = 4096;
+
+    /// The single buffer a diagnostic is rendered into on the way out.
+    fn abort_buffer(&self) -> PointerValue<'ctx> {
+        const NAME: &str = "zarrin.abort_buf";
+        if let Some(g) = self.module.get_global(NAME) {
+            return g.as_pointer_value();
+        }
+        let ty = self.i8.array_type(Self::ABORT_CAP as u32);
+        let g = self.module.add_global(ty, None, NAME);
+        g.set_initializer(&ty.const_zero());
+        g.set_linkage(inkwell::module::Linkage::Private);
+        g.as_pointer_value()
+    }
+
     fn gen_abort(&self, message: &str, args: &[IntValue<'ctx>]) {
         let ptr_ty = self.context.ptr_type(AddressSpace::default());
         let i32_ty = self.context.i32_type();
@@ -199,10 +214,11 @@ impl<'ctx> Codegen<'ctx> {
         let text = rendered.replace('%', "%%").replace('\x01', "%ld");
         let fmt = self.builder.build_global_string_ptr(&text, "abort_fmt").unwrap().as_pointer_value();
 
-        let cap = self.i64.const_int(4096, false);
-        // This block ends in exit, so the frame is the right place and the
-        // allocation cannot accumulate.
-        let buf = self.builder.build_array_alloca(self.i8, cap, "abort_buf").unwrap();
+        let cap = self.i64.const_int(Self::ABORT_CAP, false);
+        // One buffer for the whole program: this path ends in `exit`, so it is
+        // never reentered, and an `alloca` here would be one per abort site —
+        // including inside loops, where every arithmetic check now sits.
+        let buf = self.abort_buffer();
         let mut call_args: Vec<BasicMetadataValueEnum> = vec![buf.into(), cap.into(), fmt.into()];
         for a in args { call_args.push((*a).into()); }
         let n = self.builder.build_call(snprintf, &call_args, "abort_len").unwrap()
@@ -211,6 +227,54 @@ impl<'ctx> Codegen<'ctx> {
         self.builder.build_call(write, &[i32_ty.const_int(2, false).into(), buf.into(), n64.into()], "").unwrap();
         self.builder.build_call(self.exit_fn(), &[i32_ty.const_int(1, false).into()], "").unwrap();
         self.builder.build_unreachable().unwrap();
+    }
+
+    /// Arithmetic that reports rather than wraps. LLVM's checked intrinsics
+    /// answer with the result and a flag; the flag decides whether the program
+    /// goes on. The interpreter fails here too, so wrapping silently was the
+    /// one of the two that had to change.
+    fn gen_checked(
+        &self,
+        a: IntValue<'ctx>,
+        b: IntValue<'ctx>,
+        which: &str,
+        message: &str,
+    ) -> IntValue<'ctx> {
+        let name = format!("llvm.{}.with.overflow.i64", which);
+        let f = self.module.get_function(&name).unwrap_or_else(|| {
+            let ret = self.context.struct_type(&[self.i64.into(), self.i1.into()], false);
+            self.module.add_function(&name, ret.fn_type(&[self.i64.into(), self.i64.into()], false), None)
+        });
+        let pair = self.builder.build_call(f, &[a.into(), b.into()], which).unwrap()
+            .try_as_basic_value().left().unwrap().into_struct_value();
+        let value = self.builder.build_extract_value(pair, 0, "value").unwrap().into_int_value();
+        let overflowed = self.builder.build_extract_value(pair, 1, "overflowed").unwrap().into_int_value();
+
+        let parent = self.builder.get_insert_block().unwrap().get_parent().unwrap();
+        let fail = self.context.append_basic_block(parent, "overflow");
+        let ok = self.context.append_basic_block(parent, "no_overflow");
+        self.builder.build_conditional_branch(overflowed, fail, ok).unwrap();
+        self.builder.position_at_end(fail);
+        self.gen_abort(message, &[]);
+        self.builder.position_at_end(ok);
+        value
+    }
+
+    /// The one division that overflows: the smallest integer has no positive
+    /// counterpart, and `sdiv` on that pair is undefined.
+    fn gen_div_overflow_check(&self, a: IntValue<'ctx>, b: IntValue<'ctx>, message: &str) {
+        let parent = self.builder.get_insert_block().unwrap().get_parent().unwrap();
+        let fail = self.context.append_basic_block(parent, "div_overflow");
+        let ok = self.context.append_basic_block(parent, "div_no_overflow");
+        let min = self.i64.const_int(i64::MIN as u64, false);
+        let is_min = self.builder.build_int_compare(inkwell::IntPredicate::EQ, a, min, "is_min").unwrap();
+        let neg_one = self.builder.build_int_neg(self.i64.const_int(1, false), "neg_one").unwrap();
+        let is_neg_one = self.builder.build_int_compare(inkwell::IntPredicate::EQ, b, neg_one, "is_neg_one").unwrap();
+        let bad = self.builder.build_and(is_min, is_neg_one, "div_overflows").unwrap();
+        self.builder.build_conditional_branch(bad, fail, ok).unwrap();
+        self.builder.position_at_end(fail);
+        self.gen_abort(message, &[]);
+        self.builder.position_at_end(ok);
     }
 
     /// Stop with the interpreter's message when a divisor is zero.
@@ -1306,17 +1370,19 @@ impl<'ctx> Codegen<'ctx> {
                         let lv = match lv { CgValue::Int(v) => v, _ => panic!("expected int operand") };
                         let rv = match rv { CgValue::Int(v) => v, _ => panic!("expected int operand") };
                         match op {
-                            BinOp::Add => CgValue::Int(self.builder.build_int_add(lv, rv, "add").unwrap()),
-                            BinOp::Sub => CgValue::Int(self.builder.build_int_sub(lv, rv, "sub").unwrap()),
-                            BinOp::Mul => CgValue::Int(self.builder.build_int_mul(lv, rv, "mul").unwrap()),
+                            BinOp::Add => CgValue::Int(self.gen_checked(lv, rv, "sadd", "addition overflowed")),
+                            BinOp::Sub => CgValue::Int(self.gen_checked(lv, rv, "ssub", "subtraction overflowed")),
+                            BinOp::Mul => CgValue::Int(self.gen_checked(lv, rv, "smul", "multiplication overflowed")),
                             // Dividing by zero is undefined in LLVM, and what
                             // came of it was a number with no meaning.
                             BinOp::Div => {
                                 self.gen_nonzero_check(rv, "division by zero");
+                                self.gen_div_overflow_check(lv, rv, "division overflowed");
                                 CgValue::Int(self.builder.build_int_signed_div(lv, rv, "div").unwrap())
                             }
                             BinOp::Mod => {
                                 self.gen_nonzero_check(rv, "remainder by zero");
+                                self.gen_div_overflow_check(lv, rv, "remainder overflowed");
                                 CgValue::Int(self.builder.build_int_signed_rem(lv, rv, "rem").unwrap())
                             }
                             BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge => {
@@ -1342,7 +1408,9 @@ impl<'ctx> Codegen<'ctx> {
                 let v = self.gen_expr(e);
                 match op {
                     UnaryOp::Neg => match v {
-                        CgValue::Int(i) => CgValue::Int(self.builder.build_int_neg(i, "neg").unwrap()),
+                        CgValue::Int(i) => CgValue::Int(
+                            self.gen_checked(self.i64.const_zero(), i, "ssub", "negation overflowed"),
+                        ),
                         CgValue::Float(f) => CgValue::Float(self.builder.build_float_neg(f, "fneg").unwrap()),
                         _ => panic!("cannot negate non-numeric value"),
                     },

@@ -698,3 +698,52 @@ fn division_that_can_be_done_still_is() {
         &["3", "-3", "1", "inf"],
     );
 }
+
+// ---------------------------------------------------------------------------
+// Integer overflow
+//
+// Another of Rust's own panics coming out of the interpreter: exit 101 and no
+// position. Overflow is a failure this language reports, the way it reports an
+// index out of range or a zero divisor — not a wrap.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn overflowing_addition_points_at_the_statement() {
+    let r = run("fn main() {\n    print(9223372036854775807 + 1);\n}\n");
+    assert!(!r.success, "expected the program to fail; it printed:\n{}", r.stdout);
+    assert!(r.stderr.contains("addition overflowed"), "stderr was:\n{}", r.stderr);
+    assert!(r.stderr.contains("--> "), "no position in the diagnostic:\n{}", r.stderr);
+}
+
+#[test]
+fn overflowing_subtraction_and_multiplication_are_caught() {
+    assert_run_fails(
+        "fn main() { print(0 - 9223372036854775807 - 2); }\n",
+        "subtraction overflowed",
+    );
+    assert_run_fails(
+        "fn main() { print(4611686018427387904 * 4); }\n",
+        "multiplication overflowed",
+    );
+}
+
+#[test]
+fn the_one_division_that_overflows_is_caught() {
+    // The smallest integer has no positive counterpart.
+    assert_run_fails(
+        "fn main() {\n    let m = 0 - 9223372036854775807 - 1;\n    let d = 0 - 1;\n    print(m / d);\n}\n",
+        "division overflowed",
+    );
+}
+
+#[test]
+fn arithmetic_that_fits_is_untouched() {
+    assert_output(
+        "fn main() {\n\
+         \x20   print(2 + 3 * 4 - 1);\n\
+         \x20   print(9223372036854775807);\n\
+         \x20   print(0 - 9223372036854775807);\n\
+         \x20   print(9223372036854775806 + 1);\n}\n",
+        &["13", "9223372036854775807", "-9223372036854775807", "9223372036854775807"],
+    );
+}

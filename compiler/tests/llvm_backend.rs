@@ -1789,3 +1789,53 @@ fn main() {
 "#,
     );
 }
+
+// ---------------------------------------------------------------------------
+// Integer overflow
+//
+// The native backend wrapped silently where the interpreter stopped, so the
+// same program answered `-9223372036854775808` on one side and failed on the
+// other.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn overflow_stops_the_program() {
+    assert_fails_like_the_interpreter(
+        r#"
+fn main() {
+    print("before");
+    print(9223372036854775807 + 1);
+}
+"#,
+    );
+    assert_fails_like_the_interpreter(
+        r#"
+fn main() {
+    print("before");
+    print(4611686018427387904 * 4);
+}
+"#,
+    );
+}
+
+#[test]
+fn arithmetic_that_fits_agrees() {
+    assert_agrees_with_interpreter(
+        r#"
+fn fib(n: int) -> int {
+    if n < 2 { return n; }
+    return fib(n - 1) + fib(n - 2);
+}
+fn main() {
+    print(2 + 3 * 4 - 1);
+    print(9223372036854775807);
+    print(0 - 9223372036854775807);
+    print(9223372036854775806 + 1);
+    print(fib(20));
+    let total = 0;
+    for i in 0..1000 { total = total + i * 2; }
+    print(total);
+}
+"#,
+    );
+}

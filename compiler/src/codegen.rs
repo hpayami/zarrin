@@ -299,7 +299,10 @@ impl Interpreter {
             ExprKind::Unary(op, e) => {
                 let v = self.eval_expr(e);
                 match (op, &v) {
-                    (UnaryOp::Neg, Value::Int(n)) => Value::Int(-n),
+                    (UnaryOp::Neg, Value::Int(n)) => match n.checked_neg() {
+                        Some(v) => Value::Int(v),
+                        None => rt_fail!(self, "negation overflowed"),
+                    },
                     (UnaryOp::Neg, Value::Float(f)) => Value::Float(-f),
                     (UnaryOp::Not, Value::Bool(b)) => Value::Bool(!b),
                     (UnaryOp::Not, Value::Int(n)) => Value::Int(if *n == 0 { 1 } else { 0 }),
@@ -624,18 +627,40 @@ impl Interpreter {
 fn eval_binop(&self, l: &Value, op: &BinOp, r: &Value) -> Value {
     match (l, r) {
         (Value::Int(a), Value::Int(b)) => match op {
-            BinOp::Add => Value::Int(a + b), BinOp::Sub => Value::Int(a - b),
-            BinOp::Mul => Value::Int(a * b),
+            // Rust's own panic escaped through here too, for the same reason
+            // dividing by zero did. Overflow is a failure the language reports,
+            // not a wrap: everything else here — an index, a substring, a
+            // divisor — is checked and points at the statement.
+            BinOp::Add => match a.checked_add(*b) {
+                Some(v) => Value::Int(v),
+                None => rt_fail!(self, "addition overflowed"),
+            },
+            BinOp::Sub => match a.checked_sub(*b) {
+                Some(v) => Value::Int(v),
+                None => rt_fail!(self, "subtraction overflowed"),
+            },
+            BinOp::Mul => match a.checked_mul(*b) {
+                Some(v) => Value::Int(v),
+                None => rt_fail!(self, "multiplication overflowed"),
+            },
             // Rust's own panic escaped through here: exit 101 and no line to
             // look at, where every other failure in this language points at the
             // statement that caused it.
             BinOp::Div => {
                 if *b == 0 { rt_fail!(self, "division by zero"); }
-                Value::Int(a / b)
+                match a.checked_div(*b) {
+                    Some(v) => Value::Int(v),
+                    // the one division that overflows: the smallest integer
+                    // has no positive counterpart
+                    None => rt_fail!(self, "division overflowed"),
+                }
             }
             BinOp::Mod => {
                 if *b == 0 { rt_fail!(self, "remainder by zero"); }
-                Value::Int(a % b)
+                match a.checked_rem(*b) {
+                    Some(v) => Value::Int(v),
+                    None => rt_fail!(self, "remainder overflowed"),
+                }
             }
             BinOp::Eq => Value::Bool(a == b), BinOp::Ne => Value::Bool(a != b),
             BinOp::Lt => Value::Bool(a < b), BinOp::Le => Value::Bool(a <= b),
