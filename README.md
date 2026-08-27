@@ -65,8 +65,7 @@ program to print exactly what the interpreter prints. Those tests are skipped
 unless the feature is on, and on macOS they re-run each executable under Guard
 Malloc, which faults on a heap overrun instead of letting it pass unnoticed.
 
-One known difference from the interpreter: `print` on an enum shows its
-address rather than the variant name.
+All six programs in `examples/` produce identical output under both backends.
 
 ## Tests
 

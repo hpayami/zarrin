@@ -7,7 +7,7 @@
 #![cfg(feature = "llvm")]
 
 use crate::ast::*;
-use crate::variants::{Lookup, Variant, VariantIndex};
+use crate::variants::{builtin_enums, Lookup, Variant, VariantIndex};
 use inkwell::builder::Builder;
 use inkwell::context::Context;
 use inkwell::module::Module;
@@ -46,6 +46,9 @@ pub struct Codegen<'ctx> {
     named: HashMap<String, (PointerValue<'ctx>, String)>,
     struct_fields: HashMap<String, Vec<String>>,
     var_struct_type: HashMap<String, String>,
+    /// Variables known to hold a value of a given enum, so `print` can show
+    /// the variant name instead of the address it is represented by.
+    var_enum_type: HashMap<String, String>,
     enum_variants: HashMap<String, Vec<(String, Vec<Type>)>>,
     variants: VariantIndex,
     loop_exit: Vec<BasicBlock<'ctx>>,
@@ -79,6 +82,7 @@ impl<'ctx> Codegen<'ctx> {
             named: HashMap::new(),
             struct_fields: HashMap::new(),
             var_struct_type: HashMap::new(),
+            var_enum_type: HashMap::new(),
             enum_variants: HashMap::new(),
             variants: VariantIndex::build(program),
             loop_exit: Vec::new(),
@@ -98,6 +102,16 @@ impl<'ctx> Codegen<'ctx> {
         })
     }
 
+    fn heap_bytes(&self, bytes: IntValue<'ctx>, name: &str) -> PointerValue<'ctx> {
+        self.builder
+            .build_call(self.malloc_fn(), &[bytes.into()], name)
+            .unwrap()
+            .try_as_basic_value()
+            .left()
+            .unwrap()
+            .into_pointer_value()
+    }
+
     /// Allocate `slots` 64-bit words on the heap.
     ///
     /// Structs and enum payloads are passed around as raw addresses, so they
@@ -113,6 +127,127 @@ impl<'ctx> Codegen<'ctx> {
             .left()
             .unwrap()
             .into_pointer_value()
+    }
+
+    /// Variants of `enum_name`, including the predeclared `Option`/`Result`,
+    /// which are not part of the program's own declarations.
+    fn variants_of(&self, enum_name: &str) -> Vec<(String, Vec<Type>)> {
+        if let Some(v) = self.enum_variants.get(enum_name) {
+            return v.clone();
+        }
+        builtin_enums()
+            .into_iter()
+            .find(|(n, _)| n == enum_name)
+            .map(|(_, v)| v)
+            .unwrap_or_default()
+    }
+
+    fn is_enum(&self, name: &str) -> bool {
+        self.enum_variants.contains_key(name) || builtin_enums().iter().any(|(n, _)| n == name)
+    }
+
+    /// Which enum, if any, this expression produces. The backend erases types
+    /// into i64, so `print` has to recover this statically to render a variant.
+    fn infer_enum_type(&self, e: &Expr) -> Option<String> {
+        let named_enum = |t: &Type| match t {
+            Type::Named(n) if self.is_enum(n) => Some(n.clone()),
+            _ => None,
+        };
+        match e {
+            Expr::Ident(n) => self
+                .resolve_variant(n)
+                .map(|v| v.enum_name)
+                .or_else(|| self.var_enum_type.get(n).cloned()),
+            Expr::Call(callee, _) => {
+                let Expr::Ident(n) = callee.as_ref() else { return None };
+                self.resolve_variant(n)
+                    .map(|v| v.enum_name)
+                    .or_else(|| self.fn_ret_types.get(n).and_then(named_enum))
+            }
+            Expr::MethodCall(_, m, _) => self.fn_ret_types.get(m).and_then(named_enum),
+            _ => None,
+        }
+    }
+
+    /// Render an enum value the way the interpreter does: the variant name, and
+    /// for a variant with a payload, its fields in parentheses.
+    fn gen_enum_to_str(&self, val: IntValue<'ctx>, enum_name: &str, depth: u32) -> PointerValue<'ctx> {
+        let ptr_ty = self.context.ptr_type(AddressSpace::default());
+        let i32_ty = self.context.i32_type();
+        let snprintf = self.module.get_function("snprintf").unwrap_or_else(|| {
+            let ty = i32_ty.fn_type(&[ptr_ty.into(), self.i64.into(), ptr_ty.into()], true);
+            self.module.add_function("snprintf", ty, None)
+        });
+        let variants = self.variants_of(enum_name);
+        let has_payload = variants.iter().any(|(_, p)| !p.is_empty());
+        let f = self.builder.get_insert_block().unwrap().get_parent().unwrap();
+        let done = self.context.append_basic_block(f, "enum_str_done");
+        let slot = self.builder.build_alloca(ptr_ty, "enum_str").unwrap();
+
+        // A payload-free enum is just its tag; otherwise the tag is the first word.
+        let (tag, base) = if has_payload {
+            let p = self.builder.build_int_to_ptr(val, ptr_ty, "enum_p").unwrap();
+            let t = self.builder.build_load(self.i64, p, "enum_tag").unwrap().into_int_value();
+            (t, Some(p))
+        } else {
+            (val, None)
+        };
+
+        for (i, (vname, ptypes)) in variants.iter().enumerate() {
+            let case = self.context.append_basic_block(f, &format!("enum_is_{}", vname));
+            let next = self.context.append_basic_block(f, &format!("enum_not_{}", vname));
+            let cmp = self.builder.build_int_compare(inkwell::IntPredicate::EQ, tag, self.i64.const_int(i as u64, false), "is_variant").unwrap();
+            self.builder.build_conditional_branch(cmp, case, next).unwrap();
+
+            self.builder.position_at_end(case);
+            if ptypes.is_empty() || base.is_none() {
+                let text = self.builder.build_global_string_ptr(vname, "variant_name").unwrap().as_pointer_value();
+                self.builder.build_store(slot, text).unwrap();
+            } else {
+                let mut parts: Vec<PointerValue<'ctx>> = Vec::new();
+                for (j, ty) in ptypes.iter().enumerate() {
+                    let fp = unsafe {
+                        self.builder.build_gep(self.i64, base.unwrap(), &[self.i64.const_int((j + 1) as u64, false)], "payload").unwrap()
+                    };
+                    let raw = self.builder.build_load(self.i64, fp, "payload_v").unwrap().into_int_value();
+                    parts.push(match ty {
+                        Type::Float => {
+                            let fv = self.builder.build_bit_cast(raw, self.f64, "i2f").unwrap().into_float_value();
+                            self.gen_float_to_str(fv)
+                        }
+                        Type::String => self.builder.build_int_to_ptr(raw, ptr_ty, "payload_s").unwrap(),
+                        Type::Named(n) if self.is_enum(n) && depth < 3 => {
+                            self.gen_enum_to_str(raw, n, depth + 1)
+                        }
+                        _ => self.gen_int_to_str(raw),
+                    });
+                }
+                let holes = vec!["%s"; parts.len()].join(", ");
+                let fmt = self.builder.build_global_string_ptr(&format!("{}({})", vname, holes), "variant_fmt").unwrap().as_pointer_value();
+                let mut probe: Vec<BasicMetadataValueEnum> =
+                    vec![ptr_ty.const_null().into(), self.i64.const_zero().into(), fmt.into()];
+                for p in &parts { probe.push((*p).into()); }
+                let need = self.builder.build_call(snprintf, &probe, "need").unwrap()
+                    .try_as_basic_value().left().unwrap().into_int_value();
+                let need64 = self.builder.build_int_s_extend(need, self.i64, "need64").unwrap();
+                let cap = self.builder.build_int_add(need64, self.i64.const_int(1, false), "cap").unwrap();
+                let buf = self.heap_bytes(cap, "variant_buf");
+                let mut write: Vec<BasicMetadataValueEnum> = vec![buf.into(), cap.into(), fmt.into()];
+                for p in &parts { write.push((*p).into()); }
+                self.builder.build_call(snprintf, &write, "").unwrap();
+                self.builder.build_store(slot, buf).unwrap();
+            }
+            self.builder.build_unconditional_branch(done).unwrap();
+            self.builder.position_at_end(next);
+        }
+
+        // Tag outside the declared range: fall back to the number.
+        let fallback = self.gen_int_to_str(tag);
+        self.builder.build_store(slot, fallback).unwrap();
+        self.builder.build_unconditional_branch(done).unwrap();
+
+        self.builder.position_at_end(done);
+        self.builder.build_load(ptr_ty, slot, "enum_text").unwrap().into_pointer_value()
     }
 
     /// Resolve a variant name to its enum. An ambiguous name is a hard error
@@ -281,6 +416,14 @@ impl<'ctx> Codegen<'ctx> {
                     _ => panic!("cannot call non-function"),
                 };
                 if name == "print" {
+                    if let Some(en) = self.infer_enum_type(&args[0]) {
+                        let v = self.gen_expr(&args[0]);
+                        let iv = self.value_to_int(&v);
+                        let text = self.gen_enum_to_str(iv, &en, 0);
+                        let fmt = self.string_global("%s\n");
+                        self.builder.build_call(self.printf, &[fmt.into(), text.into()], "call_printf").unwrap();
+                        return CgValue::Int(self.i64.const_int(0, false));
+                    }
                     let v = self.gen_expr(&args[0]);
                     self.gen_print(&v);
                     return CgValue::Int(self.i64.const_int(0, false));
@@ -309,6 +452,11 @@ impl<'ctx> Codegen<'ctx> {
                     return CgValue::Str(str_ptr);
                 }
                 if name == "to_string" {
+                    if let Some(en) = self.infer_enum_type(&args[0]) {
+                        let v = self.gen_expr(&args[0]);
+                        let iv = self.value_to_int(&v);
+                        return CgValue::Str(self.gen_enum_to_str(iv, &en, 0));
+                    }
                     let val = self.gen_expr(&args[0]);
                     match &val {
                         CgValue::Int(i) => {
@@ -1461,6 +1609,9 @@ Expr::Match { scrutinee, arms } => {
                 if let Expr::StructLit { name: struct_name, .. } = &value {
                     self.var_struct_type.insert(name.clone(), struct_name.clone());
                 }
+                if let Some(en) = self.infer_enum_type(value) {
+                    self.var_enum_type.insert(name.clone(), en);
+                }
                 let v = self.gen_expr(value);
                 let (ptr, ty_name) = match &v {
                     CgValue::Str(p) => {
@@ -1964,13 +2115,19 @@ pub fn compile_to_executable(program: &Program, out_path: &str) {
                 let entry = context.append_basic_block(func, "entry");
                 cg.builder.position_at_end(entry);
                 cg.named.clear();
+                cg.var_enum_type.clear();
 
                 let mut terminated = false;
-                for (i, (pname, _)) in params.iter().enumerate() {
+                for (i, (pname, pty)) in params.iter().enumerate() {
                     let ptr = cg.builder.build_alloca(cg.i64, pname).unwrap();
                     let arg = func.get_nth_param(i as u32).unwrap().into_int_value();
                     cg.builder.build_store(ptr, arg).unwrap();
                     cg.named.insert(pname.clone(), (ptr, "int".to_string()));
+                    if let Type::Named(t) = pty {
+                        if cg.is_enum(t) {
+                            cg.var_enum_type.insert(pname.clone(), t.clone());
+                        }
+                    }
                 }
                 for s in body {
                     cg.gen_stmt(s, func, &mut terminated);
@@ -1990,12 +2147,18 @@ pub fn compile_to_executable(program: &Program, out_path: &str) {
                         let entry = context.append_basic_block(func, "entry");
                         cg.builder.position_at_end(entry);
                         cg.named.clear();
+                cg.var_enum_type.clear();
                         let mut terminated = false;
-                        for (i, (pname, _)) in params.iter().enumerate() {
+                        for (i, (pname, pty)) in params.iter().enumerate() {
                             let ptr = cg.builder.build_alloca(cg.i64, pname).unwrap();
                             let arg = func.get_nth_param(i as u32).unwrap().into_int_value();
                             cg.builder.build_store(ptr, arg).unwrap();
                             cg.named.insert(pname.clone(), (ptr, "int".to_string()));
+                            if let Type::Named(t) = pty {
+                                if cg.is_enum(t) {
+                                    cg.var_enum_type.insert(pname.clone(), t.clone());
+                                }
+                            }
                         }
                         for s in body {
                             cg.gen_stmt(s, func, &mut terminated);
@@ -2022,6 +2185,7 @@ pub fn compile_to_executable(program: &Program, out_path: &str) {
     let entry = context.append_basic_block(main_fn, "entry");
     cg.builder.position_at_end(entry);
     cg.named.clear();
+                cg.var_enum_type.clear();
 
     if has_user_main {
         let user_main = cg.module.get_function("_zarrin_main").unwrap();

@@ -292,3 +292,85 @@ fn nan_and_infinity() {
 fn to_string_and_print_agree_on_floats() {
     assert_agrees_with_interpreter(r#"fn main() { print(78.5); print(to_string(78.5)); }"#);
 }
+
+// --- printing enums ---------------------------------------------------------
+//
+// The backend erases every value to i64, so `print` on an enum used to show the
+// address it was represented by (Blue came out as 4303841008). The variant is
+// now recovered statically from the expression and rendered like the
+// interpreter does.
+
+#[test]
+fn payload_free_variants_print_their_name() {
+    assert_agrees_with_interpreter(
+        r#"
+enum Color { Red, Green, Blue }
+fn main() { print(Red); print(Green); print(Blue); let c = Green; print(c); }
+"#,
+    );
+}
+
+#[test]
+fn variants_with_payloads_print_their_fields() {
+    assert_agrees_with_interpreter(
+        r#"
+enum Color { Red, Rgb(int, int, int) }
+fn main() { print(Rgb(255, 128, 0)); print(Red); let d = Rgb(7, 8, 9); print(d); }
+"#,
+    );
+}
+
+#[test]
+fn payloads_of_every_type_print_correctly() {
+    assert_agrees_with_interpreter(
+        r#"
+enum S { Circle(float), Named(string), Pair(int, float) }
+fn main() { print(Circle(2.5)); print(Named("hi")); print(Pair(3, 0.5)); }
+"#,
+    );
+}
+
+#[test]
+fn enums_from_calls_and_parameters_print() {
+    // The type comes from the function's declared return type, and from the
+    // parameter's declared type, not from a literal at the print site.
+    assert_agrees_with_interpreter(
+        r#"
+enum Color { Red, Rgb(int, int, int) }
+fn pick(n: int) -> Color { if n == 0 { return Red; } return Rgb(1, 2, 3); }
+fn show(c: Color) { print(c); }
+fn main() { print(pick(0)); print(pick(1)); show(Red); show(Rgb(4, 5, 6)); }
+"#,
+    );
+}
+
+#[test]
+fn builtin_option_prints_like_a_declared_enum() {
+    // Option and Result are predeclared and are not in the program's own enum
+    // table, so rendering has to consult both.
+    assert_agrees_with_interpreter(r#"fn main() { let o = Some(5); print(o); print(None); }"#);
+}
+
+#[test]
+fn enums_render_through_to_string_and_interpolation() {
+    assert_agrees_with_interpreter(
+        r#"
+enum Color { Red, Rgb(int, int, int) }
+fn main() { let d = Rgb(7, 8, 9); print(to_string(Red)); print("value: {d}"); }
+"#,
+    );
+}
+
+#[test]
+fn matching_a_payload_free_enum_still_works() {
+    // Rendering needed the built-in enums merged into the variant view. Doing
+    // that in the table the match lowering reads would have flipped its
+    // has-payload flag for every program and broken this.
+    assert_agrees_with_interpreter(
+        r#"
+enum P { A, B, C }
+fn f(p: P) -> int { return match p { A => 1, B => 2, C => 3 }; }
+fn main() { print(f(A)); print(f(B)); print(f(C)); print(A); }
+"#,
+    );
+}
