@@ -72,6 +72,14 @@ against a `TypeEnv` the backend keeps in step with the locals in scope. Do not
 add a rule that infers a type from the shape of an expression — that is what
 the checker is for, and the two drifted apart every time it was tried.
 
+`Type::Named` carries type arguments: `Option<float>` is
+`Named("Option", [Float])`. Two named types with the same name are compatible
+when one of them has no arguments, which is what lets a signature written
+`Option` take any `Option`. The built-in enums are the only ones with type
+parameters — `variants.rs` declares them, and their payloads are those
+parameters rather than concrete types, so anything reading a payload type has
+to substitute first.
+
 Anything printable renders through `gen_to_str`, which takes a raw word and
 the type that says how to read it. Adding a new printable type means a case
 there, not a new branch in `print` — `print`, `to_string` and interpolation all

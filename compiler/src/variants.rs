@@ -37,14 +37,19 @@ pub enum Lookup {
 
 pub struct VariantIndex {
     by_name: HashMap<String, Vec<Variant>>,
+    /// Type parameters an enum declares. Only the built-ins have any: `Option`
+    /// stands for `Option<T>`, and its payload is that `T` rather than a
+    /// concrete type.
+    params: HashMap<String, Vec<String>>,
 }
 
 impl VariantIndex {
     pub fn build(program: &Program) -> Self {
-        let mut idx = VariantIndex { by_name: HashMap::new() };
+        let mut idx = VariantIndex { by_name: HashMap::new(), params: HashMap::new() };
         // Built-ins go in first, so a user enum reusing these names shows up as
         // an ambiguity instead of quietly shadowing them.
-        for (name, variants) in builtin_enums() {
+        for (name, params, variants) in builtin_enums() {
+            idx.params.insert(name.clone(), params);
             idx.add_enum(&name, &variants);
         }
         for s in &program.stmts {
@@ -82,6 +87,11 @@ impl VariantIndex {
         found
     }
 
+    /// The type parameters an enum declares, in order.
+    pub fn params_of(&self, enum_name: &str) -> Vec<String> {
+        self.params.get(enum_name).cloned().unwrap_or_default()
+    }
+
     pub fn is_enum(&self, name: &str) -> bool {
         self.by_name.values().flatten().any(|v| v.enum_name == name)
     }
@@ -104,15 +114,17 @@ impl VariantIndex {
 
 /// `Option` and `Result` are predeclared. Single source of truth: the
 /// interpreter and the type checker previously disagreed on their payloads.
-pub fn builtin_enums() -> Vec<(String, Vec<(String, Vec<Type>)>)> {
+pub fn builtin_enums() -> Vec<(String, Vec<String>, Vec<(String, Vec<Type>)>)> {
+    let t = || Type::Named("T".to_string(), Vec::new());
+    let e = || Type::Named("E".to_string(), Vec::new());
     vec![
-        ("Option".to_string(), vec![
-            ("Some".to_string(), vec![Type::Inferred]),
+        ("Option".to_string(), vec!["T".to_string()], vec![
+            ("Some".to_string(), vec![t()]),
             ("None".to_string(), vec![]),
         ]),
-        ("Result".to_string(), vec![
-            ("Ok".to_string(), vec![Type::Inferred]),
-            ("Err".to_string(), vec![Type::Inferred]),
+        ("Result".to_string(), vec!["T".to_string(), "E".to_string()], vec![
+            ("Ok".to_string(), vec![t()]),
+            ("Err".to_string(), vec![e()]),
         ]),
     ]
 }

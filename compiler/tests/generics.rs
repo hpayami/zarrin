@@ -31,7 +31,7 @@ fn type_parameters_are_inferred_per_call() {
 fn one_type_parameter_cannot_stand_for_two_types() {
     let src = "fn same<T>(a: T, b: T) -> T {\n    return a;\n}\n\
                fn main() { print(same(1, \"x\")); }\n";
-    assert_check_error(src, "expected `Int`, found `String`");
+    assert_check_error(src, "expected `int`, found `string`");
 }
 
 #[test]

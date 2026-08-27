@@ -149,14 +149,29 @@ impl TypeEnv {
 /// the alternative is rejecting `let x = Some(5);` because the built-in
 /// payload is declared `Inferred` and the argument is `Int`.
 fn compatible(a: &Type, b: &Type) -> bool {
-    a == b || *a == Type::Inferred || *b == Type::Inferred
+    if *a == Type::Inferred || *b == Type::Inferred {
+        return true;
+    }
+    // `Option` and `Option<float>` are the same type; one of them just does not
+    // say what it holds. A declared parameter written `Option` therefore takes
+    // any `Option`, which is what keeps existing signatures working.
+    if let (Type::Named(an, aa), Type::Named(bn, ba)) = (a, b) {
+        if an != bn {
+            return false;
+        }
+        if aa.is_empty() || ba.is_empty() {
+            return true;
+        }
+        return aa.len() == ba.len() && aa.iter().zip(ba).all(|(x, y)| compatible(x, y));
+    }
+    a == b
 }
 
 /// Work out what a function's type parameters stand for at one call, by
 /// lining its declared parameter types up against the arguments given.
 fn unify(declared: &Type, actual: &Type, params: &[String], subst: &mut HashMap<String, Type>) -> bool {
     match declared {
-        Type::Named(n) if params.contains(n) => match subst.get(n) {
+        Type::Named(n, args) if args.is_empty() && params.contains(n) => match subst.get(n) {
             // Every mention of a parameter has to agree.
             Some(bound) => compatible(bound, actual),
             None => {
@@ -168,6 +183,13 @@ fn unify(declared: &Type, actual: &Type, params: &[String], subst: &mut HashMap<
             Type::Array(a) => unify(d, a, params, subst),
             _ => compatible(declared, actual),
         },
+        Type::Named(dn, dargs) => match actual {
+            Type::Named(an, aargs) if dn == an && dargs.len() == aargs.len() => dargs
+                .iter()
+                .zip(aargs)
+                .all(|(d, a)| unify(d, a, params, subst)),
+            _ => compatible(declared, actual),
+        },
         _ => compatible(declared, actual),
     }
 }
@@ -175,7 +197,11 @@ fn unify(declared: &Type, actual: &Type, params: &[String], subst: &mut HashMap<
 /// Replace type parameters with what they were found to stand for.
 pub fn substitute(ty: &Type, subst: &HashMap<String, Type>) -> Type {
     match ty {
-        Type::Named(n) => subst.get(n).cloned().unwrap_or_else(|| ty.clone()),
+        Type::Named(n, args) if args.is_empty() => subst.get(n).cloned().unwrap_or_else(|| ty.clone()),
+        Type::Named(n, args) => Type::Named(
+            n.clone(),
+            args.iter().map(|a| substitute(a, subst)).collect(),
+        ),
         Type::Array(el) => Type::Array(Box::new(substitute(el, subst))),
         Type::Fn(args, ret) => Type::Fn(
             args.iter().map(|a| substitute(a, subst)).collect(),
@@ -288,7 +314,7 @@ impl TypeChecker {
             StmtKind::Let { name, ty, value } => {
                 let val_ty = Self::check_expr(value, env)?;
                 if *ty != Type::Inferred && !compatible(ty, &val_ty) {
-                    return Err(TypeError::TypeMismatch { expected: format!("{:?}", ty), found: format!("{:?}", val_ty) });
+                    return Err(TypeError::TypeMismatch { expected: format!("{}", ty), found: format!("{}", val_ty) });
                 }
                 env.define(name, val_ty);
             }
@@ -323,7 +349,7 @@ impl TypeChecker {
                 let val_ty = Self::check_expr(value, env)?;
                 if let Some(var_ty) = env.lookup(name) {
                     if !compatible(&var_ty, &val_ty) {
-                        return Err(TypeError::TypeMismatch { expected: format!("{:?}", var_ty), found: format!("{:?}", val_ty) });
+                        return Err(TypeError::TypeMismatch { expected: format!("{}", var_ty), found: format!("{}", val_ty) });
                     }
                 }
             }
@@ -345,12 +371,12 @@ impl TypeChecker {
                     Some(expr) => {
                         let expr_ty = Self::check_expr(expr, env)?;
                         if !compatible(&ret_ty, &expr_ty) {
-                            return Err(TypeError::TypeMismatch { expected: format!("{:?}", ret_ty), found: format!("{:?}", expr_ty) });
+                            return Err(TypeError::TypeMismatch { expected: format!("{}", ret_ty), found: format!("{}", expr_ty) });
                         }
                     }
                     None => {
                         if ret_ty != Type::Unit {
-                            return Err(TypeError::TypeMismatch { expected: format!("{:?}", ret_ty), found: "Unit".into() });
+                            return Err(TypeError::TypeMismatch { expected: format!("{}", ret_ty), found: "()".into() });
                         }
                     }
                 }
@@ -385,7 +411,12 @@ impl TypeChecker {
             ExprKind::Str(_) => Ok(Type::String),
             ExprKind::Ident(name) => {
                 match env.variants.lookup(name) {
-                    Lookup::Unique(v) => return Ok(Type::Named(v.enum_name)),
+                    Lookup::Unique(v) => {
+                        // A payload-free variant says nothing about what its
+                        // enum holds: `None` is an `Option` of anything.
+                        let params = env.variants.params_of(&v.enum_name);
+                        return Ok(Type::Named(v.enum_name, vec![Type::Inferred; params.len()]));
+                    }
                     Lookup::Ambiguous(candidates) => {
                         return Err(TypeError::AmbiguousVariant { name: name.clone(), candidates })
                     }
@@ -396,7 +427,7 @@ impl TypeChecker {
             ExprKind::Binary(l, op, r) => {
                 let lt = Self::check_expr(l, env)?;
                 let rt = Self::check_expr(r, env)?;
-                if !compatible(&lt, &rt) { return Err(TypeError::TypeMismatch { expected: format!("{:?}", lt), found: format!("{:?}", rt) }); }
+                if !compatible(&lt, &rt) { return Err(TypeError::TypeMismatch { expected: format!("{}", lt), found: format!("{}", rt) }); }
                 match op {
                     BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Mod => Ok(lt),
                     BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge => Ok(Type::Bool),
@@ -408,13 +439,13 @@ impl TypeChecker {
                 match op {
                     UnaryOp::Neg => {
                         if et != Type::Int && et != Type::Float {
-                            return Err(TypeError::TypeMismatch { expected: "int or float".into(), found: format!("{:?}", et) });
+                            return Err(TypeError::TypeMismatch { expected: "int or float".into(), found: format!("{}", et) });
                         }
                         Ok(et)
                     }
                     UnaryOp::Not => {
                         if et != Type::Bool && et != Type::Int {
-                            return Err(TypeError::TypeMismatch { expected: "bool or int".into(), found: format!("{:?}", et) });
+                            return Err(TypeError::TypeMismatch { expected: "bool or int".into(), found: format!("{}", et) });
                         }
                         Ok(Type::Bool)
                     }
@@ -442,11 +473,24 @@ impl TypeChecker {
                 match env.variants.lookup(func_name) {
                     Lookup::Unique(v) => {
                         if v.payload.len() != args.len() { return Err(TypeError::WrongArity { name: func_name.clone(), expected: v.payload.len(), found: args.len() }); }
+                        // A built-in variant's payload is a type parameter, so
+                        // building one is where the enum's argument gets fixed:
+                        // `Some(1.5)` is an `Option<float>`, and that is what
+                        // later lets it be printed as a float rather than as
+                        // the bits of one.
+                        let params = env.variants.params_of(&v.enum_name);
+                        let mut subst: HashMap<String, Type> = HashMap::new();
                         for (arg, expected) in args.iter().zip(v.payload.iter()) {
                             let arg_ty = Self::check_expr(arg, env)?;
-                            if !compatible(expected, &arg_ty) { return Err(TypeError::TypeMismatch { expected: format!("{:?}", expected), found: format!("{:?}", arg_ty) }); }
+                            if !unify(expected, &arg_ty, &params, &mut subst) {
+                                return Err(TypeError::TypeMismatch { expected: format!("{}", expected), found: format!("{}", arg_ty) });
+                            }
                         }
-                        return Ok(Type::Named(v.enum_name));
+                        let type_args = params
+                            .iter()
+                            .map(|p| subst.get(p).cloned().unwrap_or(Type::Inferred))
+                            .collect();
+                        return Ok(Type::Named(v.enum_name, type_args));
                     }
                     Lookup::Ambiguous(candidates) => {
                         return Err(TypeError::AmbiguousVariant { name: func_name.clone(), candidates })
@@ -490,11 +534,11 @@ impl TypeChecker {
             }
             ExprKind::MethodCall(obj, method, args) => {
                 let obj_ty = Self::check_expr(obj, env)?;
-                let type_name = match &obj_ty {
-                    Type::Named(n) => n.clone(),
-                    _ => return Err(TypeError::UnknownField { ty: format!("{:?}", obj_ty), field: method.clone() }),
+                let (type_name, type_args) = match &obj_ty {
+                    Type::Named(n, a) => (n.clone(), a.clone()),
+                    _ => return Err(TypeError::UnknownField { ty: format!("{}", obj_ty), field: method.clone() }),
                 };
-                if let Some((arity, ret)) = builtins::method_signature(&type_name, method) {
+                if let Some((arity, ret)) = builtins::method_signature(&type_name, &type_args, method) {
                     if args.len() != arity {
                         return Err(TypeError::WrongArity { name: method.clone(), expected: arity, found: args.len() });
                     }
@@ -516,7 +560,7 @@ impl TypeChecker {
             ExprKind::FieldAccess(obj, field) => {
                 let obj_ty = Self::check_expr(obj, env)?;
                 match &obj_ty {
-                    Type::Named(name) => {
+                    Type::Named(name, _) => {
                         if let Some(fields) = env.structs.get(name) {
                             fields.iter().find(|(fname, _)| fname == field)
                                 .map(|(_, fty)| fty.clone())
@@ -525,7 +569,7 @@ impl TypeChecker {
                             Err(TypeError::UnknownField { ty: name.clone(), field: field.clone() })
                         }
                     }
-                    _ => Err(TypeError::UnknownField { ty: format!("{:?}", obj_ty), field: field.clone() }),
+                    _ => Err(TypeError::UnknownField { ty: format!("{}", obj_ty), field: field.clone() }),
                 }
             }
             ExprKind::StructLit { name, fields } => {
@@ -536,7 +580,7 @@ impl TypeChecker {
                     let expr_ty = Self::check_expr(expr, env)?;
                     if !compatible(fty, &expr_ty) { return Err(Self::mismatch_at(fty, &expr_ty, expr)); }
                 }
-                Ok(Type::Named(name.clone()))
+                Ok(Type::Named(name.clone(), Vec::new()))
             }
             ExprKind::Match { scrutinee, arms } => {
                 let scrutinee_ty = Self::check_expr(scrutinee, env)?;
@@ -553,7 +597,7 @@ impl TypeChecker {
                     let body_ty = Self::check_expr(body, env)?;
                     env.pop_scope();
                     if let Some(prev) = &result_ty {
-                        if !compatible(prev, &body_ty) { return Err(TypeError::TypeMismatch { expected: format!("{:?}", prev), found: format!("{:?}", body_ty) }); }
+                        if !compatible(prev, &body_ty) { return Err(TypeError::TypeMismatch { expected: format!("{}", prev), found: format!("{}", body_ty) }); }
                     } else {
                         result_ty = Some(body_ty);
                     }
@@ -565,7 +609,7 @@ impl TypeChecker {
                 let then_ty = Self::check_expr(then_body, env)?;
                 if let Some(eb) = else_body {
                     let else_ty = Self::check_expr(eb, env)?;
-                    if !compatible(&then_ty, &else_ty) { return Err(TypeError::TypeMismatch { expected: format!("{:?}", then_ty), found: format!("{:?}", else_ty) }); }
+                    if !compatible(&then_ty, &else_ty) { return Err(TypeError::TypeMismatch { expected: format!("{}", then_ty), found: format!("{}", else_ty) }); }
                     Ok(then_ty)
                 } else {
                     Ok(Type::Unit)
@@ -590,7 +634,7 @@ impl TypeChecker {
                 let at = Self::check_expr(a, env)?;
                 let bt = Self::check_expr(b, env)?;
                 if at != Type::Int || bt != Type::Int {
-                    return Err(TypeError::TypeMismatch { expected: "int".into(), found: format!("{:?}", if at != Type::Int { at } else { bt }) });
+                    return Err(TypeError::TypeMismatch { expected: "int".into(), found: format!("{}", if at != Type::Int { at } else { bt }) });
                 }
                 Ok(Type::Int)
             }
@@ -601,7 +645,7 @@ impl TypeChecker {
                     let elem_ty = Self::check_expr(&elems[0], env)?;
                     for e in &elems[1..] {
                         let et = Self::check_expr(e, env)?;
-                        if !compatible(&et, &elem_ty) { return Err(TypeError::TypeMismatch { expected: format!("{:?}", elem_ty), found: format!("{:?}", et) }); }
+                        if !compatible(&et, &elem_ty) { return Err(TypeError::TypeMismatch { expected: format!("{}", elem_ty), found: format!("{}", et) }); }
                     }
                     Ok(Type::Array(Box::new(elem_ty)))
                 }
@@ -609,10 +653,10 @@ impl TypeChecker {
             ExprKind::Index(arr, idx) => {
                 let arr_ty = Self::check_expr(arr, env)?;
                 let idx_ty = Self::check_expr(idx, env)?;
-                if idx_ty != Type::Int { return Err(TypeError::TypeMismatch { expected: "int".into(), found: format!("{:?}", idx_ty) }); }
+                if idx_ty != Type::Int { return Err(TypeError::TypeMismatch { expected: "int".into(), found: format!("{}", idx_ty) }); }
                 match arr_ty {
                     Type::Array(et) => Ok(*et),
-                    _ => Err(TypeError::TypeMismatch { expected: "array".into(), found: format!("{:?}", arr_ty) }),
+                    _ => Err(TypeError::TypeMismatch { expected: "array".into(), found: format!("{}", arr_ty) }),
                 }
             }
         }
@@ -637,12 +681,12 @@ impl TypeChecker {
         }
 
         let name = |t: &Type| match t {
-            Type::Named(n) => n.clone(),
+            Type::Named(n, _) => n.clone(),
             Type::Int => "int".into(),
             Type::Float => "float".into(),
             Type::Bool => "bool".into(),
             Type::String => "string".into(),
-            other => format!("{:?}", other),
+            other => other.to_string(),
         };
 
         match ty {
@@ -670,7 +714,7 @@ impl TypeChecker {
                     Err(TypeError::NonExhaustiveMatch { ty: "bool".into(), missing })
                 }
             }
-            Type::Named(n) if env.variants.is_enum(n) => {
+            Type::Named(n, _) if env.variants.is_enum(n) => {
                 let mut covered: Vec<String> = Vec::new();
                 for pats in &unguarded {
                     for p in pats.iter() {
@@ -707,8 +751,8 @@ impl TypeChecker {
     fn mismatch_at(expected: &Type, found: &Type, at: &Expr) -> TypeError {
         TypeError::Located(Box::new(Diagnostic::new(
             TypeError::TypeMismatch {
-                expected: format!("{:?}", expected),
-                found: format!("{:?}", found),
+                expected: format!("{}", expected),
+                found: format!("{}", found),
             }
             .to_string(),
             at.span,
@@ -719,7 +763,7 @@ impl TypeChecker {
         match pattern {
             Pattern::Literal(expr) => {
                 let pat_ty = Self::check_expr(expr, env)?;
-                if !compatible(&pat_ty, expected_ty) { return Err(TypeError::TypeMismatch { expected: format!("{:?}", expected_ty), found: format!("{:?}", pat_ty) }); }
+                if !compatible(&pat_ty, expected_ty) { return Err(TypeError::TypeMismatch { expected: format!("{}", expected_ty), found: format!("{}", pat_ty) }); }
                 Ok(())
             }
             Pattern::Variable(name) => { env.define(name, expected_ty.clone()); Ok(()) }
@@ -727,10 +771,32 @@ impl TypeChecker {
             Pattern::EnumVariant { name, inner } => {
                 match env.variants.lookup(name) {
                     Lookup::Unique(v) => {
-                        if !compatible(expected_ty, &Type::Named(v.enum_name.clone())) { return Err(TypeError::TypeMismatch { expected: format!("{:?}", expected_ty), found: format!("Enum {}", v.enum_name) }); }
+                        if !compatible(expected_ty, &Type::Named(v.enum_name.clone(), Vec::new())) { return Err(TypeError::TypeMismatch { expected: format!("{}", expected_ty), found: format!("Enum {}", v.enum_name) }); }
                         if v.payload.len() != inner.len() { return Err(TypeError::WrongArity { name: name.clone(), expected: v.payload.len(), found: inner.len() }); }
+                        // What the payload is depends on the value being
+                        // matched: `Some(v)` binds a float out of an
+                        // `Option<float>` and nothing definite out of a plain
+                        // `Option`.
+                        let subst: HashMap<String, Type> = match expected_ty {
+                            Type::Named(_, targs) => env
+                                .variants
+                                .params_of(&v.enum_name)
+                                .into_iter()
+                                .zip(targs.iter().cloned())
+                                .collect(),
+                            _ => HashMap::new(),
+                        };
+                        let params = env.variants.params_of(&v.enum_name);
                         for (pat, arg_ty) in inner.iter().zip(v.payload.iter()) {
-                            Self::check_pattern(pat, arg_ty, env)?;
+                            let mut arg_ty = substitute(arg_ty, &subst);
+                            // An unbound parameter says nothing, rather than
+                            // naming a type that does not exist.
+                            if let Type::Named(n, a) = &arg_ty {
+                                if a.is_empty() && params.contains(n) {
+                                    arg_ty = Type::Inferred;
+                                }
+                            }
+                            Self::check_pattern(pat, &arg_ty, env)?;
                         }
                         Ok(())
                     }

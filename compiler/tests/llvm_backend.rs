@@ -1208,3 +1208,80 @@ fn main() {
 "#,
     );
 }
+
+// ---------------------------------------------------------------------------
+// What an Option or a Result holds
+//
+// `Some(1.5)` printed `Some(4609434218613702656)` — the payload's bits read as
+// an integer. The built-in enums declared their payload as "inferred", so the
+// native backend, which erases everything to i64, had nothing to read it back
+// as. They now declare a type parameter, and building one fixes it.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn an_option_payload_prints_as_what_it_is() {
+    assert_agrees_with_interpreter(
+        r#"
+struct P { x: int, y: int }
+fn main() {
+    print(Some(1.5));
+    print(Some("hi"));
+    print(Some(true));
+    print(Some([1, 2]));
+    print(Some(P { x: 1, y: 2 }));
+    print(None);
+    print([Some(1.5), None]);
+}
+"#,
+    );
+}
+
+#[test]
+fn a_result_payload_prints_as_what_it_is() {
+    assert_agrees_with_interpreter(
+        r#"
+fn main() {
+    print(Ok(2.5));
+    print(Err("bad"));
+    print(to_string(Ok(1.5)));
+    print("r = {Ok(3.5)}");
+}
+"#,
+    );
+}
+
+#[test]
+fn a_payload_type_survives_a_function_boundary() {
+    assert_agrees_with_interpreter(
+        r#"
+fn maybe(n: int) -> Option<float> {
+    if n > 0 { return Some(1.5); }
+    return None;
+}
+fn show(o: Option<string>) -> int {
+    print(o);
+    return 0;
+}
+fn main() {
+    print(maybe(1));
+    print(maybe(0));
+    show(Some("through a parameter"));
+}
+"#,
+    );
+}
+
+#[test]
+fn unwrap_and_match_read_the_payload_back_as_its_type() {
+    assert_agrees_with_interpreter(
+        r#"
+fn main() {
+    let o = Some(3.5);
+    print(o.unwrap());
+    print(match o { Some(v) => v, None => 0.0 });
+    let r = Ok(2.5);
+    print(r.unwrap());
+}
+"#,
+    );
+}

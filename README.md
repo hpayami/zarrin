@@ -28,10 +28,15 @@ down.
 
 `print` and `to_string` render a value the way it is written: an array as
 `[1, 2, 3]`, a struct as `Point { x: 1, y: 2 }` with its fields in declaration
-order, an enum as its variant name and payload. An `Option` or `Result` payload
-still prints as an integer on the native backend, since a built-in variant does
-not record what type it carries; a range prints as `0` there for the same
-reason.
+order, an enum as its variant name and payload.
+
+`Option` and `Result` carry the type of what they hold: `Some(1.5)` is an
+`Option<float>`, and that is what makes it print as `Some(1.5)` rather than as
+the bits of a float. Write the argument where a signature needs it —
+`Option<float>`, `Result<int, string>` — or leave it off, and a plain `Option`
+accepts any payload but cannot say what it holds. `unwrap` and a `match` arm
+both hand back the payload at that type. A range printed as a value still comes
+out as `0` on the native backend, since a range has no type to render from.
 
 Errors — syntax, type, and run time — are reported against the source with a
 line, a column and the offending line quoted. A type error points at the

@@ -32,7 +32,11 @@ fn type_tag(t: &Type) -> String {
         Type::String => "string".into(),
         Type::Unit => "unit".into(),
         Type::Inferred => "any".into(),
-        Type::Named(n) => n.clone(),
+        Type::Named(n, args) if args.is_empty() => n.clone(),
+        Type::Named(n, args) => {
+            let parts: Vec<String> = args.iter().map(type_tag).collect();
+            format!("{}.{}", n, parts.join("."))
+        }
         Type::Array(el) => format!("arr.{}", type_tag(el)),
         Type::Fn(args, ret) => {
             let parts: Vec<String> = args.iter().map(type_tag).collect();

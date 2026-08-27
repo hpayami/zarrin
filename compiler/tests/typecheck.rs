@@ -233,3 +233,54 @@ fn an_unknown_scrutinee_type_is_left_alone() {
     // proven and nothing is claimed.
     assert_checks("fn main() { let a = [1, 2]; let v = match array_get(a, 0) { 5 => 10, 6 => 20 }; }\n");
 }
+
+// ---------------------------------------------------------------------------
+// What an Option or a Result holds
+// ---------------------------------------------------------------------------
+
+#[test]
+fn an_option_remembers_its_payload_type() {
+    assert_check_error(
+        "fn take(o: Option<int>) -> int { return 0; }\n\
+         fn main() { print(take(Some(\"s\"))); }\n",
+        "expected `Option<int>`, found `Option<string>`",
+    );
+}
+
+#[test]
+fn a_bare_option_still_accepts_any_payload() {
+    // Signatures written before payload types existed have to keep working.
+    assert_checks(
+        "fn take(o: Option) -> int { return 0; }\n\
+         fn main() { print(take(Some(1.5))); print(take(Some(\"s\"))); print(take(None)); }\n",
+    );
+}
+
+#[test]
+fn a_result_carries_two_payload_types() {
+    assert_checks(
+        "fn f(n: int) -> Result<int, string> {\n\
+         \x20   if n > 0 { return Ok(n); }\n\
+         \x20   return Err(\"negative\");\n}\n\
+         fn main() { print(f(1)); }\n",
+    );
+    assert_check_error(
+        "fn f(n: int) -> Result<int, string> { return Ok(\"wrong\"); }\n\
+         fn main() { print(f(1)); }\n",
+        "Result<int, string>",
+    );
+}
+
+#[test]
+fn unwrap_has_the_payload_type() {
+    assert_check_error(
+        "fn main() { let n: int = Some(1.5).unwrap(); print(n); }\n",
+        "expected `int`, found `float`",
+    );
+}
+
+#[test]
+fn a_type_error_names_types_the_way_they_are_written() {
+    assert_check_error("fn main() { let x: int = \"s\"; }\n", "expected `int`, found `string`");
+    assert_check_error("fn main() { let x: int = [1]; }\n", "expected `int`, found `[int]`");
+}

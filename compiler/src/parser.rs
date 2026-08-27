@@ -250,7 +250,7 @@ impl<'a> Parser<'a> {
                     t => return Err(self.error_at_prev(format!("expected param name, found {}", describe(&t)))),
                 };
                 if pname == "self" || pname == "&self" || pname == "&mut" {
-                    params.push((pname, Type::Named("Self".into())));
+                    params.push((pname, Type::Named("Self".into(), Vec::new())));
                     if self.current == Token::Comma {
                         self.advance()?;
                     } else {
@@ -371,7 +371,7 @@ impl<'a> Parser<'a> {
                         t => return Err(self.error_at_prev(format!("expected param name, found {}", describe(&t)))),
                     };
                     if pname == "self" || pname == "&self" || pname == "&mut" {
-                        params.push((pname, Type::Named("Self".into())));
+                        params.push((pname, Type::Named("Self".into(), Vec::new())));
                         if self.current == Token::Comma { self.advance()?; } else { break; }
                         continue;
                     }
@@ -499,6 +499,27 @@ impl<'a> Parser<'a> {
         Ok(Stmt::new(StmtKind::Macro { name, params, body }, span))
     }
 
+    /// `<int, string>` after a type name, if it is there. A type position has
+    /// no comparison operator to be confused with, so a `<` here is always the
+    /// start of an argument list.
+    fn parse_type_args(&mut self) -> Result<Vec<Type>, Diagnostic> {
+        if self.current != Token::Lt {
+            return Ok(Vec::new());
+        }
+        self.advance()?;
+        let mut args = Vec::new();
+        loop {
+            args.push(self.parse_type()?);
+            if self.current == Token::Comma {
+                self.advance()?;
+            } else {
+                break;
+            }
+        }
+        self.expect(Token::Gt)?;
+        Ok(args)
+    }
+
     fn parse_type(&mut self) -> Result<Type, Diagnostic> {
         Ok(match self.current.clone() {
             Token::Ident(n) => {
@@ -508,7 +529,7 @@ impl<'a> Parser<'a> {
                     "float" => Type::Float,
                     "bool" => Type::Bool,
                     "string" => Type::String,
-                    other => Type::Named(other.to_string()),
+                    other => Type::Named(other.to_string(), self.parse_type_args()?),
                 }
             }
             Token::Fn => {

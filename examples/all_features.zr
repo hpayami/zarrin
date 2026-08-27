@@ -117,6 +117,11 @@ fn main() {
     // Option, and a match with a guard and a qualified pattern
     let maybe = Some(41);
     if maybe.is_some() { print(maybe.unwrap() + 1); }
+    // an Option remembers what it holds, so this prints as a float
+    let ratio = Some(0.5);
+    print(ratio);
+    print(ratio.unwrap());
+    print(Err("as written"));
     let grade = match a {
         n if n > 100 => "big",
         7 => "lucky",

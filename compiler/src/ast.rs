@@ -10,9 +10,38 @@ pub enum Type {
     Bool,
     String,
     Unit,
-    Named(String),
+    /// A declared type by name, with whatever type arguments were worked out
+    /// for it. `Option` on its own carries none — its payload is unknown —
+    /// while `Some(1.5)` produces `Option<float>`.
+    Named(String, Vec<Type>),
     Fn(Vec<Type>, Box<Type>),
     Array(Box<Type>),
+}
+
+/// Types appear in diagnostics, so they print the way they are written in
+/// source — `[int]`, `Option<float>` — rather than as the Rust enum that holds
+/// them, which is what a reader was previously shown.
+impl std::fmt::Display for Type {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Type::Inferred => write!(f, "unknown"),
+            Type::Int => write!(f, "int"),
+            Type::Float => write!(f, "float"),
+            Type::Bool => write!(f, "bool"),
+            Type::String => write!(f, "string"),
+            Type::Unit => write!(f, "()"),
+            Type::Named(n, args) if args.is_empty() => write!(f, "{}", n),
+            Type::Named(n, args) => {
+                let parts: Vec<String> = args.iter().map(|a| a.to_string()).collect();
+                write!(f, "{}<{}>", n, parts.join(", "))
+            }
+            Type::Array(el) => write!(f, "[{}]", el),
+            Type::Fn(args, ret) => {
+                let parts: Vec<String> = args.iter().map(|a| a.to_string()).collect();
+                write!(f, "fn({}) -> {}", parts.join(", "), ret)
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]

@@ -35,14 +35,14 @@ pub fn signature(name: &str) -> Option<(usize, Type)> {
 
 /// Result type of a builtin method on `Option`/`Result`, or `None` if the
 /// method is not one of them.
-pub fn method_signature(type_name: &str, method: &str) -> Option<(usize, Type)> {
+/// `type_args` are the enum's, so `unwrap` on an `Option<float>` is a float.
+/// On a bare `Option` it is still unknown — nothing said what it holds.
+pub fn method_signature(type_name: &str, type_args: &[Type], method: &str) -> Option<(usize, Type)> {
     if type_name != "Option" && type_name != "Result" {
         return None;
     }
     match method {
-        // The payload type needs generics to express, which the language does
-        // not have yet.
-        "unwrap" => Some((0, Type::Inferred)),
+        "unwrap" => Some((0, type_args.first().cloned().unwrap_or(Type::Inferred))),
         "is_some" | "is_none" | "is_ok" | "is_err" => Some((0, Type::Bool)),
         _ => None,
     }

@@ -7,7 +7,7 @@
 #![cfg(feature = "llvm")]
 
 use crate::ast::*;
-use crate::typecheck::{TypeChecker, TypeEnv};
+use crate::typecheck::{substitute, TypeChecker, TypeEnv};
 use crate::diagnostic::{Diagnostic, Span};
 use crate::variants::{builtin_enums, Lookup, Variant, VariantIndex};
 use inkwell::builder::Builder;
@@ -340,7 +340,7 @@ impl<'ctx> Codegen<'ctx> {
     fn is_managed(&self, ty: &Type) -> bool {
         match ty {
             Type::String | Type::Array(_) => true,
-            Type::Named(n) => self.struct_fields.contains_key(n) || self.enum_has_body(n),
+            Type::Named(n, _) => self.struct_fields.contains_key(n) || self.enum_has_body(n),
             _ => false,
         }
     }
@@ -383,7 +383,7 @@ impl<'ctx> Codegen<'ctx> {
         match ty {
             Type::String => "str".into(),
             Type::Array(el) => format!("arr.{}", self.release_key(el)),
-            Type::Named(n) => format!("t.{}", n),
+            Type::Named(n, _) => format!("t.{}", n),
             other => format!("{:?}", other),
         }
     }
@@ -473,7 +473,7 @@ impl<'ctx> Codegen<'ctx> {
                 self.builder.build_unconditional_branch(head).unwrap();
                 self.builder.position_at_end(out);
             }
-            Type::Named(n) => {
+            Type::Named(n, _) => {
                 if let Some(fields) = self.struct_fields.get(n).cloned() {
                     for (idx, (_, fty)) in fields.iter().enumerate() {
                         if !self.is_managed(fty) {
@@ -577,13 +577,13 @@ impl<'ctx> Codegen<'ctx> {
         }
         builtin_enums()
             .into_iter()
-            .find(|(n, _)| n == enum_name)
-            .map(|(_, v)| v)
+            .find(|(n, _, _)| n == enum_name)
+            .map(|(_, _, v)| v)
             .unwrap_or_default()
     }
 
     fn is_enum(&self, name: &str) -> bool {
-        self.enum_variants.contains_key(name) || builtin_enums().iter().any(|(n, _)| n == name)
+        self.enum_variants.contains_key(name) || builtin_enums().iter().any(|(n, _, _)| n == name)
     }
 
     /// The declared or inferred type of an expression.
@@ -591,9 +591,12 @@ impl<'ctx> Codegen<'ctx> {
         TypeChecker::type_of(e, &mut self.types)
     }
 
-    fn named_of_kind(&mut self, e: &Expr, is_kind: impl Fn(&Self, &str) -> bool) -> Option<String> {
+    /// The declared type's name and its type arguments — `Option<float>` comes
+    /// back as `("Option", [Float])`, which is how a payload gets printed as
+    /// what it is rather than as a word.
+    fn named_of_kind(&mut self, e: &Expr, is_kind: impl Fn(&Self, &str) -> bool) -> Option<(String, Vec<Type>)> {
         match self.type_of(e) {
-            Some(Type::Named(n)) if is_kind(self, &n) => Some(n),
+            Some(Type::Named(n, args)) if is_kind(self, &n) => Some((n, args)),
             _ => None,
         }
     }
@@ -663,18 +666,33 @@ impl<'ctx> Codegen<'ctx> {
 
     /// Which struct, if any, this expression produces.
     fn infer_struct_type(&mut self, e: &Expr) -> Option<String> {
-        self.named_of_kind(e, |cg, n| cg.struct_fields.contains_key(n))
+        self.named_of_kind(e, |cg, n| cg.struct_fields.contains_key(n)).map(|(n, _)| n)
     }
 
-    /// Which enum, if any, this expression produces.
-    fn infer_enum_type(&mut self, e: &Expr) -> Option<String> {
+    /// Which enum, if any, this expression produces, and what it holds.
+    fn infer_enum_type(&mut self, e: &Expr) -> Option<(String, Vec<Type>)> {
         self.named_of_kind(e, |cg, n| cg.is_enum(n))
     }
 
 
     /// Render an enum value the way the interpreter does: the variant name, and
     /// for a variant with a payload, its fields in parentheses.
-    fn gen_enum_to_str(&mut self, val: IntValue<'ctx>, enum_name: &str, depth: u32) -> PointerValue<'ctx> {
+    fn gen_enum_to_str(
+        &mut self,
+        val: IntValue<'ctx>,
+        enum_name: &str,
+        type_args: &[Type],
+        depth: u32,
+    ) -> PointerValue<'ctx> {
+        // A built-in variant's payload is declared as the enum's type
+        // parameter, so `Some`'s payload is only a float once the enum is known
+        // to be `Option<float>`.
+        let subst: HashMap<String, Type> = self
+            .variants
+            .params_of(enum_name)
+            .into_iter()
+            .zip(type_args.iter().cloned())
+            .collect();
         let ptr_ty = self.context.ptr_type(AddressSpace::default());
         let i32_ty = self.context.i32_type();
         let snprintf = self.module.get_function("snprintf").unwrap_or_else(|| {
@@ -715,7 +733,8 @@ impl<'ctx> Codegen<'ctx> {
                     let raw = self.builder.build_load(self.i64, fp, "payload_v").unwrap().into_int_value();
                     // Several payload strings are live at once while the
                     // variant text is assembled, so each needs its own.
-                    parts.push(self.gen_to_str(raw, ty, depth + 1));
+                    let ty = substitute(ty, &subst);
+                    parts.push(self.gen_to_str(raw, &ty, depth + 1));
                 }
                 let holes = vec!["%s"; parts.len()].join(", ");
                 let fmt = self.builder.build_global_string_ptr(&format!("{}({})", vname, holes), "variant_fmt").unwrap().as_pointer_value();
@@ -768,11 +787,11 @@ impl<'ctx> Codegen<'ctx> {
                 let el = (**el).clone();
                 self.gen_array_to_str(raw, &el, depth)
             }
-            Type::Named(n) if self.is_enum(n) => {
-                let n = n.clone();
-                self.gen_enum_to_str(raw, &n, depth)
+            Type::Named(n, args) if self.is_enum(n) => {
+                let (n, args) = (n.clone(), args.clone());
+                self.gen_enum_to_str(raw, &n, &args, depth)
             }
-            Type::Named(n) if self.struct_fields.contains_key(n) => {
+            Type::Named(n, _) if self.struct_fields.contains_key(n) => {
                 let n = n.clone();
                 self.gen_struct_to_str(raw, &n, depth)
             }
@@ -1185,10 +1204,10 @@ impl<'ctx> Codegen<'ctx> {
                         self.builder.build_call(self.printf, &[fmt.into(), text.into()], "call_printf").unwrap();
                         return CgValue::Int(self.i64.const_int(0, false));
                     }
-                    if let Some(en) = self.infer_enum_type(&args[0]) {
+                    if let Some((en, targs)) = self.infer_enum_type(&args[0]) {
                         let v = self.gen_expr(&args[0]);
                         let iv = self.value_to_int(&v);
-                        let text = self.gen_enum_to_str(iv, &en, 0);
+                        let text = self.gen_enum_to_str(iv, &en, &targs, 0);
                         let fmt = self.string_global("%s\n");
                         self.builder.build_call(self.printf, &[fmt.into(), text.into()], "call_printf").unwrap();
                         return CgValue::Int(self.i64.const_int(0, false));
@@ -1226,10 +1245,10 @@ impl<'ctx> Codegen<'ctx> {
                         let iv = self.value_to_int(&v);
                         return CgValue::Str(self.gen_bool_to_str(iv));
                     }
-                    if let Some(en) = self.infer_enum_type(&args[0]) {
+                    if let Some((en, targs)) = self.infer_enum_type(&args[0]) {
                         let v = self.gen_expr(&args[0]);
                         let iv = self.value_to_int(&v);
-                        return CgValue::Str(self.gen_enum_to_str(iv, &en, 0));
+                        return CgValue::Str(self.gen_enum_to_str(iv, &en, &targs, 0));
                     }
                     if let Some(ty) = self.compound_type(&args[0]) {
                         let v = self.gen_expr(&args[0]);
@@ -1675,6 +1694,13 @@ impl<'ctx> Codegen<'ctx> {
                 self.typed_value(raw, &field_ty)
             }
             ExprKind::MethodCall(obj, method, args) => {
+                // What `unwrap` yields is the enum's type argument; without it
+                // a float payload came back as the integer its bits spell.
+                let unwrapped = self
+                    .infer_enum_type(obj)
+                    .and_then(|(_, a)| a.into_iter().next())
+                    .filter(|t| *t != Type::Inferred)
+                    .unwrap_or(Type::Int);
                 let obj_val = self.gen_expr(obj);
                 if method == "unwrap" || method == "is_some" || method == "is_none" || method == "is_ok" || method == "is_err" {
                     let obj_int = self.value_to_int(&obj_val);
@@ -1690,7 +1716,7 @@ impl<'ctx> Codegen<'ctx> {
                                 self.builder.build_gep(self.i64, sv_ptr, &[self.i64.const_int(1, false)], "data_ptr").unwrap()
                             };
                             let data = self.builder.build_load(self.i64, data_ptr, "data").unwrap().into_int_value();
-                            return CgValue::Int(data);
+                            return self.typed_value(data, &unwrapped);
                         }
                         "is_some" | "is_ok" => {
                             let zext = self.builder.build_int_z_extend(is_variant0, self.i64, "result").unwrap();
@@ -1752,8 +1778,12 @@ ExprKind::Match { scrutinee, arms } => {
                 // bare tag depends on *its* enum. This was a single flag over
                 // every enum in the program, so declaring one payload variant
                 // anywhere made `match` on an integer dereference it.
+                // What the scrutinee holds, so a bound payload is read back as
+                // the type it is: `Some(v)` off an `Option<float>` binds a
+                // float, not the word its bits sit in.
+                let scrutinee_args = self.infer_enum_type(scrutinee).map(|(_, a)| a).unwrap_or_default();
                 let has_data_variants = match self.infer_enum_type(scrutinee) {
-                    Some(en) => self.variants_of(&en).iter().any(|(_, pt)| !pt.is_empty()),
+                    Some((en, _)) => self.variants_of(&en).iter().any(|(_, pt)| !pt.is_empty()),
                     None => match &*scrutinee.kind {
                         // A local or parameter that is not a known enum, or a
                         // plain arithmetic value, is its own tag.
@@ -1823,7 +1853,16 @@ ExprKind::Match { scrutinee, arms } => {
                                 // never matched a qualified name like `Color::Red`,
                                 // which is what the pattern parser produces.
                                 let (tag_val, payload_types) = match self.resolve_variant(name) {
-                                    Some(v) => (v.tag as u64, v.payload),
+                                    Some(v) => {
+                                        let subst: HashMap<String, Type> = self
+                                            .variants
+                                            .params_of(&v.enum_name)
+                                            .into_iter()
+                                            .zip(scrutinee_args.iter().cloned())
+                                            .collect();
+                                        let payload = v.payload.iter().map(|t| substitute(t, &subst)).collect();
+                                        (v.tag as u64, payload)
+                                    }
                                     None => (0, Vec::new()),
                                 };
                                 let pv_int = self.i64.const_int(tag_val, false);
@@ -1850,7 +1889,14 @@ ExprKind::Match { scrutinee, arms } => {
                                             let field_val = self.builder.build_load(self.i64, field_ptr, vname).unwrap().into_int_value();
                                             let ptr = self.entry_alloca(self.i64.into(), vname);
                                             self.builder.build_store(ptr, field_val).unwrap();
-                                            let pty = payload_types.get(j).cloned().unwrap_or(Type::Int);
+                                            // An unsubstituted parameter means
+                                            // the scrutinee never said what it
+                                            // held; a raw word is all there is.
+                                            let pty = match payload_types.get(j) {
+                                                Some(Type::Named(n, a)) if a.is_empty() && !self.is_enum(n) && !self.struct_fields.contains_key(n) => Type::Int,
+                                                Some(t) => t.clone(),
+                                                None => Type::Int,
+                                            };
                                             self.named.insert(vname.clone(), (ptr, pty.clone()));
                                             self.types.define(vname, pty);
                                         }
@@ -2506,7 +2552,7 @@ ExprKind::Match { scrutinee, arms } => {
     fn compound_type(&mut self, e: &Expr) -> Option<Type> {
         match self.type_of(e)? {
             Type::Array(el) => Some(Type::Array(el)),
-            Type::Named(n) if self.struct_fields.contains_key(&n) => Some(Type::Named(n)),
+            Type::Named(n, args) if self.struct_fields.contains_key(&n) => Some(Type::Named(n, args)),
             _ => None,
         }
     }
@@ -2518,10 +2564,10 @@ ExprKind::Match { scrutinee, arms } => {
             let text = self.gen_bool_to_str(iv);
             let fmt = self.string_global("%s\n");
             self.builder.build_call(self.printf, &[fmt.into(), text.into()], "call_printf").unwrap();
-        } else if let Some(en) = self.infer_enum_type(arg) {
+        } else if let Some((en, targs)) = self.infer_enum_type(arg) {
             let v = self.gen_expr(arg);
             let iv = self.value_to_int(&v);
-            let text = self.gen_enum_to_str(iv, &en, 0);
+            let text = self.gen_enum_to_str(iv, &en, &targs, 0);
             let fmt = self.string_global("%s\n");
             self.builder.build_call(self.printf, &[fmt.into(), text.into()], "call_printf").unwrap();
         } else if let Some(ty) = self.compound_type(arg) {
@@ -3123,7 +3169,7 @@ pub fn compile_to_executable(program: &Program, out_path: &str, src_path: &str, 
                     // or `string` parameter was read back as an integer.
                     let arg = func.get_nth_param(i as u32).unwrap().into_int_value();
                     cg.bind_local(pname, pty, &CgValue::Int(arg));
-                    if let Type::Named(t) = pty {
+                    if let Type::Named(t, _) = pty {
                         if cg.struct_fields.contains_key(t) {
                             cg.var_struct_type.insert(pname.clone(), t.clone());
                         }
@@ -3160,12 +3206,12 @@ pub fn compile_to_executable(program: &Program, out_path: &str, src_path: &str, 
                             // The parser types a `self` parameter as `Self`;
                             // the impl block is what says which type that is.
                             let declared = match pname.as_str() {
-                                "self" | "&self" | "&mut" => Type::Named(type_name.clone()),
+                                "self" | "&self" | "&mut" => Type::Named(type_name.clone(), Vec::new()),
                                 _ => pty.clone(),
                             };
                             let arg = func.get_nth_param(i as u32).unwrap().into_int_value();
                             cg.bind_local(pname, &declared, &CgValue::Int(arg));
-                            if let Type::Named(t) = declared {
+                            if let Type::Named(t, _) = declared {
                                 if cg.struct_fields.contains_key(&t) {
                                     cg.var_struct_type.insert(pname.clone(), t);
                                 }
