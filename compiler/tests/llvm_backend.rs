@@ -680,6 +680,49 @@ fn main() {
     );
 }
 
+// --- types the backend used to have no rule for ------------------------------
+//
+// The backend asks the type checker now instead of pattern-matching on the
+// shape of an expression, so these follow without a rule for each.
+
+#[test]
+fn types_reached_through_other_values() {
+    assert_agrees_with_interpreter(
+        r#"
+enum Color { Red, Rgb(int, int, int) }
+struct Style { c: Color, on: bool, w: float }
+fn pick() -> Color { return Rgb(1, 2, 3); }
+fn main() {
+    let s = Style { c: pick(), on: 3 > 1, w: 2.5 };
+    print(s.on);
+    print(s.c);
+    print(s.w);
+    let b = match 1 { 1 => 2 > 1, _ => false };
+    print(b);
+    print(if true { 1 == 1 } else { false });
+    let e = match 0 { 0 => Red, _ => pick() };
+    print(e);
+}
+"#,
+    );
+}
+
+#[test]
+fn a_branch_that_opens_blocks_of_its_own() {
+    // The phi recorded the block an arm started in. A body containing its own
+    // if or match ends somewhere else, and llc rejected the module:
+    // "PHI node entries do not match predecessors".
+    assert_agrees_with_interpreter(
+        r#"
+fn main() {
+    print(match 2 { 2 => if true { "yes" } else { "no" }, _ => "other" });
+    print(if true { match 1 { 1 => 10, _ => 20 } } else { 0 });
+    print(match 1 { 1 => match 2 { 2 => 1.5, _ => 0.5 }, _ => 0.0 });
+}
+"#,
+    );
+}
+
 // --- every example, both backends -------------------------------------------
 
 /// Walk `examples/` and require the native executable to behave exactly like

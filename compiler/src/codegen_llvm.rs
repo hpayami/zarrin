@@ -7,7 +7,7 @@
 #![cfg(feature = "llvm")]
 
 use crate::ast::*;
-use crate::builtins;
+use crate::typecheck::{TypeChecker, TypeEnv};
 use crate::diagnostic::{Diagnostic, Span};
 use crate::variants::{builtin_enums, Lookup, Variant, VariantIndex};
 use inkwell::builder::Builder;
@@ -48,11 +48,10 @@ pub struct Codegen<'ctx> {
     named: HashMap<String, (PointerValue<'ctx>, String)>,
     struct_fields: HashMap<String, Vec<(String, Type)>>,
     var_struct_type: HashMap<String, String>,
-    /// Variables known to hold a value of a given enum, so `print` can show
-    /// the variant name instead of the address it is represented by.
-    var_enum_type: HashMap<String, String>,
-    /// Locals known to hold a boolean.
-    var_bool: std::collections::HashSet<String>,
+    /// The type checker's view of the program, kept in step with the locals in
+    /// scope. Everything this backend needs to know about a value's type is
+    /// asked here, rather than re-derived from the shape of the expression.
+    types: TypeEnv,
     /// Source of the program being compiled, so a check that fails at run time
     /// can print the same diagnostic the interpreter would.
     path: String,
@@ -91,8 +90,7 @@ impl<'ctx> Codegen<'ctx> {
             named: HashMap::new(),
             struct_fields: HashMap::new(),
             var_struct_type: HashMap::new(),
-            var_enum_type: HashMap::new(),
-            var_bool: std::collections::HashSet::new(),
+            types: TypeChecker::env_for(program),
             path: String::new(),
             src: String::new(),
             current_span: Span::new(1, 1),
@@ -224,89 +222,32 @@ impl<'ctx> Codegen<'ctx> {
         self.enum_variants.contains_key(name) || builtin_enums().iter().any(|(n, _)| n == name)
     }
 
-    /// Whether this expression yields a boolean. Booleans are i64 0/1 here, so
-    /// `print` showed 1 where the interpreter shows true.
-    fn is_bool_expr(&self, e: &Expr) -> bool {
-        match e {
-            Expr::Bool(_) => true,
-            Expr::Unary(UnaryOp::Not, _) => true,
-            Expr::Binary(_, op, _) => matches!(
-                op,
-                BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge | BinOp::And | BinOp::Or
-            ),
-            Expr::Ident(n) => self.var_bool.contains(n),
-            Expr::MethodCall(_, m, _) => matches!(m.as_str(), "is_some" | "is_none" | "is_ok" | "is_err"),
-            Expr::Call(callee, _) => {
-                let Expr::Ident(n) = callee.as_ref() else { return false };
-                if let Some((_, ret)) = builtins::signature(n) {
-                    return ret == Type::Bool;
-                }
-                matches!(self.fn_ret_types.get(n), Some(Type::Bool))
-            }
-            Expr::If { then_body, .. } => self.is_bool_expr(then_body),
-            _ => false,
-        }
+    /// The declared or inferred type of an expression.
+    fn type_of(&mut self, e: &Expr) -> Option<Type> {
+        TypeChecker::type_of(e, &mut self.types)
     }
 
-    /// Which struct, if any, this expression produces. Field access used to
-    /// insist on a variable bound directly to a struct literal, so a struct
-    /// returned from a function, taken as a parameter, or nested inside
-    /// another struct had no readable fields at all.
-    fn infer_struct_type(&self, e: &Expr) -> Option<String> {
-        let named_struct = |t: &Type| match t {
-            Type::Named(n) if self.struct_fields.contains_key(n) => Some(n.clone()),
-            _ => None,
-        };
-        match e {
-            Expr::StructLit { name, .. } => Some(name.clone()),
-            Expr::Ident(n) => self.var_struct_type.get(n).cloned(),
-            Expr::Call(callee, _) => {
-                let Expr::Ident(n) = callee.as_ref() else { return None };
-                self.fn_ret_types.get(n).and_then(named_struct)
-            }
-            Expr::MethodCall(_, m, _) => self.fn_ret_types.get(m).and_then(named_struct),
-            Expr::FieldAccess(obj, field) => {
-                let owner = self.infer_struct_type(obj)?;
-                self.field_type(&owner, field).as_ref().and_then(named_struct)
-            }
+    fn named_of_kind(&mut self, e: &Expr, is_kind: impl Fn(&Self, &str) -> bool) -> Option<String> {
+        match self.type_of(e) {
+            Some(Type::Named(n)) if is_kind(self, &n) => Some(n),
             _ => None,
         }
     }
 
-    fn field_type(&self, struct_name: &str, field: &str) -> Option<Type> {
-        self.struct_fields
-            .get(struct_name)?
-            .iter()
-            .find(|(n, _)| n == field)
-            .map(|(_, t)| t.clone())
+    fn is_bool_expr(&mut self, e: &Expr) -> bool {
+        self.type_of(e) == Some(Type::Bool)
     }
 
-    /// Which enum, if any, this expression produces. The backend erases types
-    /// into i64, so `print` has to recover this statically to render a variant.
-    fn infer_enum_type(&self, e: &Expr) -> Option<String> {
-        let named_enum = |t: &Type| match t {
-            Type::Named(n) if self.is_enum(n) => Some(n.clone()),
-            _ => None,
-        };
-        match e {
-            Expr::Ident(n) => self
-                .resolve_variant(n)
-                .map(|v| v.enum_name)
-                .or_else(|| self.var_enum_type.get(n).cloned()),
-            Expr::Call(callee, _) => {
-                let Expr::Ident(n) = callee.as_ref() else { return None };
-                self.resolve_variant(n)
-                    .map(|v| v.enum_name)
-                    .or_else(|| self.fn_ret_types.get(n).and_then(named_enum))
-            }
-            Expr::MethodCall(_, m, _) => self.fn_ret_types.get(m).and_then(named_enum),
-            Expr::FieldAccess(obj, field) => {
-                let owner = self.infer_struct_type(obj)?;
-                self.field_type(&owner, field).as_ref().and_then(named_enum)
-            }
-            _ => None,
-        }
+    /// Which struct, if any, this expression produces.
+    fn infer_struct_type(&mut self, e: &Expr) -> Option<String> {
+        self.named_of_kind(e, |cg, n| cg.struct_fields.contains_key(n))
     }
+
+    /// Which enum, if any, this expression produces.
+    fn infer_enum_type(&mut self, e: &Expr) -> Option<String> {
+        self.named_of_kind(e, |cg, n| cg.is_enum(n))
+    }
+
 
     /// Render an enum value the way the interpreter does: the variant name, and
     /// for a variant with a payload, its fields in parentheses.
@@ -1243,7 +1184,7 @@ Expr::Match { scrutinee, arms } => {
                     // `arm_bb` was a self-loop, and the body was never emitted
                     // at all, leaving `merge` with a predecessor that fed the
                     // phi no value.
-                    let body_bb = if let Some(g) = guard {
+                    let _body_bb = if let Some(g) = guard {
                         let gv = self.gen_expr(g);
                         let gc = self.to_i1(&gv);
                         let body_bb = self.context.append_basic_block(parent, &format!("arm_{}_body", i));
@@ -1265,7 +1206,11 @@ Expr::Match { scrutinee, arms } => {
                     let bv = self.gen_expr(body);
                     let bv_int = self.value_to_int(&bv);
                     if arm_shape.is_none() { arm_shape = Some(bv.clone()); }
-                    arm_values.push((bv_int, body_bb));
+                    // An arm body can open blocks of its own — a nested if or
+                    // match — so the value reaches the merge from wherever the
+                    // body ended, not from the block the arm started in.
+                    let from = self.builder.get_insert_block().unwrap();
+                    arm_values.push((bv_int, from));
                     self.builder.build_unconditional_branch(merge).unwrap();
                     if let Some(nc) = next_check {
                         current_check = nc;
@@ -1303,6 +1248,7 @@ Expr::Match { scrutinee, arms } => {
                     CgValue::Float(v) => self.builder.build_bit_cast(v, self.i64, "f2i").unwrap().into_int_value(),
                     CgValue::Str(p) => self.builder.build_ptr_to_int(p, self.i64, "p2i").unwrap(),
                 };
+                let then_end = self.builder.get_insert_block().unwrap();
                 self.builder.build_unconditional_branch(merge_bb).unwrap();
 
                 self.builder.position_at_end(else_bb);
@@ -1316,11 +1262,12 @@ Expr::Match { scrutinee, arms } => {
                     CgValue::Float(v) => self.builder.build_bit_cast(v, self.i64, "f2i").unwrap().into_int_value(),
                     CgValue::Str(p) => self.builder.build_ptr_to_int(p, self.i64, "p2i").unwrap(),
                 };
+                let else_end = self.builder.get_insert_block().unwrap();
                 self.builder.build_unconditional_branch(merge_bb).unwrap();
 
                 self.builder.position_at_end(merge_bb);
                 let phi = self.builder.build_phi(self.i64, "if.result").unwrap();
-                phi.add_incoming(&[(&then_int, then_bb), (&else_int, else_bb)]);
+                phi.add_incoming(&[(&then_int, then_end), (&else_int, else_end)]);
                 self.reshape_like(phi.as_basic_value().into_int_value(), Some(&then_val))
             }
             Expr::While { cond, body } => {
@@ -1831,13 +1778,10 @@ Expr::Match { scrutinee, arms } => {
                 if let Some(sn) = self.infer_struct_type(value) {
                     self.var_struct_type.insert(name.clone(), sn);
                 }
-                if let Some(en) = self.infer_enum_type(value) {
-                    self.var_enum_type.insert(name.clone(), en);
-                }
-                if self.is_bool_expr(value) {
-                    self.var_bool.insert(name.clone());
-                } else {
-                    self.var_bool.remove(name);
+                // Record the binding for the checker, so later expressions
+                // that mention it can be typed.
+                if let Some(t) = self.type_of(value) {
+                    self.types.define(name, t);
                 }
                 let v = self.gen_expr(value);
                 let (ptr, ty_name) = match &v {
@@ -2344,9 +2288,11 @@ pub fn compile_to_executable(program: &Program, out_path: &str, src_path: &str, 
                 let entry = context.append_basic_block(func, "entry");
                 cg.builder.position_at_end(entry);
                 cg.named.clear();
-                cg.var_enum_type.clear();
-                cg.var_bool.clear();
                 cg.var_struct_type.clear();
+                // A fresh scope per function: the checker must see this
+                // function's locals, not the previous function's.
+                cg.types.pop_scope();
+                cg.types.push_scope();
 
                 let mut terminated = false;
                 for (i, (pname, pty)) in params.iter().enumerate() {
@@ -2354,10 +2300,9 @@ pub fn compile_to_executable(program: &Program, out_path: &str, src_path: &str, 
                     let arg = func.get_nth_param(i as u32).unwrap().into_int_value();
                     cg.builder.build_store(ptr, arg).unwrap();
                     cg.named.insert(pname.clone(), (ptr, "int".to_string()));
+                    cg.types.define(pname, pty.clone());
                     if let Type::Named(t) = pty {
-                        if cg.is_enum(t) {
-                            cg.var_enum_type.insert(pname.clone(), t.clone());
-                        } else if cg.struct_fields.contains_key(t) {
+                        if cg.struct_fields.contains_key(t) {
                             cg.var_struct_type.insert(pname.clone(), t.clone());
                         }
                     }
@@ -2380,9 +2325,11 @@ pub fn compile_to_executable(program: &Program, out_path: &str, src_path: &str, 
                         let entry = context.append_basic_block(func, "entry");
                         cg.builder.position_at_end(entry);
                         cg.named.clear();
-                cg.var_enum_type.clear();
-                cg.var_bool.clear();
-                cg.var_struct_type.clear();
+                        cg.var_struct_type.clear();
+                        // A fresh scope per function: the checker must see this
+                        // function's locals, not the previous function's.
+                        cg.types.pop_scope();
+                        cg.types.push_scope();
                         let mut terminated = false;
                         for (i, (pname, pty)) in params.iter().enumerate() {
                             let ptr = cg.builder.build_alloca(cg.i64, pname).unwrap();
@@ -2391,17 +2338,15 @@ pub fn compile_to_executable(program: &Program, out_path: &str, src_path: &str, 
                             cg.named.insert(pname.clone(), (ptr, "int".to_string()));
                             // The parser types a `self` parameter as `Self`;
                             // the impl block is what says which type that is.
+                            // The parser types a `self` parameter as `Self`;
+                            // the impl block is what says which type that is.
                             let declared = match pname.as_str() {
-                                "self" | "&self" | "&mut" => Some(type_name.clone()),
-                                _ => match pty {
-                                    Type::Named(t) => Some(t.clone()),
-                                    _ => None,
-                                },
+                                "self" | "&self" | "&mut" => Type::Named(type_name.clone()),
+                                _ => pty.clone(),
                             };
-                            if let Some(t) = declared {
-                                if cg.is_enum(&t) {
-                                    cg.var_enum_type.insert(pname.clone(), t);
-                                } else if cg.struct_fields.contains_key(&t) {
+                            cg.types.define(pname, declared.clone());
+                            if let Type::Named(t) = declared {
+                                if cg.struct_fields.contains_key(&t) {
                                     cg.var_struct_type.insert(pname.clone(), t);
                                 }
                             }
@@ -2431,9 +2376,11 @@ pub fn compile_to_executable(program: &Program, out_path: &str, src_path: &str, 
     let entry = context.append_basic_block(main_fn, "entry");
     cg.builder.position_at_end(entry);
     cg.named.clear();
-                cg.var_enum_type.clear();
-                cg.var_bool.clear();
-                cg.var_struct_type.clear();
+    cg.var_struct_type.clear();
+    // A fresh scope per function: the checker must see this
+    // function's locals, not the previous function's.
+    cg.types.pop_scope();
+    cg.types.push_scope();
 
     if has_user_main {
         let user_main = cg.module.get_function("_zarrin_main").unwrap();

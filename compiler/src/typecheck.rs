@@ -51,7 +51,10 @@ impl std::fmt::Display for TypeError {
     }
 }
 
-struct TypeEnv {
+/// The type checker's view of a program. Exposed so the backends can ask the
+/// same question the checker answers — "what type is this expression?" —
+/// instead of each re-deriving the rules and drifting from them.
+pub struct TypeEnv {
     scopes: Vec<HashMap<String, Type>>,
     functions: HashMap<String, (Vec<Type>, Type)>,
     structs: HashMap<String, Vec<(String, Type)>>,
@@ -78,10 +81,10 @@ impl TypeEnv {
         }
     }
 
-    fn push_scope(&mut self) { self.scopes.push(HashMap::new()); }
-    fn pop_scope(&mut self) { self.scopes.pop(); }
+    pub fn push_scope(&mut self) { self.scopes.push(HashMap::new()); }
+    pub fn pop_scope(&mut self) { self.scopes.pop(); }
 
-    fn define(&mut self, name: &str, ty: Type) {
+    pub fn define(&mut self, name: &str, ty: Type) {
         self.scopes.last_mut().unwrap().insert(name.to_string(), ty);
     }
 
@@ -119,9 +122,11 @@ fn compatible(a: &Type, b: &Type) -> bool {
 pub struct TypeChecker;
 
 impl TypeChecker {
-    pub fn check(program: &Program) -> Result<(), Diagnostic> {
+    /// Declarations only: signatures, structs, traits, externs, macros. No
+    /// statement bodies are walked, so this is what a backend needs before it
+    /// can ask about an expression.
+    pub fn env_for(program: &Program) -> TypeEnv {
         let mut env = TypeEnv::new(program);
-
         for s in &program.stmts {
             match &s.kind {
                 StmtKind::Fn { name, params, ret, .. } => {
@@ -147,6 +152,16 @@ impl TypeChecker {
                 _ => {}
             }
         }
+        for s in &program.stmts {
+            if let StmtKind::Impl { trait_name, type_name, methods } = &s.kind {
+                env.impls.push((trait_name.clone(), type_name.clone(), methods.clone()));
+            }
+        }
+        env
+    }
+
+    pub fn check(program: &Program) -> Result<(), Diagnostic> {
+        let mut env = Self::env_for(program);
 
         for s in &program.stmts {
             if let StmtKind::Impl { trait_name, type_name, methods } = &s.kind {
@@ -173,7 +188,6 @@ impl TypeChecker {
                         }.to_string(), s.span));
                     }
                 }
-                env.impls.push((trait_name.clone(), type_name.clone(), methods.clone()));
             }
         }
 
@@ -268,7 +282,15 @@ impl TypeChecker {
         Ok(())
     }
 
-    fn check_expr(expr: &Expr, env: &mut TypeEnv) -> Result<Type, TypeError> {
+    /// The type of an expression. The backends call this rather than
+    /// re-deriving the rules; on a program that already type-checked it cannot
+    /// fail, so they treat an error as "unknown" and fall back.
+    #[cfg_attr(not(feature = "llvm"), allow(dead_code))]
+    pub fn type_of(expr: &Expr, env: &mut TypeEnv) -> Option<Type> {
+        Self::check_expr(expr, env).ok()
+    }
+
+    pub fn check_expr(expr: &Expr, env: &mut TypeEnv) -> Result<Type, TypeError> {
         match expr {
             Expr::Int(_) => Ok(Type::Int),
             Expr::Float(_) => Ok(Type::Float),

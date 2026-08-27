@@ -53,6 +53,12 @@ Three backends have to agree on the language's semantics — the type checker,
 the interpreter and the LLVM backend. When you change behaviour in one, check
 the other two.
 
+The LLVM backend erases every value to i64, so it has to know an expression's
+type to emit the right code. It asks the type checker: `TypeChecker::type_of`,
+against a `TypeEnv` the backend keeps in step with the locals in scope. Do not
+add a rule that infers a type from the shape of an expression — that is what
+the checker is for, and the two drifted apart every time it was tried.
+
 `every_example_agrees_across_backends` in `llvm_backend.rs` runs every program
 in `examples/` through the interpreter and as a native executable and requires
 identical output and exit status. Most bugs found in the native backend were
