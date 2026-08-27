@@ -256,19 +256,19 @@ impl Interpreter {
     }
 
     fn eval_expr(&mut self, expr: &Expr) -> Value {
-        match expr {
-            Expr::Int(n) => Value::Int(*n),
-            Expr::Float(f) => Value::Float(*f),
-            Expr::Bool(b) => Value::Bool(*b),
-            Expr::Str(s) => Value::Str(s.clone()),
-            Expr::Ident(name) => {
+        match &*expr.kind {
+            ExprKind::Int(n) => Value::Int(*n),
+            ExprKind::Float(f) => Value::Float(*f),
+            ExprKind::Bool(b) => Value::Bool(*b),
+            ExprKind::Str(s) => Value::Str(s.clone()),
+            ExprKind::Ident(name) => {
                 if let Some(v) = self.resolve_variant(name) {
                     return Value::EnumVariant { enum_name: v.enum_name, variant: v.name, args: Vec::new() };
                 }
                 self.lookup(name)
             }
-            Expr::Binary(l, op, r) => { let lv = self.eval_expr(l); let rv = self.eval_expr(r); self.eval_binop(&lv, op, &rv) }
-            Expr::Unary(op, e) => {
+            ExprKind::Binary(l, op, r) => { let lv = self.eval_expr(l); let rv = self.eval_expr(r); self.eval_binop(&lv, op, &rv) }
+            ExprKind::Unary(op, e) => {
                 let v = self.eval_expr(e);
                 match (op, &v) {
                     (UnaryOp::Neg, Value::Int(n)) => Value::Int(-n),
@@ -278,8 +278,8 @@ impl Interpreter {
                     _ => rt_fail!(self, "invalid unary operation {:?} on {:?}", op, v),
                 }
             }
-            Expr::Call(callee, args) => {
-                let name = match callee.as_ref() { Expr::Ident(n) => n, _ => rt_fail!(self, "cannot call non-function") };
+            ExprKind::Call(callee, args) => {
+                let name = match &*callee.kind { ExprKind::Ident(n) => n, _ => rt_fail!(self, "cannot call non-function") };
                 if name == "print" { let v = self.eval_expr(&args[0]); println!("{}", value_to_string(&v)); return Value::Unit; }
                 if name == "len" { let v = self.eval_expr(&args[0]); return match v { Value::Str(s) => Value::Int(s.len() as i64), Value::Array(a) => Value::Int(a.len() as i64), _ => rt_fail!(self, "len expects string or array") }; }
                 if name == "to_string" { let v = self.eval_expr(&args[0]); return Value::Str(value_to_string(&v)); }
@@ -318,7 +318,7 @@ impl Interpreter {
                     self.call_frame(frame, &body)
                 } else { Value::Unit }
             }
-            Expr::MethodCall(obj, method, args) => {
+            ExprKind::MethodCall(obj, method, args) => {
                 let obj_val = self.eval_expr(obj);
                 if method == "unwrap" {
                     match &obj_val {
@@ -379,18 +379,18 @@ impl Interpreter {
                 }
                 rt_fail!(self, "method `{}` not found for `{}`", method, type_name);
             }
-            Expr::FieldAccess(obj, field) => {
+            ExprKind::FieldAccess(obj, field) => {
                 match self.eval_expr(obj) {
                     Value::Struct { fields, .. } => fields.get(field).cloned().unwrap_or_else(|| rt_fail!(self, "field `{}` not found", field)),
                     _ => rt_fail!(self, "cannot access field on non-struct"),
                 }
             }
-            Expr::StructLit { name, fields } => {
+            ExprKind::StructLit { name, fields } => {
                 let mut field_map = HashMap::new();
                 for (fname, fexpr) in fields { field_map.insert(fname.clone(), self.eval_expr(fexpr)); }
                 Value::Struct { name: name.clone(), fields: field_map }
             }
-            Expr::Match { scrutinee, arms } => {
+            ExprKind::Match { scrutinee, arms } => {
                 let sv = self.eval_expr(scrutinee);
                 for (patterns, guard, body) in arms {
                     for pattern in patterns {
@@ -415,7 +415,7 @@ impl Interpreter {
                 }
                 rt_fail!(self, "no matching pattern");
             }
-            Expr::If { cond, then_body, else_body } => {
+            ExprKind::If { cond, then_body, else_body } => {
                 let cv = self.eval_expr(cond);
                 let truthy = match cv { Value::Bool(b) => b, Value::Int(n) => n != 0, Value::Str(s) => !s.is_empty(), Value::Unit => false, _ => true };
                 if truthy {
@@ -426,7 +426,7 @@ impl Interpreter {
                     Value::Unit
                 }
             }
-            Expr::While { cond, body } => {
+            ExprKind::While { cond, body } => {
                 let mut result = Value::Unit;
                 loop {
                     let cv = self.eval_expr(cond);
@@ -456,7 +456,7 @@ impl Interpreter {
                 }
                 result
             }
-            Expr::For { var, iter, body } => {
+            ExprKind::For { var, iter, body } => {
                 let iter_val = self.eval_expr(iter);
                 let mut result = Value::Unit;
                 match iter_val {
@@ -500,7 +500,7 @@ impl Interpreter {
                 }
                 result
             }
-            Expr::Range(a, b) => {
+            ExprKind::Range(a, b) => {
                 let av = self.eval_expr(a);
                 let bv = self.eval_expr(b);
                 match (av, bv) {
@@ -508,11 +508,11 @@ impl Interpreter {
                     _ => rt_fail!(self, "range requires two ints"),
                 }
             }
-            Expr::ArrayLit(elems) => {
+            ExprKind::ArrayLit(elems) => {
                 let vals: Vec<Value> = elems.iter().map(|e| self.eval_expr(e)).collect();
                 Value::Array(vals)
             }
-            Expr::Index(arr, idx) => {
+            ExprKind::Index(arr, idx) => {
                 let arr_val = self.eval_expr(arr);
                 let idx_val = self.eval_expr(idx);
                 match (arr_val, idx_val) {

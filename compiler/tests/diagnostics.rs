@@ -116,21 +116,22 @@ fn type_errors_report_a_position() {
     assert_diagnostic_from(
         "check",
         "fn f(x: int) -> int {\n    return x;\n}\n\nfn main() {\n    let a = 1;\n    let b = f(\"nope\");\n}\n",
+        // the argument, not the statement it sits in
         "type mismatch",
         7,
-        5,
+        15,
     );
 }
 
 #[test]
-fn a_type_error_points_at_the_innermost_statement() {
-    // Not at the enclosing `while`, which is the statement the walk started from.
+fn a_type_error_points_at_the_innermost_expression() {
+    // Not at the enclosing `while`, nor at the `let` — at the name itself.
     assert_diagnostic_from(
         "check",
         "fn main() {\n    let i = 0;\n    while i < 3 {\n        let z = nothing;\n    }\n}\n",
         "undefined variable",
         4,
-        9,
+        17,
     );
 }
 
@@ -140,7 +141,7 @@ fn run_reports_type_errors_with_a_position_too() {
         "fn f(x: int) -> int {\n    return x;\n}\nfn main() {\n    let b = f(\"nope\");\n}\n",
         "type mismatch",
         5,
-        5,
+        15,
     );
 }
 
@@ -206,4 +207,66 @@ fn nul_is_not_offered() {
     // The native backend uses NUL-terminated strings, so an embedded NUL would
     // behave differently there. Better to reject it than to diverge.
     assert_diagnostic("fn main() { print(\"x\\0y\"); }\n", "unknown escape sequence `\\0`", 1, 21);
+}
+
+// --- positions inside an expression -------------------------------------------
+//
+// Positions were recorded per statement, so any error in a long line pointed at
+// its start. Expressions carry their own now.
+
+#[test]
+fn an_error_points_at_the_subexpression_not_the_line() {
+    assert_diagnostic_from(
+        "check",
+        "fn f(x: int) -> int { return x; }\nfn g(x: int) -> int { return x; }\nfn main() {\n    let a = 1;\n    let b = f(a) + g(\"wrong\");\n}\n",
+        "type mismatch",
+        5,
+        22,
+    );
+}
+
+#[test]
+fn a_bad_argument_points_at_the_argument() {
+    // Not at the call: the mismatch is with what was handed over.
+    assert_diagnostic_from(
+        "check",
+        "fn two(a: int, b: int) -> int { return a + b; }\nfn main() { let x = two(1, \"no\"); }\n",
+        "type mismatch",
+        2,
+        28,
+    );
+}
+
+#[test]
+fn a_bad_struct_field_points_at_the_value() {
+    assert_diagnostic_from(
+        "check",
+        "struct P { x: int, y: int }\nfn main() { let p = P { x: 1, y: \"no\" }; }\n",
+        "type mismatch",
+        2,
+        34,
+    );
+}
+
+#[test]
+fn an_undefined_name_deep_in_an_expression() {
+    assert_diagnostic_from(
+        "check",
+        "fn f(x: int) -> int { return x; }\nfn main() {\n    let n = 1;\n    let r = n + n * f(n) + f(nope) - n;\n}\n",
+        "undefined variable: `nope`",
+        4,
+        30,
+    );
+}
+
+#[test]
+fn positions_inside_match_arms_and_array_elements() {
+    assert_diagnostic_from(
+        "check",
+        "fn main() {\n    let n = 1;\n    let v = match n {\n        0 => 1,\n        _ => missing,\n    };\n}\n",
+        "undefined variable: `missing`",
+        5,
+        14,
+    );
+    assert_diagnostic_from("check", "fn main() {\n    let a = [1, 2, oops, 4];\n}\n", "undefined variable: `oops`", 2, 20);
 }

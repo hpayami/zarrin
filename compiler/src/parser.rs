@@ -172,7 +172,7 @@ impl<'a> Parser<'a> {
                     self.advance()?;
                     let val = self.parse_expr()?;
                     self.expect(Token::Semicolon)?;
-                    if let Expr::Ident(name) = e {
+                    if let ExprKind::Ident(name) = *e.kind {
                         StmtKind::Assign { name, value: val }
                     } else {
                         return Err(self.error("expected identifier on left side of assignment"));
@@ -545,6 +545,7 @@ impl<'a> Parser<'a> {
     /// Binding power, loosest to tightest: `||` < `&&` < comparison < `+ -` < `* / %`.
     /// All levels are left-associative, hence the `prec + 1` on the right operand.
     fn parse_binop(&mut self, min_prec: u8) -> Result<Expr, Diagnostic> {
+        let at = self.span;
         let mut left = self.parse_unary()?;
         loop {
             let (prec, op) = match self.current {
@@ -568,38 +569,41 @@ impl<'a> Parser<'a> {
             }
             self.advance()?;
             let right = self.parse_binop(prec + 1)?;
-            left = Expr::Binary(Box::new(left), op, Box::new(right));
+            left = Expr::new(ExprKind::Binary(Box::new(left), op, Box::new(right)), at);
         }
         Ok(left)
     }
 
     fn parse_range(&mut self) -> Result<Expr, Diagnostic> {
+        let at = self.span;
         let mut left = self.parse_binop(0)?;
         if self.current == Token::DotDot {
             self.advance()?;
             let right = self.parse_binop(0)?;
-            left = Expr::Range(Box::new(left), Box::new(right));
+            left = Expr::new(ExprKind::Range(Box::new(left), Box::new(right)), at);
         }
         Ok(left)
     }
 
     fn parse_unary(&mut self) -> Result<Expr, Diagnostic> {
+        let at = self.span;
         Ok(match self.current {
             Token::Minus => {
                 self.advance()?;
                 let expr = self.parse_unary()?;
-                Expr::Unary(UnaryOp::Neg, Box::new(expr))
+                Expr::new(ExprKind::Unary(UnaryOp::Neg, Box::new(expr)), at)
             }
             Token::Bang => {
                 self.advance()?;
                 let expr = self.parse_unary()?;
-                Expr::Unary(UnaryOp::Not, Box::new(expr))
+                Expr::new(ExprKind::Unary(UnaryOp::Not, Box::new(expr)), at)
             }
             _ => self.parse_postfix()?,
         })
     }
 
     fn parse_postfix(&mut self) -> Result<Expr, Diagnostic> {
+        let at = self.span;
         let mut expr = self.parse_primary()?;
         loop {
             match self.current {
@@ -619,16 +623,16 @@ impl<'a> Parser<'a> {
                             }
                         }
                         self.expect(Token::RParen)?;
-                        expr = Expr::MethodCall(Box::new(expr), field, args);
+                        expr = Expr::new(ExprKind::MethodCall(Box::new(expr), field, args), at);
                     } else {
-                        expr = Expr::FieldAccess(Box::new(expr), field);
+                        expr = Expr::new(ExprKind::FieldAccess(Box::new(expr), field), at);
                     }
                 }
                 Token::LBrack => {
                     self.advance()?;
                     let index = self.parse_expr()?;
                     self.expect(Token::RBrack)?;
-                    expr = Expr::Index(Box::new(expr), Box::new(index));
+                    expr = Expr::new(ExprKind::Index(Box::new(expr), Box::new(index)), at);
                 }
                 _ => break,
             }
@@ -637,11 +641,12 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_primary(&mut self) -> Result<Expr, Diagnostic> {
+        let at = self.span;
         Ok(match self.current.clone() {
-            Token::Int(n) => { self.advance()?; Expr::Int(n) }
-            Token::Float(f) => { self.advance()?; Expr::Float(f) }
-            Token::Bool(b) => { self.advance()?; Expr::Bool(b) }
-            Token::Str(s) => { self.advance()?; Expr::Str(s) }
+            Token::Int(n) => { self.advance()?; Expr::new(ExprKind::Int(n), at) }
+            Token::Float(f) => { self.advance()?; Expr::new(ExprKind::Float(f), at) }
+            Token::Bool(b) => { self.advance()?; Expr::new(ExprKind::Bool(b), at) }
+            Token::Str(s) => { self.advance()?; Expr::new(ExprKind::Str(s), at) }
             Token::InterpStr(s) => {
                 let span = self.span;
                 self.advance()?;
@@ -668,9 +673,9 @@ impl<'a> Parser<'a> {
                         }
                     }
                     self.expect(Token::RParen)?;
-                    return Ok(Expr::Call(Box::new(Expr::Ident(name)), args));
+                    return Ok(Expr::new(ExprKind::Call(Box::new(Expr::new(ExprKind::Ident(name), at)), args), at));
                 }
-                Expr::Ident(name)
+                Expr::new(ExprKind::Ident(name), at)
             }
             Token::LParen => {
                 self.advance()?;
@@ -688,7 +693,7 @@ impl<'a> Parser<'a> {
                     }
                 }
                 self.expect(Token::RBrack)?;
-                Expr::ArrayLit(elems)
+                Expr::new(ExprKind::ArrayLit(elems), at)
             }
             Token::LBrace => {
                 self.advance()?;
@@ -700,10 +705,10 @@ impl<'a> Parser<'a> {
                 if let Some(last) = stmts.pop() {
                     match last.kind {
                         StmtKind::Expr(e) | StmtKind::Return(Some(e)) => e,
-                        _ => Expr::Bool(false),
+                        _ => Expr::new(ExprKind::Bool(false), at),
                     }
                 } else {
-                    Expr::Bool(false)
+                    Expr::new(ExprKind::Bool(false), at)
                 }
             }
             t => return Err(self.error_at_prev(format!("unexpected token in expression: {}", describe(&t)))),
@@ -711,6 +716,7 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_interp_string(&self, content: String, span: Span) -> Result<Expr, Diagnostic> {
+        let at = self.span;
         let mut parts: Vec<Expr> = Vec::new();
         let mut current_str = String::new();
         let mut chars = content.chars().peekable();
@@ -718,7 +724,7 @@ impl<'a> Parser<'a> {
             if ch == '{' {
                 chars.next();
                 if !current_str.is_empty() {
-                    parts.push(Expr::Str(current_str.clone()));
+                    parts.push(Expr::new(ExprKind::Str(current_str.clone()), at));
                     current_str.clear();
                 }
                 let mut depth = 1u32;
@@ -741,7 +747,7 @@ impl<'a> Parser<'a> {
                 let expr = sub_parser.parse_expr()
                     .map_err(|e| Diagnostic::new(
                         format!("in interpolated expression `{}`: {}", expr_str.trim(), e.message), span))?;
-                parts.push(Expr::Call(Box::new(Expr::Ident("to_string".to_string())), vec![expr]));
+                parts.push(Expr::new(ExprKind::Call(Box::new(Expr::new(ExprKind::Ident("to_string".to_string()), at)), vec![expr]), at));
             } else if ch == '\\' {
                 // `\{` and `\}` survive lexing intact so that this scan can
                 // tell an escaped brace from the start of an interpolation.
@@ -756,26 +762,27 @@ impl<'a> Parser<'a> {
             }
         }
         if !current_str.is_empty() {
-            parts.push(Expr::Str(current_str));
+            parts.push(Expr::new(ExprKind::Str(current_str), at));
         }
         Ok(if parts.is_empty() {
-            Expr::Str(String::new())
+            Expr::new(ExprKind::Str(String::new()), at)
         } else if parts.len() == 1 {
             parts.remove(0)
         } else {
             let mut result = parts.remove(0);
             for part in parts {
-                result = Expr::Binary(
+                result = Expr::new(ExprKind::Binary(
                     Box::new(result),
                     BinOp::Add,
                     Box::new(part),
-                );
+                ), at);
             }
             result
         })
     }
 
     fn parse_struct_lit(&mut self, name: String) -> Result<Expr, Diagnostic> {
+        let at = self.span;
         self.advance()?;
         let mut fields = Vec::new();
         while self.current != Token::RBrace {
@@ -791,10 +798,11 @@ impl<'a> Parser<'a> {
             }
         }
         self.expect(Token::RBrace)?;
-        Ok(Expr::StructLit { name, fields })
+        Ok(Expr::new(ExprKind::StructLit { name, fields }, at))
     }
 
     fn parse_match(&mut self) -> Result<Expr, Diagnostic> {
+        let at = self.span;
         self.advance()?;
         let scrutinee = self.parse_expr()?;
         self.expect(Token::LBrace)?;
@@ -819,10 +827,11 @@ impl<'a> Parser<'a> {
             }
         }
         self.expect(Token::RBrace)?;
-        Ok(Expr::Match { scrutinee: Box::new(scrutinee), arms })
+        Ok(Expr::new(ExprKind::Match { scrutinee: Box::new(scrutinee), arms }, at))
     }
 
     fn parse_if_expr(&mut self) -> Result<Expr, Diagnostic> {
+        let at = self.span;
         self.advance()?; // if
         let cond = self.parse_expr()?;
         self.expect(Token::LBrace)?;
@@ -835,10 +844,10 @@ impl<'a> Parser<'a> {
             match &stmts[0].kind {
                 StmtKind::Expr(e) => e.clone(),
                 StmtKind::Return(Some(e)) => e.clone(),
-                _ => Expr::Int(0),
+                _ => Expr::new(ExprKind::Int(0), at),
             }
         } else {
-            Expr::Int(0)
+            Expr::new(ExprKind::Int(0), at)
         };
         let else_body = if self.current == Token::Else {
             self.advance()?;
@@ -855,19 +864,20 @@ impl<'a> Parser<'a> {
                     match &estmts[0].kind {
                         StmtKind::Expr(e) => e.clone(),
                         StmtKind::Return(Some(e)) => e.clone(),
-                        _ => Expr::Int(0),
+                        _ => Expr::new(ExprKind::Int(0), at),
                     }
                 } else {
-                    Expr::Int(0)
+                    Expr::new(ExprKind::Int(0), at)
                 }))
             }
         } else {
             None
         };
-        Ok(Expr::If { cond: Box::new(cond), then_body: Box::new(then_body), else_body })
+        Ok(Expr::new(ExprKind::If { cond: Box::new(cond), then_body: Box::new(then_body), else_body }, at))
     }
 
     fn parse_while_expr(&mut self) -> Result<Expr, Diagnostic> {
+        let at = self.span;
         self.advance()?; // while
         let cond = self.parse_expr()?;
         self.expect(Token::LBrace)?;
@@ -876,10 +886,11 @@ impl<'a> Parser<'a> {
             body.push(self.parse_stmt()?);
         }
         self.expect(Token::RBrace)?;
-        Ok(Expr::While { cond: Box::new(cond), body })
+        Ok(Expr::new(ExprKind::While { cond: Box::new(cond), body }, at))
     }
 
     fn parse_for_expr(&mut self) -> Result<Expr, Diagnostic> {
+        let at = self.span;
         self.advance()?; // for
         let var = match self.advance()? {
             Token::Ident(n) => n,
@@ -893,14 +904,15 @@ impl<'a> Parser<'a> {
             body.push(self.parse_stmt()?);
         }
         self.expect(Token::RBrace)?;
-        Ok(Expr::For { var, iter: Box::new(iter), body })
+        Ok(Expr::new(ExprKind::For { var, iter: Box::new(iter), body }, at))
     }
 
     fn parse_pattern(&mut self) -> Result<Pattern, Diagnostic> {
+        let at = self.span;
         Ok(match self.current.clone() {
-            Token::Int(n) => { self.advance()?; Pattern::Literal(Expr::Int(n)) }
-            Token::Str(s) => { self.advance()?; Pattern::Literal(Expr::Str(s)) }
-            Token::Bool(b) => { self.advance()?; Pattern::Literal(Expr::Bool(b)) }
+            Token::Int(n) => { self.advance()?; Pattern::Literal(Expr::new(ExprKind::Int(n), at)) }
+            Token::Str(s) => { self.advance()?; Pattern::Literal(Expr::new(ExprKind::Str(s), at)) }
+            Token::Bool(b) => { self.advance()?; Pattern::Literal(Expr::new(ExprKind::Bool(b), at)) }
             Token::Ident(name) => {
                 self.advance()?;
                 if name == "_" {

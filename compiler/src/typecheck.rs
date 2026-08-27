@@ -302,13 +302,23 @@ impl TypeChecker {
         Self::check_expr(expr, env).ok()
     }
 
+    /// Now that expressions carry positions, an error picks up the one of the
+    /// subexpression that raised it rather than the whole statement's.
     pub fn check_expr(expr: &Expr, env: &mut TypeEnv) -> Result<Type, TypeError> {
-        match expr {
-            Expr::Int(_) => Ok(Type::Int),
-            Expr::Float(_) => Ok(Type::Float),
-            Expr::Bool(_) => Ok(Type::Bool),
-            Expr::Str(_) => Ok(Type::String),
-            Expr::Ident(name) => {
+        Self::check_expr_inner(expr, env).map_err(|e| match e {
+            // Something further in already said where it was.
+            TypeError::Located(d) => TypeError::Located(d),
+            other => TypeError::Located(Box::new(Diagnostic::new(other.to_string(), expr.span))),
+        })
+    }
+
+    fn check_expr_inner(expr: &Expr, env: &mut TypeEnv) -> Result<Type, TypeError> {
+        match &*expr.kind {
+            ExprKind::Int(_) => Ok(Type::Int),
+            ExprKind::Float(_) => Ok(Type::Float),
+            ExprKind::Bool(_) => Ok(Type::Bool),
+            ExprKind::Str(_) => Ok(Type::String),
+            ExprKind::Ident(name) => {
                 match env.variants.lookup(name) {
                     Lookup::Unique(v) => return Ok(Type::Named(v.enum_name)),
                     Lookup::Ambiguous(candidates) => {
@@ -318,7 +328,7 @@ impl TypeChecker {
                 }
                 env.lookup(name).ok_or_else(|| TypeError::UndefinedVariable(name.clone()))
             }
-            Expr::Binary(l, op, r) => {
+            ExprKind::Binary(l, op, r) => {
                 let lt = Self::check_expr(l, env)?;
                 let rt = Self::check_expr(r, env)?;
                 if !compatible(&lt, &rt) { return Err(TypeError::TypeMismatch { expected: format!("{:?}", lt), found: format!("{:?}", rt) }); }
@@ -328,7 +338,7 @@ impl TypeChecker {
                     BinOp::And | BinOp::Or => Ok(Type::Bool),
                 }
             }
-            Expr::Unary(op, e) => {
+            ExprKind::Unary(op, e) => {
                 let et = Self::check_expr(e, env)?;
                 match op {
                     UnaryOp::Neg => {
@@ -345,9 +355,9 @@ impl TypeChecker {
                     }
                 }
             }
-            Expr::Call(callee, args) => {
-                let func_name = match callee.as_ref() {
-                    Expr::Ident(n) => n,
+            ExprKind::Call(callee, args) => {
+                let func_name = match &*callee.kind {
+                    ExprKind::Ident(n) => n,
                     _ => return Err(TypeError::NotAFunction("non-identifier call".into())),
                 };
                 if let Some((arity, ret)) = builtins::signature(func_name) {
@@ -382,13 +392,13 @@ impl TypeChecker {
                     if param_tys.len() != args.len() { return Err(TypeError::WrongArity { name: func_name.clone(), expected: param_tys.len(), found: args.len() }); }
                     for (arg, expected) in args.iter().zip(param_tys.iter()) {
                         let arg_ty = Self::check_expr(arg, env)?;
-                        if !compatible(&arg_ty, expected) { return Err(TypeError::TypeMismatch { expected: format!("{:?}", expected), found: format!("{:?}", arg_ty) }); }
+                        if !compatible(&arg_ty, expected) { return Err(Self::mismatch_at(expected, &arg_ty, arg)); }
                     }
                     return Ok(ret_ty);
                 }
                 Err(TypeError::UndefinedFunction(func_name.clone()))
             }
-            Expr::MethodCall(obj, method, args) => {
+            ExprKind::MethodCall(obj, method, args) => {
                 let obj_ty = Self::check_expr(obj, env)?;
                 let type_name = match &obj_ty {
                     Type::Named(n) => n.clone(),
@@ -407,13 +417,13 @@ impl TypeChecker {
                     if expected_args != args.len() { return Err(TypeError::WrongArity { name: method.clone(), expected: expected_args, found: args.len() }); }
                     for (arg, (_, pty)) in args.iter().zip(params[self_count..].iter()) {
                         let arg_ty = Self::check_expr(arg, env)?;
-                        if !compatible(&arg_ty, pty) { return Err(TypeError::TypeMismatch { expected: format!("{:?}", pty), found: format!("{:?}", arg_ty) }); }
+                        if !compatible(&arg_ty, pty) { return Err(Self::mismatch_at(pty, &arg_ty, arg)); }
                     }
                     return Ok(ret);
                 }
                 Err(TypeError::UnknownField { ty: type_name, field: method.clone() })
             }
-            Expr::FieldAccess(obj, field) => {
+            ExprKind::FieldAccess(obj, field) => {
                 let obj_ty = Self::check_expr(obj, env)?;
                 match &obj_ty {
                     Type::Named(name) => {
@@ -428,17 +438,17 @@ impl TypeChecker {
                     _ => Err(TypeError::UnknownField { ty: format!("{:?}", obj_ty), field: field.clone() }),
                 }
             }
-            Expr::StructLit { name, fields } => {
+            ExprKind::StructLit { name, fields } => {
                 let sdef = env.structs.get(name).cloned()
                     .ok_or_else(|| TypeError::UndefinedType(name.clone()))?;
                 if sdef.len() != fields.len() { return Err(TypeError::WrongArity { name: name.clone(), expected: sdef.len(), found: fields.len() }); }
                 for ((_, fty), (_, expr)) in sdef.iter().zip(fields.iter()) {
                     let expr_ty = Self::check_expr(expr, env)?;
-                    if !compatible(fty, &expr_ty) { return Err(TypeError::TypeMismatch { expected: format!("{:?}", fty), found: format!("{:?}", expr_ty) }); }
+                    if !compatible(fty, &expr_ty) { return Err(Self::mismatch_at(fty, &expr_ty, expr)); }
                 }
                 Ok(Type::Named(name.clone()))
             }
-            Expr::Match { scrutinee, arms } => {
+            ExprKind::Match { scrutinee, arms } => {
                 let scrutinee_ty = Self::check_expr(scrutinee, env)?;
                 Self::check_exhaustive(&scrutinee_ty, arms, env)?;
                 let mut result_ty = None;
@@ -460,7 +470,7 @@ impl TypeChecker {
                 }
                 Ok(result_ty.unwrap_or(Type::Unit))
             }
-            Expr::If { cond, then_body, else_body } => {
+            ExprKind::If { cond, then_body, else_body } => {
                 Self::check_expr(cond, env)?;
                 let then_ty = Self::check_expr(then_body, env)?;
                 if let Some(eb) = else_body {
@@ -471,14 +481,14 @@ impl TypeChecker {
                     Ok(Type::Unit)
                 }
             }
-            Expr::While { cond, body } => {
+            ExprKind::While { cond, body } => {
                 Self::check_expr(cond, env)?;
                 env.push_scope();
                 for s in body { Self::check_stmt(s, env)?; }
                 env.pop_scope();
                 Ok(Type::Int)
             }
-            Expr::For { var, iter, body } => {
+            ExprKind::For { var, iter, body } => {
                 Self::check_expr(iter, env)?;
                 env.push_scope();
                 env.define(var, Type::Int);
@@ -486,7 +496,7 @@ impl TypeChecker {
                 env.pop_scope();
                 Ok(Type::Int)
             }
-            Expr::Range(a, b) => {
+            ExprKind::Range(a, b) => {
                 let at = Self::check_expr(a, env)?;
                 let bt = Self::check_expr(b, env)?;
                 if at != Type::Int || bt != Type::Int {
@@ -494,7 +504,7 @@ impl TypeChecker {
                 }
                 Ok(Type::Int)
             }
-            Expr::ArrayLit(elems) => {
+            ExprKind::ArrayLit(elems) => {
                 if elems.is_empty() {
                     Ok(Type::Array(Box::new(Type::Inferred)))
                 } else {
@@ -506,7 +516,7 @@ impl TypeChecker {
                     Ok(Type::Array(Box::new(elem_ty)))
                 }
             }
-            Expr::Index(arr, idx) => {
+            ExprKind::Index(arr, idx) => {
                 let arr_ty = Self::check_expr(arr, env)?;
                 let idx_ty = Self::check_expr(idx, env)?;
                 if idx_ty != Type::Int { return Err(TypeError::TypeMismatch { expected: "int".into(), found: format!("{:?}", idx_ty) }); }
@@ -552,8 +562,10 @@ impl TypeChecker {
                 let mut seen = [false, false];
                 for pats in &unguarded {
                     for p in pats.iter() {
-                        if let Pattern::Literal(Expr::Bool(b)) = p {
-                            seen[*b as usize] = true;
+                        if let Pattern::Literal(lit) = p {
+                            if let ExprKind::Bool(b) = &*lit.kind {
+                                seen[*b as usize] = true;
+                            }
                         }
                     }
                 }
@@ -598,6 +610,19 @@ impl TypeChecker {
             }
             other => Err(TypeError::NonExhaustiveMatch { ty: name(other), missing: Vec::new() }),
         }
+    }
+
+    /// A mismatch found by comparing against a declaration belongs to the
+    /// value that was supplied, not to the call or literal around it.
+    fn mismatch_at(expected: &Type, found: &Type, at: &Expr) -> TypeError {
+        TypeError::Located(Box::new(Diagnostic::new(
+            TypeError::TypeMismatch {
+                expected: format!("{:?}", expected),
+                found: format!("{:?}", found),
+            }
+            .to_string(),
+            at.span,
+        )))
     }
 
     fn check_pattern(pattern: &Pattern, expected_ty: &Type, env: &mut TypeEnv) -> Result<(), TypeError> {

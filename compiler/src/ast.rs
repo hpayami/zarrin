@@ -49,8 +49,22 @@ pub enum Pattern {
     },
 }
 
+/// An expression and where it came from. Errors used to be reported against
+/// the whole statement; with this they can name the subexpression at fault.
 #[derive(Debug, Clone, PartialEq)]
-pub enum Expr {
+pub struct Expr {
+    pub kind: Box<ExprKind>,
+    pub span: Span,
+}
+
+impl Expr {
+    pub fn new(kind: ExprKind, span: Span) -> Self {
+        Expr { kind: Box::new(kind), span }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum ExprKind {
     Int(i64),
     Float(f64),
     Bool(bool),

@@ -27,9 +27,10 @@ a `_` arm. An arm carrying a guard covers nothing, since the guard can turn it
 down.
 
 Errors — syntax, type, and run time — are reported against the source with a
-line, a column and the offending line quoted. Positions are recorded per
-statement, so a type or run-time error points at the statement it happened in
-rather than the exact subexpression.
+line, a column and the offending line quoted. A type error points at the
+subexpression that caused it, down to the individual argument. Run-time
+failures are reported against the statement, which is as far as the value being
+blamed can be traced.
 
 String literals take `\n`, `\t`, `\r`, `\"`, `\\`, and `\{` / `\}` for a
 literal brace — an unescaped `{` starts an interpolation. There is no `\0`: the

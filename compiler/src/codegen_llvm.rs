@@ -264,10 +264,10 @@ impl<'ctx> Codegen<'ctx> {
     /// holds? A fresh allocation does; naming something that already exists
     /// does not, and has to be retained before a second owner records it.
     fn produces_owned(&mut self, e: &Expr) -> bool {
-        match e {
-            Expr::Ident(_) | Expr::FieldAccess(..) | Expr::Index(..) => false,
-            Expr::If { then_body, .. } => self.produces_owned(then_body),
-            Expr::Match { arms, .. } => arms.first().map(|(_, _, b)| b.clone()).map(|b| self.produces_owned(&b)).unwrap_or(true),
+        match &*e.kind {
+            ExprKind::Ident(_) | ExprKind::FieldAccess(..) | ExprKind::Index(..) => false,
+            ExprKind::If { then_body, .. } => self.produces_owned(then_body),
+            ExprKind::Match { arms, .. } => arms.first().map(|(_, _, b)| b.clone()).map(|b| self.produces_owned(&b)).unwrap_or(true),
             _ => true,
         }
     }
@@ -814,15 +814,15 @@ impl<'ctx> Codegen<'ctx> {
 
 
     fn gen_expr(&mut self, e: &Expr) -> CgValue<'ctx> {
-        match e {
-            Expr::Int(n) => CgValue::Int(self.i64.const_int(*n as u64, false)),
-            Expr::Float(f) => CgValue::Float(self.f64.const_float(*f)),
-            Expr::Bool(b) => {
+        match &*e.kind {
+            ExprKind::Int(n) => CgValue::Int(self.i64.const_int(*n as u64, false)),
+            ExprKind::Float(f) => CgValue::Float(self.f64.const_float(*f)),
+            ExprKind::Bool(b) => {
                 let bool_val = self.i1.const_int(*b as u64, false);
                 CgValue::Int(self.builder.build_int_z_extend(bool_val, self.i64, "bool_ext").unwrap())
             }
-            Expr::Str(s) => CgValue::Str(self.string_global(s)),
-            Expr::Ident(name) => {
+            ExprKind::Str(s) => CgValue::Str(self.string_global(s)),
+            ExprKind::Ident(name) => {
                 if let Some(v) = self.load_local(name) {
                     v
                 } else if let Some(variant) = self.resolve_variant(name) {
@@ -843,7 +843,7 @@ impl<'ctx> Codegen<'ctx> {
                     panic!("undefined var: {}", name)
                 }
             }
-            Expr::Binary(l, op, r) => {
+            ExprKind::Binary(l, op, r) => {
                 let lv = self.gen_expr(l);
                 let rv = self.gen_expr(r);
                 if matches!(op, BinOp::Add) {
@@ -930,7 +930,7 @@ impl<'ctx> Codegen<'ctx> {
                     }
                 }
             }
-            Expr::Unary(op, e) => {
+            ExprKind::Unary(op, e) => {
                 let v = self.gen_expr(e);
                 match op {
                     UnaryOp::Neg => match v {
@@ -948,9 +948,9 @@ impl<'ctx> Codegen<'ctx> {
                     },
                 }
             }
-            Expr::Call(callee, args) => {
-                let name = match callee.as_ref() {
-                    Expr::Ident(n) => n,
+            ExprKind::Call(callee, args) => {
+                let name = match &*callee.kind {
+                    ExprKind::Ident(n) => n,
                     _ => panic!("cannot call non-function"),
                 };
                 if name == "print" {
@@ -1390,7 +1390,7 @@ impl<'ctx> Codegen<'ctx> {
                     Either::Right(_) => CgValue::Int(self.i64.const_int(0, false)),
                 }
             }
-            Expr::StructLit { name, fields } => {
+            ExprKind::StructLit { name, fields } => {
                 let field_defs = self.struct_fields.get(name).cloned()
                     .unwrap_or_else(|| panic!("unknown struct: {}", name));
                 let field_defs: Vec<String> = field_defs.into_iter().map(|(n, _)| n).collect();
@@ -1420,7 +1420,7 @@ impl<'ctx> Codegen<'ctx> {
                 }
                 CgValue::Int(self.builder.build_ptr_to_int(base_ptr, self.i64, "struct_ptr").unwrap())
             }
-            Expr::FieldAccess(obj, field) => {
+            ExprKind::FieldAccess(obj, field) => {
                 let obj_val = self.gen_expr(obj);
                 let obj_ptr_val = match obj_val {
                     CgValue::Int(v) => v,
@@ -1445,7 +1445,7 @@ impl<'ctx> Codegen<'ctx> {
                 // pattern and a string field its address.
                 self.typed_value(raw, &field_ty)
             }
-            Expr::MethodCall(obj, method, args) => {
+            ExprKind::MethodCall(obj, method, args) => {
                 let obj_val = self.gen_expr(obj);
                 if method == "unwrap" || method == "is_some" || method == "is_none" || method == "is_ok" || method == "is_err" {
                     let obj_int = self.value_to_int(&obj_val);
@@ -1514,7 +1514,7 @@ impl<'ctx> Codegen<'ctx> {
                     Either::Right(_) => CgValue::Int(self.i64.const_int(0, false)),
                 }
             }
-Expr::Match { scrutinee, arms } => {
+ExprKind::Match { scrutinee, arms } => {
                 let sv = self.gen_expr(scrutinee);
                 let parent = self.builder.get_insert_block().unwrap().get_parent().unwrap();
                 let merge = self.context.append_basic_block(parent, "match_merge");
@@ -1525,11 +1525,11 @@ Expr::Match { scrutinee, arms } => {
                 // anywhere made `match` on an integer dereference it.
                 let has_data_variants = match self.infer_enum_type(scrutinee) {
                     Some(en) => self.variants_of(&en).iter().any(|(_, pt)| !pt.is_empty()),
-                    None => match scrutinee.as_ref() {
+                    None => match &*scrutinee.kind {
                         // A local or parameter that is not a known enum, or a
                         // plain arithmetic value, is its own tag.
-                        Expr::Ident(n) if self.named.contains_key(n) => false,
-                        Expr::Int(_) | Expr::Binary(..) => false,
+                        ExprKind::Ident(n) if self.named.contains_key(n) => false,
+                        ExprKind::Int(_) | ExprKind::Binary(..) => false,
                         _ => self.enum_variants.values().flat_map(|v| v.iter()).any(|(_, pt)| !pt.is_empty()),
                     },
                 };
@@ -1693,7 +1693,7 @@ Expr::Match { scrutinee, arms } => {
                 }
                 self.reshape_like(phi.as_basic_value().into_int_value(), arm_shape.as_ref())
             }
-            Expr::If { cond, then_body, else_body } => {
+            ExprKind::If { cond, then_body, else_body } => {
                 let cond_val = self.gen_expr(cond);
                 let cond_bool = self.to_i1(&cond_val);
 
@@ -1733,7 +1733,7 @@ Expr::Match { scrutinee, arms } => {
                 phi.add_incoming(&[(&then_int, then_end), (&else_int, else_end)]);
                 self.reshape_like(phi.as_basic_value().into_int_value(), Some(&then_val))
             }
-            Expr::While { cond, body } => {
+            ExprKind::While { cond, body } => {
                 let fn_val = self.builder.get_insert_block().unwrap().get_parent().unwrap();
                 let loop_bb = self.context.append_basic_block(fn_val, "while_expr");
                 let body_bb = self.context.append_basic_block(fn_val, "while_expr_body");
@@ -1770,7 +1770,7 @@ Expr::Match { scrutinee, arms } => {
                 let result = self.builder.build_load(self.i64, result_ptr, "while_result").unwrap().into_int_value();
                 CgValue::Int(result)
             }
-            Expr::For { var, iter, body } => {
+            ExprKind::For { var, iter, body } => {
                 let fn_val = self.builder.get_insert_block().unwrap().get_parent().unwrap();
                 let iter_val = self.gen_expr(iter);
                 let iter_int = self.value_to_int(&iter_val);
@@ -1837,10 +1837,10 @@ Expr::Match { scrutinee, arms } => {
                 let result = self.builder.build_load(self.i64, result_ptr, "for_result").unwrap().into_int_value();
                 CgValue::Int(result)
             }
-            Expr::Range(_, _) => {
+            ExprKind::Range(_, _) => {
                 CgValue::Int(self.i64.const_int(0, false))
             }
-            Expr::ArrayLit(elems) => {
+            ExprKind::ArrayLit(elems) => {
                 let len = elems.len() as u64;
                 // Layout is [len, elem0, ..]. This asked malloc for `len + 1`
                 // *bytes* and then wrote that many 64-bit words into it.
@@ -1862,7 +1862,7 @@ Expr::Match { scrutinee, arms } => {
                 }
                 CgValue::Int(buf_i64)
             }
-            Expr::Index(arr, idx) => {
+            ExprKind::Index(arr, idx) => {
                 let arr_val = self.gen_expr(arr);
                 let arr_ptr_val = self.value_to_int(&arr_val);
                 let arr_ptr = self.builder.build_int_to_ptr(arr_ptr_val, self.context.ptr_type(AddressSpace::default()), "arr_ptr").unwrap();
@@ -2497,7 +2497,7 @@ Expr::Match { scrutinee, arms } => {
                 }
             }
             StmtKind::For { var, iter, body } => {
-                if let Expr::Range(start_expr, end_expr) = iter {
+                if let ExprKind::Range(start_expr, end_expr) = &*iter.kind {
                     let start_val = self.gen_expr(start_expr);
                     let end_val = self.gen_expr(end_expr);
                     let end_int = match end_val { CgValue::Int(v) => v, _ => panic!("for range end must be int") };
@@ -2553,8 +2553,8 @@ Expr::Match { scrutinee, arms } => {
 }
 
 fn expand_macros_in_expr(expr: &Expr, macros: &HashMap<String, (Vec<String>, Vec<Stmt>)>) -> Expr {
-    if let Expr::Call(callee, args) = expr {
-        if let Expr::Ident(name) = callee.as_ref() {
+    if let ExprKind::Call(callee, args) = &*expr.kind {
+        if let ExprKind::Ident(name) = &*callee.kind {
             if let Some((params, body)) = macros.get(name) {
                 let mut arg_map: HashMap<String, Expr> = HashMap::new();
                 for (i, p) in params.iter().enumerate() {
@@ -2572,76 +2572,76 @@ fn expand_macros_in_expr(expr: &Expr, macros: &HashMap<String, (Vec<String>, Vec
             }
         }
     }
-    match expr {
-        Expr::Binary(l, op, r) => Expr::Binary(Box::new(expand_macros_in_expr(l, macros)), op.clone(), Box::new(expand_macros_in_expr(r, macros))),
-        Expr::Unary(op, e) => Expr::Unary(op.clone(), Box::new(expand_macros_in_expr(e, macros))),
-        Expr::Call(callee, args) => Expr::Call(Box::new(expand_macros_in_expr(callee, macros)), args.iter().map(|a| expand_macros_in_expr(a, macros)).collect()),
-        Expr::If { cond, then_body, else_body } => Expr::If {
+    match &*expr.kind {
+        ExprKind::Binary(l, op, r) => Expr::new(ExprKind::Binary(Box::new(expand_macros_in_expr(l, macros)), op.clone(), Box::new(expand_macros_in_expr(r, macros))), expr.span),
+        ExprKind::Unary(op, e) => Expr::new(ExprKind::Unary(op.clone(), Box::new(expand_macros_in_expr(e, macros))), expr.span),
+        ExprKind::Call(callee, args) => Expr::new(ExprKind::Call(Box::new(expand_macros_in_expr(callee, macros)), args.iter().map(|a| expand_macros_in_expr(a, macros)).collect()), expr.span),
+        ExprKind::If { cond, then_body, else_body } => Expr::new(ExprKind::If {
             cond: Box::new(expand_macros_in_expr(cond, macros)),
             then_body: Box::new(expand_macros_in_expr(then_body, macros)),
             else_body: else_body.as_ref().map(|e| Box::new(expand_macros_in_expr(e, macros))),
-        },
-        Expr::FieldAccess(obj, field) => Expr::FieldAccess(Box::new(expand_macros_in_expr(obj, macros)), field.clone()),
-        Expr::MethodCall(obj, method, args) => Expr::MethodCall(Box::new(expand_macros_in_expr(obj, macros)), method.clone(), args.iter().map(|a| expand_macros_in_expr(a, macros)).collect()),
-        Expr::Index(arr, idx) => Expr::Index(Box::new(expand_macros_in_expr(arr, macros)), Box::new(expand_macros_in_expr(idx, macros))),
-        Expr::StructLit { name, fields } => Expr::StructLit { name: name.clone(), fields: fields.iter().map(|(n, e)| (n.clone(), expand_macros_in_expr(e, macros))).collect() },
-        Expr::Match { scrutinee, arms } => Expr::Match { scrutinee: Box::new(expand_macros_in_expr(scrutinee, macros)), arms: arms.iter().map(|(pats, guard, e)| (pats.clone(), guard.as_ref().map(|g| expand_macros_in_expr(g, macros)), expand_macros_in_expr(e, macros))).collect() },
-        Expr::While { cond, body } => Expr::While { cond: Box::new(expand_macros_in_expr(cond, macros)), body: body.iter().flat_map(|s| expand_macros_in_stmt(s, macros)).collect() },
-        Expr::For { var, iter, body } => Expr::For { var: var.clone(), iter: Box::new(expand_macros_in_expr(iter, macros)), body: body.iter().flat_map(|s| expand_macros_in_stmt(s, macros)).collect() },
+        }, expr.span),
+        ExprKind::FieldAccess(obj, field) => Expr::new(ExprKind::FieldAccess(Box::new(expand_macros_in_expr(obj, macros)), field.clone()), expr.span),
+        ExprKind::MethodCall(obj, method, args) => Expr::new(ExprKind::MethodCall(Box::new(expand_macros_in_expr(obj, macros)), method.clone(), args.iter().map(|a| expand_macros_in_expr(a, macros)).collect()), expr.span),
+        ExprKind::Index(arr, idx) => Expr::new(ExprKind::Index(Box::new(expand_macros_in_expr(arr, macros)), Box::new(expand_macros_in_expr(idx, macros))), expr.span),
+        ExprKind::StructLit { name, fields } => Expr::new(ExprKind::StructLit { name: name.clone(), fields: fields.iter().map(|(n, e)| (n.clone(), expand_macros_in_expr(e, macros))).collect() }, expr.span),
+        ExprKind::Match { scrutinee, arms } => Expr::new(ExprKind::Match { scrutinee: Box::new(expand_macros_in_expr(scrutinee, macros)), arms: arms.iter().map(|(pats, guard, e)| (pats.clone(), guard.as_ref().map(|g| expand_macros_in_expr(g, macros)), expand_macros_in_expr(e, macros))).collect() }, expr.span),
+        ExprKind::While { cond, body } => Expr::new(ExprKind::While { cond: Box::new(expand_macros_in_expr(cond, macros)), body: body.iter().flat_map(|s| expand_macros_in_stmt(s, macros)).collect() }, expr.span),
+        ExprKind::For { var, iter, body } => Expr::new(ExprKind::For { var: var.clone(), iter: Box::new(expand_macros_in_expr(iter, macros)), body: body.iter().flat_map(|s| expand_macros_in_stmt(s, macros)).collect() }, expr.span),
         _ => expr.clone(),
     }
 }
 
 fn substitute_expr(expr: &Expr, arg_map: &HashMap<String, Expr>, macros: &HashMap<String, (Vec<String>, Vec<Stmt>)>) -> Expr {
-    match expr {
-        Expr::Ident(name) => {
+    match &*expr.kind {
+        ExprKind::Ident(name) => {
             if let Some(val) = arg_map.get(name) {
                 val.clone()
             } else {
-                Expr::Ident(name.clone())
+                Expr::new(ExprKind::Ident(name.clone()), expr.span)
             }
         }
-        Expr::Binary(l, op, r) => Expr::Binary(
+        ExprKind::Binary(l, op, r) => Expr::new(ExprKind::Binary(
             Box::new(substitute_expr(l, arg_map, macros)),
             op.clone(),
             Box::new(substitute_expr(r, arg_map, macros)),
-        ),
-        Expr::Unary(op, e) => Expr::Unary(op.clone(), Box::new(substitute_expr(e, arg_map, macros))),
-        Expr::Call(callee, args) => {
-            let expanded = Expr::Call(
+        ), expr.span),
+        ExprKind::Unary(op, e) => Expr::new(ExprKind::Unary(op.clone(), Box::new(substitute_expr(e, arg_map, macros))), expr.span),
+        ExprKind::Call(callee, args) => {
+            let expanded = Expr::new(ExprKind::Call(
                 Box::new(substitute_expr(callee, arg_map, macros)),
                 args.iter().map(|a| substitute_expr(a, arg_map, macros)).collect(),
-            );
+            ), expr.span);
             expand_macros_in_expr(&expanded, macros)
         }
-        Expr::If { cond, then_body, else_body } => Expr::If {
+        ExprKind::If { cond, then_body, else_body } => Expr::new(ExprKind::If {
             cond: Box::new(substitute_expr(cond, arg_map, macros)),
             then_body: Box::new(substitute_expr(then_body, arg_map, macros)),
             else_body: else_body.as_ref().map(|e| Box::new(substitute_expr(e, arg_map, macros))),
-        },
-        Expr::FieldAccess(obj, field) => Expr::FieldAccess(Box::new(substitute_expr(obj, arg_map, macros)), field.clone()),
-        Expr::MethodCall(obj, method, args) => Expr::MethodCall(
+        }, expr.span),
+        ExprKind::FieldAccess(obj, field) => Expr::new(ExprKind::FieldAccess(Box::new(substitute_expr(obj, arg_map, macros)), field.clone()), expr.span),
+        ExprKind::MethodCall(obj, method, args) => Expr::new(ExprKind::MethodCall(
             Box::new(substitute_expr(obj, arg_map, macros)),
             method.clone(),
             args.iter().map(|a| substitute_expr(a, arg_map, macros)).collect(),
-        ),
-        Expr::Index(arr, idx) => Expr::Index(
+        ), expr.span),
+        ExprKind::Index(arr, idx) => Expr::new(ExprKind::Index(
             Box::new(substitute_expr(arr, arg_map, macros)),
             Box::new(substitute_expr(idx, arg_map, macros)),
-        ),
-        Expr::StructLit { name, fields } => Expr::StructLit {
+        ), expr.span),
+        ExprKind::StructLit { name, fields } => Expr::new(ExprKind::StructLit {
             name: name.clone(),
             fields: fields.iter().map(|(n, e)| (n.clone(), substitute_expr(e, arg_map, macros))).collect(),
-        },
-        Expr::Match { scrutinee, arms } => Expr::Match {
+        }, expr.span),
+        ExprKind::Match { scrutinee, arms } => Expr::new(ExprKind::Match {
             scrutinee: Box::new(substitute_expr(scrutinee, arg_map, macros)),
             arms: arms.iter().map(|(pats, guard, e)| (pats.clone(), guard.as_ref().map(|g| substitute_expr(g, arg_map, macros)), substitute_expr(e, arg_map, macros))).collect(),
-        },
-        Expr::Range(l, r) => Expr::Range(
+        }, expr.span),
+        ExprKind::Range(l, r) => Expr::new(ExprKind::Range(
             Box::new(substitute_expr(l, arg_map, macros)),
             Box::new(substitute_expr(r, arg_map, macros)),
-        ),
-        Expr::ArrayLit(elems) => Expr::ArrayLit(elems.iter().map(|e| substitute_expr(e, arg_map, macros)).collect()),
+        ), expr.span),
+        ExprKind::ArrayLit(elems) => Expr::new(ExprKind::ArrayLit(elems.iter().map(|e| substitute_expr(e, arg_map, macros)).collect()), expr.span),
         _ => expr.clone(),
     }
 }
@@ -2690,8 +2690,8 @@ fn expand_macros_program(program: &Program) -> Program {
 fn expand_macros_in_stmt(stmt: &Stmt, macros: &HashMap<String, (Vec<String>, Vec<Stmt>)>) -> Vec<Stmt> {
     match &stmt.kind {
         StmtKind::Expr(e) => {
-            if let Expr::Call(callee, args) = e {
-                if let Expr::Ident(mname) = callee.as_ref() {
+            if let ExprKind::Call(callee, args) = &*e.kind {
+                if let ExprKind::Ident(mname) = &*callee.kind {
                     if let Some((params, body)) = macros.get(mname) {
                         if body.len() >= 2 {
                             return expand_macro_call_inline(params, body, args, None, macros);
@@ -2702,8 +2702,8 @@ fn expand_macros_in_stmt(stmt: &Stmt, macros: &HashMap<String, (Vec<String>, Vec
             vec![Stmt::new(StmtKind::Expr(expand_macros_in_expr(e, macros)), stmt.span)]
         }
         StmtKind::Let { name, ty, value } => {
-            if let Expr::Call(callee, args) = value {
-                if let Expr::Ident(mname) = callee.as_ref() {
+            if let ExprKind::Call(callee, args) = &*value.kind {
+                if let ExprKind::Ident(mname) = &*callee.kind {
                     if let Some((params, body)) = macros.get(mname) {
                         if body.len() >= 2 {
                             return expand_macro_call_inline(params, body, args, Some(name.clone()), macros);

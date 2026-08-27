@@ -42,17 +42,30 @@ fn arithmetic_binds_tighter_than_comparison() {
 fn mixed_precedence_tree_shape() {
     // Exact nesting, not just "an And exists somewhere": `a == 1 && b == 2 || c`
     // must be Or(And(Eq(a,1), Eq(b,2)), c). Before the fix it parsed as
-    // Eq(Eq(a, And(1,b)), Or(2,c)).
+    // Eq(Eq(a, And(1,b)), Or(2,c)). Spans are elided so the shape is readable.
     let r = common::zarrinc("emit-ast", "let z = a == 1 && b == 2 || c;");
     let flat: String = r.stdout.chars().filter(|c| !c.is_whitespace()).collect();
+    let shape = regex_lite_strip(&flat);
     let expected = "Binary(Binary(Binary(Ident(\"a\",),Eq,Int(1,),),And,\
 Binary(Ident(\"b\",),Eq,Int(2,),),),Or,Ident(\"c\",),)";
     assert!(
-        flat.contains(expected),
+        shape.contains(expected),
         "precedence tree changed.\n  expected to contain: {}\n  got: {}",
         expected,
-        flat
+        shape
     );
+}
+
+/// Drop the `Expr { kind: .., span: .. }` wrappers so a test can talk about the
+/// shape of a tree without restating every position in it.
+fn regex_lite_strip(s: &str) -> String {
+    let mut out = s.replace("Expr{kind:", "");
+    loop {
+        let Some(i) = out.find(",span:Span{") else { break };
+        let Some(rel) = out[i..].find("},}") else { break };
+        out.replace_range(i..i + rel + 3, "");
+    }
+    out
 }
 
 // ---------------------------------------------------------------------------
