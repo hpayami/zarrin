@@ -1738,3 +1738,54 @@ fn main() {
 "#,
     );
 }
+
+// ---------------------------------------------------------------------------
+// Dividing by zero
+//
+// Undefined in LLVM: the native backend printed a number with no meaning and
+// carried on, where the interpreter stopped.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn dividing_by_zero_stops_the_program() {
+    assert_fails_like_the_interpreter(
+        r#"
+fn main() {
+    print("before");
+    let n = 0;
+    print(7 / n);
+}
+"#,
+    );
+}
+
+#[test]
+fn remainder_by_zero_stops_the_program() {
+    assert_fails_like_the_interpreter(
+        r#"
+fn main() {
+    print("before");
+    let n = 0;
+    print(7 % n);
+}
+"#,
+    );
+}
+
+#[test]
+fn division_that_can_be_done_agrees() {
+    assert_agrees_with_interpreter(
+        r#"
+fn main() {
+    print(7 / 2);
+    print(0 - 7 / 2);
+    print(7 % 3);
+    print(0 - 7 % 3);
+    print(1.0 / 0.0);
+    print(0.0 / 0.0);
+    let d = 3;
+    print(100 / d);
+}
+"#,
+    );
+}

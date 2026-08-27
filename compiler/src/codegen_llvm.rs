@@ -213,6 +213,20 @@ impl<'ctx> Codegen<'ctx> {
         self.builder.build_unreachable().unwrap();
     }
 
+    /// Stop with the interpreter's message when a divisor is zero.
+    fn gen_nonzero_check(&self, divisor: IntValue<'ctx>, message: &str) {
+        let f = self.builder.get_insert_block().unwrap().get_parent().unwrap();
+        let fail = self.context.append_basic_block(f, "divzero");
+        let ok = self.context.append_basic_block(f, "divok");
+        let zero = self.builder
+            .build_int_compare(inkwell::IntPredicate::EQ, divisor, self.i64.const_zero(), "is_zero")
+            .unwrap();
+        self.builder.build_conditional_branch(zero, fail, ok).unwrap();
+        self.builder.position_at_end(fail);
+        self.gen_abort(message, &[]);
+        self.builder.position_at_end(ok);
+    }
+
     /// Stop with the interpreter's message when an index is out of range. The
     /// native backend read past the allocation instead, printed whatever was
     /// there and carried on.
@@ -1295,8 +1309,16 @@ impl<'ctx> Codegen<'ctx> {
                             BinOp::Add => CgValue::Int(self.builder.build_int_add(lv, rv, "add").unwrap()),
                             BinOp::Sub => CgValue::Int(self.builder.build_int_sub(lv, rv, "sub").unwrap()),
                             BinOp::Mul => CgValue::Int(self.builder.build_int_mul(lv, rv, "mul").unwrap()),
-                            BinOp::Div => CgValue::Int(self.builder.build_int_signed_div(lv, rv, "div").unwrap()),
-                            BinOp::Mod => CgValue::Int(self.builder.build_int_signed_rem(lv, rv, "rem").unwrap()),
+                            // Dividing by zero is undefined in LLVM, and what
+                            // came of it was a number with no meaning.
+                            BinOp::Div => {
+                                self.gen_nonzero_check(rv, "division by zero");
+                                CgValue::Int(self.builder.build_int_signed_div(lv, rv, "div").unwrap())
+                            }
+                            BinOp::Mod => {
+                                self.gen_nonzero_check(rv, "remainder by zero");
+                                CgValue::Int(self.builder.build_int_signed_rem(lv, rv, "rem").unwrap())
+                            }
                             BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge => {
                                 let pred = match op {
                                     BinOp::Eq => inkwell::IntPredicate::EQ,

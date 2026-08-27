@@ -664,3 +664,37 @@ fn continue_still_skips_the_rest_of_the_body() {
         &["1", "3"],
     );
 }
+
+// ---------------------------------------------------------------------------
+// Dividing by zero
+//
+// Rust's own panic escaped through the interpreter: `error: attempt to divide
+// by zero` with no line to look at and exit 101, where every other failure in
+// this language points at the statement that caused it and exits 1.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn dividing_by_zero_points_at_the_statement() {
+    let r = run("fn main() {\n    let n = 0;\n    print(7 / n);\n}\n");
+    assert!(!r.success, "expected the program to fail; it printed:\n{}", r.stdout);
+    assert!(r.stderr.contains("division by zero"), "stderr was:\n{}", r.stderr);
+    // The panic path had no position at all.
+    assert!(r.stderr.contains("--> "), "no position in the diagnostic:\n{}", r.stderr);
+    assert!(r.stderr.contains("3 |"), "wrong line in the diagnostic:\n{}", r.stderr);
+}
+
+#[test]
+fn remainder_by_zero_points_at_the_statement() {
+    let r = run("fn main() {\n    let n = 0;\n    print(7 % n);\n}\n");
+    assert!(!r.success, "expected the program to fail; it printed:\n{}", r.stdout);
+    assert!(r.stderr.contains("remainder by zero"), "stderr was:\n{}", r.stderr);
+    assert!(r.stderr.contains("--> "), "no position in the diagnostic:\n{}", r.stderr);
+}
+
+#[test]
+fn division_that_can_be_done_still_is() {
+    assert_output(
+        "fn main() { print(7 / 2); print(0 - 7 / 2); print(7 % 3); print(1.0 / 0.0); }\n",
+        &["3", "-3", "1", "inf"],
+    );
+}

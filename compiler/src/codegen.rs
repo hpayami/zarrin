@@ -625,7 +625,18 @@ fn eval_binop(&self, l: &Value, op: &BinOp, r: &Value) -> Value {
     match (l, r) {
         (Value::Int(a), Value::Int(b)) => match op {
             BinOp::Add => Value::Int(a + b), BinOp::Sub => Value::Int(a - b),
-            BinOp::Mul => Value::Int(a * b), BinOp::Div => Value::Int(a / b), BinOp::Mod => Value::Int(a % b),
+            BinOp::Mul => Value::Int(a * b),
+            // Rust's own panic escaped through here: exit 101 and no line to
+            // look at, where every other failure in this language points at the
+            // statement that caused it.
+            BinOp::Div => {
+                if *b == 0 { rt_fail!(self, "division by zero"); }
+                Value::Int(a / b)
+            }
+            BinOp::Mod => {
+                if *b == 0 { rt_fail!(self, "remainder by zero"); }
+                Value::Int(a % b)
+            }
             BinOp::Eq => Value::Bool(a == b), BinOp::Ne => Value::Bool(a != b),
             BinOp::Lt => Value::Bool(a < b), BinOp::Le => Value::Bool(a <= b),
             BinOp::Gt => Value::Bool(a > b), BinOp::Ge => Value::Bool(a >= b),
