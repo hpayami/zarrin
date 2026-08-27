@@ -1,5 +1,6 @@
-// Both backends implement joining a string to a number, and the checker
-// rejects it. Either it should be allowed or that code should go.
+// The checker rejects joining a string to a number, and the code that did it
+// in both backends is gone. `to_string` and `"{n}"` are how a number becomes
+// text.
 fn main() {
     print("a" + 1);
 }

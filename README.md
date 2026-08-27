@@ -35,6 +35,10 @@ that says which field it means.
 `[1, 2, 3]`, a struct as `Point { x: 1, y: 2 }` with its fields in declaration
 order, an enum as its variant name and payload.
 
+`+` joins two strings; a number becomes text through `to_string` or
+interpolation. A `fn` type can be written in a signature, but a function cannot
+yet be passed as a value or called through one, and the checker says so.
+
 Strings compare by their characters: `==` and `!=`, and `<` through `>=` in the
 order they sort. A string pattern in a `match` is matched the same way.
 

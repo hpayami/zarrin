@@ -712,14 +712,7 @@ fn eval_binop(&self, l: &Value, op: &BinOp, r: &Value) -> Value {
             BinOp::Gt => Value::Bool(a > b), BinOp::Ge => Value::Bool(a >= b),
             _ => rt_fail!(self, "unsupported string op"),
         },
-        (Value::Str(a), Value::Int(b)) => match op {
-            BinOp::Add => Value::Str(format!("{}{}", a, b)),
-            _ => rt_fail!(self, "unsupported string+int op"),
-        },
-        (Value::Int(a), Value::Str(b)) => match op {
-            BinOp::Add => Value::Str(format!("{}{}", a, b)),
-            _ => rt_fail!(self, "unsupported int+string op"),
-        },
+
         _ => rt_fail!(self, "type mismatch in binary operation"),
     }
 }

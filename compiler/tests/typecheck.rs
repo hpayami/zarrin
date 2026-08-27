@@ -391,3 +391,28 @@ fn a_field_of_the_wrong_type_is_named_by_its_own_type() {
         "expected `string`, found `int`",
     );
 }
+
+#[test]
+fn a_function_value_says_what_it_cannot_do() {
+    // `fn(int) -> int` can be written in a signature, and neither backend can
+    // run one. The errors used to be "undefined variable" where a function was
+    // passed and "undefined function" where one was called.
+    assert_check_error(
+        "fn twice(n: int) -> int { return n * 2; }\n\
+         fn apply(f: fn(int) -> int, n: int) -> int { return f(n); }\n\
+         fn main() { print(apply(twice, 5)); }\n",
+        "calling one through a variable is not supported yet",
+    );
+    assert_check_error(
+        "fn twice(n: int) -> int { return n * 2; }\nfn main() { let f = twice; print(f(3)); }\n",
+        "passing one as a value is not supported yet",
+    );
+}
+
+#[test]
+fn joining_a_string_to_a_number_needs_to_say_so() {
+    // Both backends implemented this and the checker rejected it, so the code
+    // never ran. `to_string` and interpolation are how a number becomes text.
+    assert_check_error("fn main() { print(\"a\" + 1); }\n", "expected `string`, found `int`");
+    assert_checks("fn main() { let n = 2; print(\"a\" + to_string(n)); print(\"n = {n}\"); }\n");
+}

@@ -1,3 +1,5 @@
+// `fn(int) -> int` can be written in a signature, and neither backend can run
+// one. Both refuse it, and now say why.
 fn twice(n: int) -> int {
     return n * 2;
 }

@@ -1454,6 +1454,11 @@ impl<'ctx> Codegen<'ctx> {
                     // Joining reads both sides and produces something new, so an
                     // operand built on the spot has no owner afterwards. Without
                     // this the intermediate in `"v" + to_string(i)` was left.
+                    //
+                    // Only two strings: joining a string to a number was
+                    // implemented here and in the interpreter and rejected by
+                    // the checker, so it never ran. `to_string` and `"{n}"` are
+                    // how a number becomes text.
                     let (drop_l, drop_r) = (self.produces_owned(l), self.produces_owned(r));
                     let mut spent: Vec<PointerValue<'ctx>> = Vec::new();
                     let joined = match (&lv, &rv) {
@@ -1461,18 +1466,6 @@ impl<'ctx> Codegen<'ctx> {
                             if drop_l { spent.push(*a); }
                             if drop_r { spent.push(*b); }
                             Some(self.gen_string_concat(*a, *b))
-                        }
-                        (CgValue::Str(a), CgValue::Int(b)) => {
-                            let b_str = self.gen_int_to_str(*b);
-                            if drop_l { spent.push(*a); }
-                            spent.push(b_str);
-                            Some(self.gen_string_concat(*a, b_str))
-                        }
-                        (CgValue::Int(a), CgValue::Str(b)) => {
-                            let a_str = self.gen_int_to_str(*a);
-                            spent.push(a_str);
-                            if drop_r { spent.push(*b); }
-                            Some(self.gen_string_concat(a_str, *b))
                         }
                         _ => None,
                     };

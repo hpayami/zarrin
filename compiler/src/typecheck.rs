@@ -23,6 +23,8 @@ pub enum TypeError {
     NonExhaustiveMatch { ty: String, missing: Vec<String> },
     UnresolvedTypeParam { func: String, param: String },
     ExternNotCallable(String),
+    FunctionAsValue(String),
+    CallingAFunctionValue(String),
     /// Raised inside a nested statement, which already knows where it is.
     Located(Box<Diagnostic>),
 }
@@ -38,6 +40,16 @@ impl std::fmt::Display for TypeError {
         match self {
             TypeError::UndefinedVariable(n) => write!(f, "undefined variable: `{}`", n),
             TypeError::UndefinedFunction(n) => write!(f, "undefined function: `{}`", n),
+            TypeError::FunctionAsValue(n) => write!(
+                f,
+                "`{}` is a function; passing one as a value is not supported yet",
+                n
+            ),
+            TypeError::CallingAFunctionValue(n) => write!(
+                f,
+                "`{}` holds a function, and calling one through a variable is not supported yet",
+                n
+            ),
             TypeError::ExternNotCallable(n) => write!(
                 f,
                 "`{}` is declared `extern`, and no backend can call one yet",
@@ -454,7 +466,15 @@ impl TypeChecker {
                     }
                     Lookup::Unknown => {}
                 }
-                env.lookup(name).ok_or_else(|| TypeError::UndefinedVariable(name.clone()))
+                // A `fn` type can be written in a signature, so this used to
+                // come out as "undefined variable" at the point one was passed.
+                env.lookup(name).ok_or_else(|| {
+                    if env.functions.contains_key(name) || env.extern_fns.contains_key(name) {
+                        TypeError::FunctionAsValue(name.clone())
+                    } else {
+                        TypeError::UndefinedVariable(name.clone())
+                    }
+                })
             }
             ExprKind::Binary(l, op, r) => {
                 let lt = Self::check_expr(l, env)?;
@@ -586,6 +606,12 @@ impl TypeChecker {
                         ));
                     }
                     return Ok(substitute(&ret_ty, &subst));
+                }
+                // Calling what a variable holds, rather than a function by
+                // name: the parser accepts `f: fn(int) -> int`, and this is
+                // where the language admits it cannot run one.
+                if matches!(env.lookup(func_name), Some(Type::Fn(..))) {
+                    return Err(TypeError::CallingAFunctionValue(func_name.clone()));
                 }
                 Err(TypeError::UndefinedFunction(func_name.clone()))
             }
