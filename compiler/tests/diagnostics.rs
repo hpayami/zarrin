@@ -185,3 +185,22 @@ fn a_failure_inside_a_function_points_into_that_function() {
         5,
     );
 }
+
+// --- escape sequences -------------------------------------------------------
+
+#[test]
+fn an_unknown_escape_is_rejected() {
+    assert_diagnostic("fn main() { print(\"bad \\q here\"); }\n", "unknown escape sequence `\\q`", 1, 24);
+}
+
+#[test]
+fn a_backslash_at_the_end_of_a_string_is_not_an_escape_of_the_quote() {
+    assert_diagnostic("fn main() { print(\"oops \\\"); }\n", "unterminated string literal", 1, 19);
+}
+
+#[test]
+fn nul_is_not_offered() {
+    // The native backend uses NUL-terminated strings, so an embedded NUL would
+    // behave differently there. Better to reject it than to diverge.
+    assert_diagnostic("fn main() { print(\"x\\0y\"); }\n", "unknown escape sequence `\\0`", 1, 21);
+}

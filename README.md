@@ -27,8 +27,13 @@ line, a column and the offending line quoted. Positions are recorded per
 statement, so a type or run-time error points at the statement it happened in
 rather than the exact subexpression.
 
-Not yet: generics (parsed, then ignored), escape sequences in string literals,
-and freeing memory in the native backend.
+String literals take `\n`, `\t`, `\r`, `\"`, `\\`, and `\{` / `\}` for a
+literal brace — an unescaped `{` starts an interpolation. There is no `\0`: the
+native backend uses NUL-terminated strings, so an embedded NUL would behave
+differently there.
+
+Not yet: generics (parsed, then ignored), and freeing memory in the native
+backend.
 
 ## Build
 

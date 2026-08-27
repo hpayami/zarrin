@@ -229,11 +229,37 @@ impl<'a> Lexer<'a> {
                             closed = true;
                             break;
                         }
+                        if ch == '\\' {
+                            let esc_at = self.here();
+                            self.bump();
+                            let Some(&next) = self.chars.peek() else {
+                                return Err(self.error("unterminated string literal", start));
+                            };
+                            self.bump();
+                            match next {
+                                'n' => s.push('\n'),
+                                't' => s.push('\t'),
+                                'r' => s.push('\r'),
+                                // No `\0`: the native backend uses NUL-terminated
+                                // strings, so an embedded NUL would truncate there
+                                // and not in the interpreter.
+                                '\\' => s.push('\\'),
+                                '"' => s.push('"'),
+                                // Brace escapes stay escaped: an interpolated
+                                // string is re-scanned by the parser, which is
+                                // what has to tell `\{` from an interpolation.
+                                '{' | '}' => { s.push('\\'); s.push(next); }
+                                other => {
+                                    return Err(self.error(
+                                        format!("unknown escape sequence `\\{}`", other),
+                                        esc_at,
+                                    ))
+                                }
+                            }
+                            continue;
+                        }
                         if ch == '{' {
                             has_interp = true;
-                        }
-                        if ch == '}' && has_interp {
-                            // Will be handled during re-lexing in parser
                         }
                         s.push(ch);
                         self.bump();
@@ -244,7 +270,8 @@ impl<'a> Lexer<'a> {
                     if has_interp {
                         Token::InterpStr(s)
                     } else {
-                        Token::Str(s)
+                        // Nothing will re-scan this one, so unescape the braces here.
+                        Token::Str(s.replace("\\{", "{").replace("\\}", "}"))
                     }
                 }
                 ch if ch.is_ascii_digit() => {

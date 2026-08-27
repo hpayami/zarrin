@@ -742,6 +742,14 @@ impl<'a> Parser<'a> {
                     .map_err(|e| Diagnostic::new(
                         format!("in interpolated expression `{}`: {}", expr_str.trim(), e.message), span))?;
                 parts.push(Expr::Call(Box::new(Expr::Ident("to_string".to_string())), vec![expr]));
+            } else if ch == '\\' {
+                // `\{` and `\}` survive lexing intact so that this scan can
+                // tell an escaped brace from the start of an interpolation.
+                chars.next();
+                match chars.peek() {
+                    Some(&c @ ('{' | '}')) => { current_str.push(c); chars.next(); }
+                    _ => current_str.push('\\'),
+                }
             } else {
                 current_str.push(ch);
                 chars.next();

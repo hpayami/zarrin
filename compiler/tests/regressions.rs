@@ -486,3 +486,33 @@ fn a_trailing_expression_at_top_level_is_allowed() {
     assert!(r.success, "rejected a top-level trailing expression:\n{}", r.stderr);
     assert_eq!(r.lines().as_slice(), &["7"]);
 }
+
+// ---------------------------------------------------------------------------
+// Escape sequences
+//
+// The lexer had none: "a\nb" was the four characters a, backslash, n, b, and a
+// string could not contain a quote at all — the backslash was ordinary and the
+// quote closed the literal.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn escapes_produce_real_characters() {
+    assert_output("fn main() { print(\"a\\nb\"); }\n", &["a", "b"]);
+    assert_output("fn main() { print(len(\"a\\nb\")); }\n", &["3"]);
+    assert_output("fn main() { print(\"x\\ty\"); }\n", &["x\ty"]);
+    assert_output("fn main() { print(\"q\\\"d\"); }\n", &["q\"d"]);
+    assert_output("fn main() { print(\"b\\\\s\"); }\n", &["b\\s"]);
+}
+
+#[test]
+fn braces_can_be_escaped_in_an_interpolated_string() {
+    // An unescaped brace still starts an interpolation, so a literal one needs
+    // escaping — and the escape has to survive into the interpolation scan.
+    assert_output("fn main() { let n = 5; print(\"\\{ {n} \\}\"); }\n", &["{ 5 }"]);
+    assert_output("fn main() { print(\"\\{plain\\}\"); }\n", &["{plain}"]);
+}
+
+#[test]
+fn a_carriage_return_escape_works() {
+    assert_output("fn main() { print(len(\"a\\rb\")); }\n", &["3"]);
+}
