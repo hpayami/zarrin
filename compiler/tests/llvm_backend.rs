@@ -73,6 +73,45 @@ fn build_and_run(src: &str) -> Option<String> {
     Some(out)
 }
 
+/// Compile `src` and run it expecting failure; returns (stdout, first stderr
+/// line, exit code), or None when the backend is off.
+fn build_and_run_failing(src: &str) -> Option<(String, String, Option<i32>)> {
+    if !enabled() {
+        return None;
+    }
+    let n = N.fetch_add(1, Ordering::SeqCst);
+    let dir: PathBuf = std::env::temp_dir().join(format!("zarrin-llvm-fail-{}-{}", std::process::id(), n));
+    std::fs::create_dir_all(&dir).unwrap();
+    let file = dir.join("prog.zr");
+    std::fs::write(&file, src).unwrap();
+    let exe = dir.join("prog");
+    let build = Command::new(env!("CARGO_BIN_EXE_zarrinc"))
+        .args(["build", file.to_str().unwrap(), "-o", exe.to_str().unwrap()])
+        .output()
+        .expect("failed to invoke zarrinc");
+    assert!(build.status.success(), "native build failed:\n{}", String::from_utf8_lossy(&build.stderr));
+    let run = Command::new(&exe).output().expect("failed to run the executable");
+    let out = String::from_utf8_lossy(&run.stdout).into_owned();
+    let err = String::from_utf8_lossy(&run.stderr).lines().next().unwrap_or_default().to_string();
+    let code = run.status.code();
+    let _ = std::fs::remove_dir_all(&dir);
+    Some((out, err, code))
+}
+
+/// A run-time failure must look the same from either backend: same stdout up to
+/// the failure, same message, same exit status. Only the first stderr line is
+/// compared, since each side writes its program to a different scratch path.
+fn assert_fails_like_the_interpreter(src: &str) {
+    let Some((native_out, native_err, code)) = build_and_run_failing(src) else { return };
+    let interpreted = common::run(src);
+    assert!(!interpreted.success, "the interpreter accepted this program");
+    assert_eq!(code, Some(1), "native exit status");
+    assert_eq!(native_out, interpreted.stdout, "output before the failure differs");
+    let want = interpreted.stderr.lines().next().unwrap_or_default();
+    assert_eq!(native_err, want, "diagnostic differs");
+    assert!(native_err.starts_with("error: "), "not a diagnostic: {}", native_err);
+}
+
 /// The compiled program must print exactly what the interpreter prints.
 fn assert_agrees_with_interpreter(src: &str) {
     let Some(native) = build_and_run(src) else { return };
@@ -500,6 +539,55 @@ fn main() {
     print(b.n);
     print(b.s.c);
     print("{b.s.name} / {b.s.c}");
+}
+"#,
+    );
+}
+
+// --- bounds checks ----------------------------------------------------------
+//
+// The interpreter checks indices and reports a positioned error. The native
+// backend read past the allocation, printed whatever was there and carried on:
+// `print(a[10])` on a three-element array printed 0 and the program finished
+// successfully.
+
+#[test]
+fn an_out_of_range_index_stops_the_program() {
+    assert_fails_like_the_interpreter(
+        "fn main() {\n    let a = [1, 2, 3];\n    print(a[0]);\n    print(a[10]);\n    print(\"never\");\n}\n",
+    );
+}
+
+#[test]
+fn a_negative_index_is_caught() {
+    assert_fails_like_the_interpreter("fn main() {\n    let a = [1, 2];\n    print(a[0 - 1]);\n}\n");
+}
+
+#[test]
+fn array_get_and_array_set_are_checked() {
+    assert_fails_like_the_interpreter("fn main() {\n    let a = [1, 2];\n    print(array_get(a, 5));\n}\n");
+    assert_fails_like_the_interpreter("fn main() {\n    let a = [1, 2];\n    let b = array_set(a, 9, 0);\n}\n");
+}
+
+#[test]
+fn substring_bounds_are_checked_natively() {
+    assert_fails_like_the_interpreter("fn main() {\n    print(substring(\"hello\", 2, 99));\n}\n");
+    assert_fails_like_the_interpreter("fn main() {\n    print(substring(\"hello\", 4, 1));\n}\n");
+}
+
+#[test]
+fn indices_in_range_still_work() {
+    assert_agrees_with_interpreter(
+        r#"
+fn main() {
+    let a = [10, 20, 30];
+    print(a[0]);
+    print(a[2]);
+    print(array_get(a, 1));
+    print(array_get(array_set(a, 1, 99), 1));
+    print(substring("hello", 1, 4));
+    print(substring("hello", 0, 5));
+    print(substring("hello", 3, 3));
 }
 "#,
     );

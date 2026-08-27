@@ -7,6 +7,7 @@
 #![cfg(feature = "llvm")]
 
 use crate::ast::*;
+use crate::diagnostic::{Diagnostic, Span};
 use crate::variants::{builtin_enums, Lookup, Variant, VariantIndex};
 use inkwell::builder::Builder;
 use inkwell::context::Context;
@@ -49,6 +50,11 @@ pub struct Codegen<'ctx> {
     /// Variables known to hold a value of a given enum, so `print` can show
     /// the variant name instead of the address it is represented by.
     var_enum_type: HashMap<String, String>,
+    /// Source of the program being compiled, so a check that fails at run time
+    /// can print the same diagnostic the interpreter would.
+    path: String,
+    src: String,
+    current_span: Span,
     enum_variants: HashMap<String, Vec<(String, Vec<Type>)>>,
     variants: VariantIndex,
     loop_exit: Vec<BasicBlock<'ctx>>,
@@ -83,6 +89,9 @@ impl<'ctx> Codegen<'ctx> {
             struct_fields: HashMap::new(),
             var_struct_type: HashMap::new(),
             var_enum_type: HashMap::new(),
+            path: String::new(),
+            src: String::new(),
+            current_span: Span::new(1, 1),
             enum_variants: HashMap::new(),
             variants: VariantIndex::build(program),
             loop_exit: Vec::new(),
@@ -100,6 +109,71 @@ impl<'ctx> Codegen<'ctx> {
             let ty = self.context.ptr_type(AddressSpace::default()).fn_type(&[self.i64.into()], false);
             self.module.add_function("malloc", ty, None)
         })
+    }
+
+    fn exit_fn(&self) -> FunctionValue<'ctx> {
+        self.module.get_function("exit").unwrap_or_else(|| {
+            let ty = self.context.void_type().fn_type(&[self.context.i32_type().into()], false);
+            self.module.add_function("exit", ty, None)
+        })
+    }
+
+    /// Emit code that prints a diagnostic and stops.
+    ///
+    /// The frame — path, line, the quoted source line, the caret — is known at
+    /// compile time and baked into the format string.
+    /// `\x01` in `message` marks a value filled in at run time.
+    fn gen_abort(&self, message: &str, args: &[IntValue<'ctx>]) {
+        let ptr_ty = self.context.ptr_type(AddressSpace::default());
+        let i32_ty = self.context.i32_type();
+        let snprintf = self.module.get_function("snprintf").unwrap_or_else(|| {
+            let ty = i32_ty.fn_type(&[ptr_ty.into(), self.i64.into(), ptr_ty.into()], true);
+            self.module.add_function("snprintf", ty, None)
+        });
+        let write = self.module.get_function("write").unwrap_or_else(|| {
+            let ty = self.i64.fn_type(&[i32_ty.into(), ptr_ty.into(), self.i64.into()], false);
+            self.module.add_function("write", ty, None)
+        });
+
+        // Anything already printed is sitting in stdio's buffer; without this
+        // the error reaches a pipe before the output that preceded it.
+        let fflush = self.module.get_function("fflush").unwrap_or_else(|| {
+            let ty = i32_ty.fn_type(&[ptr_ty.into()], false);
+            self.module.add_function("fflush", ty, None)
+        });
+        self.builder.build_call(fflush, &[ptr_ty.const_null().into()], "").unwrap();
+
+        let rendered = Diagnostic::new(message, self.current_span).render(&self.path, &self.src);
+        // the source line may itself contain a percent sign
+        let text = rendered.replace('%', "%%").replace('\x01', "%ld");
+        let fmt = self.builder.build_global_string_ptr(&text, "abort_fmt").unwrap().as_pointer_value();
+
+        let cap = self.i64.const_int(4096, false);
+        let buf = self.heap_bytes(cap, "abort_buf");
+        let mut call_args: Vec<BasicMetadataValueEnum> = vec![buf.into(), cap.into(), fmt.into()];
+        for a in args { call_args.push((*a).into()); }
+        let n = self.builder.build_call(snprintf, &call_args, "abort_len").unwrap()
+            .try_as_basic_value().left().unwrap().into_int_value();
+        let n64 = self.builder.build_int_s_extend(n, self.i64, "abort_len64").unwrap();
+        self.builder.build_call(write, &[i32_ty.const_int(2, false).into(), buf.into(), n64.into()], "").unwrap();
+        self.builder.build_call(self.exit_fn(), &[i32_ty.const_int(1, false).into()], "").unwrap();
+        self.builder.build_unreachable().unwrap();
+    }
+
+    /// Stop with the interpreter's message when an index is out of range. The
+    /// native backend read past the allocation instead, printed whatever was
+    /// there and carried on.
+    fn gen_bounds_check(&self, idx: IntValue<'ctx>, len: IntValue<'ctx>, what: &str) {
+        let f = self.builder.get_insert_block().unwrap().get_parent().unwrap();
+        let fail = self.context.append_basic_block(f, "bounds_fail");
+        let ok = self.context.append_basic_block(f, "bounds_ok");
+        let neg = self.builder.build_int_compare(inkwell::IntPredicate::SLT, idx, self.i64.const_zero(), "neg_idx").unwrap();
+        let past = self.builder.build_int_compare(inkwell::IntPredicate::SGE, idx, len, "past_end").unwrap();
+        let bad = self.builder.build_or(neg, past, "out_of_range").unwrap();
+        self.builder.build_conditional_branch(bad, fail, ok).unwrap();
+        self.builder.position_at_end(fail);
+        self.gen_abort(&format!("{} index \x01 is out of bounds for length \x01", what), &[idx, len]);
+        self.builder.position_at_end(ok);
     }
 
     fn heap_bytes(&self, bytes: IntValue<'ctx>, name: &str) -> PointerValue<'ctx> {
@@ -518,9 +592,7 @@ impl<'ctx> Codegen<'ctx> {
                     };
                     let fmt = self.builder.build_global_string_ptr("%s\n", "panic_fmt").unwrap().as_pointer_value();
                     self.builder.build_call(self.printf, &[fmt.into(), str_ptr.into()], "panic_str").unwrap();
-                    let abort_type = self.context.void_type().fn_type(&[], false);
-                    let abort_fn = self.module.get_function("exit").unwrap_or_else(|| self.module.add_function("exit", abort_type, None));
-                    self.builder.build_call(abort_fn, &[self.i64.const_int(1, false).into()], "panic_exit").unwrap();
+                    self.builder.build_call(self.exit_fn(), &[self.context.i32_type().const_int(1, false).into()], "panic_exit").unwrap();
                     return CgValue::Int(self.i64.const_int(0, false));
                 }
                 if name == "array_len" {
@@ -536,6 +608,8 @@ impl<'ctx> Codegen<'ctx> {
                     let arr_ptr = self.builder.build_int_to_ptr(arr_ptr_val, self.i64.ptr_type(AddressSpace::default()), "arr_ptr").unwrap();
                     let idx_val = self.gen_expr(&args[1]);
                     let idx_int = self.value_to_int(&idx_val);
+                    let get_len = self.builder.build_load(self.i64, arr_ptr, "arr_len").unwrap().into_int_value();
+                    self.gen_bounds_check(idx_int, get_len, "array");
                     let elem_off = self.builder.build_int_add(idx_int, self.i64.const_int(1, false), "elem_off").unwrap();
                     let elem_ptr = unsafe {
                         self.builder.build_gep(self.i64, arr_ptr, &[elem_off], "elem_ptr").unwrap()
@@ -559,6 +633,7 @@ impl<'ctx> Codegen<'ctx> {
                     ], false);
                     let memcpy_fn = self.module.get_function("memcpy").unwrap_or_else(|| self.module.add_function("memcpy", memcpy_type, None));
                     let old_len = self.builder.build_load(self.i64, arr_ptr, "old_len").unwrap().into_int_value();
+                    self.gen_bounds_check(idx_int, old_len, "array");
                     // Layout is [len, elem0, ..]; `slots` counts the header too.
                     let slots = self.builder.build_int_add(old_len, self.i64.const_int(1, false), "slots").unwrap();
                     // This asked malloc for `slots` *bytes* and then memcpy'd
@@ -580,6 +655,25 @@ impl<'ctx> Codegen<'ctx> {
                     let s_ptr = match s_val { CgValue::Str(p) => p, _ => panic!("substring expects string") };
                     let start = self.value_to_int(&start_val);
                     let end = self.value_to_int(&end_val);
+                    // The interpreter bounds-checks against len + 1, so an index
+                    // one past the last byte is a valid end.
+                    let strlen_ty = self.i64.fn_type(&[self.context.ptr_type(AddressSpace::default()).into()], false);
+                    let strlen_f = self.module.get_function("strlen").unwrap_or_else(|| self.module.add_function("strlen", strlen_ty, None));
+                    let s_len = self.builder.build_call(strlen_f, &[s_ptr.into()], "sub_srclen").unwrap()
+                        .try_as_basic_value().left().unwrap().into_int_value();
+                    let limit = self.builder.build_int_add(s_len, self.i64.const_int(1, false), "sub_limit").unwrap();
+                    self.gen_bounds_check(start, limit, "substring start");
+                    self.gen_bounds_check(end, limit, "substring end");
+                    {
+                        let f = self.builder.get_insert_block().unwrap().get_parent().unwrap();
+                        let bad = self.context.append_basic_block(f, "sub_inverted");
+                        let good = self.context.append_basic_block(f, "sub_ordered");
+                        let inverted = self.builder.build_int_compare(inkwell::IntPredicate::SGT, start, end, "inverted").unwrap();
+                        self.builder.build_conditional_branch(inverted, bad, good).unwrap();
+                        self.builder.position_at_end(bad);
+                        self.gen_abort("substring start \x01 is past end \x01", &[start, end]);
+                        self.builder.position_at_end(good);
+                    }
                     let malloc_type = self.context.ptr_type(AddressSpace::default()).fn_type(&[self.i64.into()], false);
                     let malloc_fn = self.module.get_function("malloc").unwrap_or_else(|| self.module.add_function("malloc", malloc_type, None));
                     let memcpy_type = self.context.void_type().fn_type(&[
@@ -1315,6 +1409,8 @@ Expr::Match { scrutinee, arms } => {
                 let arr_ptr = self.builder.build_int_to_ptr(arr_ptr_val, self.context.ptr_type(AddressSpace::default()), "arr_ptr").unwrap();
                 let idx_val = self.gen_expr(idx);
                 let idx_int = self.value_to_int(&idx_val);
+                let arr_len = self.builder.build_load(self.i64, arr_ptr, "arr_len").unwrap().into_int_value();
+                self.gen_bounds_check(idx_int, arr_len, "array");
                 let elem_offset = self.builder.build_int_add(idx_int, self.i64.const_int(1, false), "elem_off").unwrap();
                 let elem_ptr = unsafe {
                     self.builder.build_gep(self.i64, arr_ptr, &[elem_offset], "elem_ptr").unwrap()
@@ -1660,6 +1756,7 @@ Expr::Match { scrutinee, arms } => {
 
     fn gen_stmt(&mut self, s: &Stmt, fn_val: FunctionValue<'ctx>, terminated: &mut bool) {
         if *terminated { return; }
+        self.current_span = s.span;
         match &s.kind {
             StmtKind::Let { name, value, .. } => {
                 if let Some(sn) = self.infer_struct_type(value) {
@@ -2110,10 +2207,12 @@ fn expand_macro_call_inline_single(stmt: &Stmt, arg_map: &HashMap<String, Expr>,
 
 /// Compile a program to a native executable at `out_path` using LLVM + system
 /// toolchain (llc / clang).
-pub fn compile_to_executable(program: &Program, out_path: &str) {
+pub fn compile_to_executable(program: &Program, out_path: &str, src_path: &str, src: &str) {
     let program = expand_macros_program(program);
     let context = Context::create();
     let mut cg = Codegen::new(&context, &program);
+    cg.path = src_path.to_string();
+    cg.src = src.to_string();
 
     // Register struct fields and enum variants
     for s in &program.stmts {

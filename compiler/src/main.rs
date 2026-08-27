@@ -150,7 +150,7 @@ fn main() {
             } else {
                 args.get(3).cloned().unwrap_or_else(|| "a.out".into())
             };
-            codegen_llvm::compile_to_executable(&program, &out);
+            codegen_llvm::compile_to_executable(&program, &out, file, &src);
         }
         #[cfg(not(feature = "llvm"))]
         "build" => {
