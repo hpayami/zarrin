@@ -636,3 +636,126 @@ fn main() { print(f(R)); print(f(B)); print(g(0)); print(g(21)); }
 "#,
     );
 }
+
+// --- values that lose their type at the merge -------------------------------
+//
+// Both found by the cross-backend walk below, once the comprehensive example
+// was made comprehensive.
+
+#[test]
+fn booleans_print_as_true_and_false() {
+    // Booleans are i64 0/1 in this backend, so `print` showed 1.
+    assert_agrees_with_interpreter(
+        r#"
+fn big(n: int) -> bool { return n > 100; }
+fn main() {
+    print(true); print(false);
+    print(1 < 2); print(1 == 2);
+    print(true && false); print(!true);
+    print(contains("hello", "ell"));
+    print(big(500)); print(big(1));
+    let b = 3 > 1;
+    print(b); print(to_string(b));
+    let o = Some(1);
+    print(o.is_some()); print(o.is_none());
+}
+"#,
+    );
+}
+
+#[test]
+fn a_match_or_if_yielding_a_string_keeps_its_type() {
+    // Branches merge through an i64 phi; the result was handed back as an int,
+    // so a string arm printed the number its pointer happened to be.
+    assert_agrees_with_interpreter(
+        r#"
+fn main() {
+    let n = 7;
+    print(match n { 7 => "seven", _ => "other" });
+    print(if n > 3 { "big" } else { "small" });
+    print(if n > 3 { 1.5 } else { 0.25 });
+    print(match n { 7 => 2.5, _ => 0.0 });
+}
+"#,
+    );
+}
+
+// --- every example, both backends -------------------------------------------
+
+/// Walk `examples/` and require the native executable to behave exactly like
+/// the interpreter: same stdout, same exit status.
+///
+/// The inline tests above each pin one thing that was wrong. This one needs no
+/// maintenance: an example added later is covered the day it lands. Most of the
+/// bugs fixed in this backend were found by running a program both ways and
+/// looking at the difference, which is what this automates.
+#[test]
+fn every_example_agrees_across_backends() {
+    if !enabled() {
+        // Requires `--features llvm` and LLVM_SYS_180_PREFIX; see the README.
+        return;
+    }
+    let examples = common::examples_dir();
+    let mut programs: Vec<PathBuf> = std::fs::read_dir(&examples)
+        .unwrap_or_else(|e| panic!("cannot read {}: {}", examples.display(), e))
+        .filter_map(Result::ok)
+        .map(|e| e.path())
+        .filter(|p| p.extension().map(|x| x == "zr").unwrap_or(false))
+        .collect();
+    programs.sort();
+    assert!(!programs.is_empty(), "no examples found in {}", examples.display());
+
+    let dir = std::env::temp_dir().join(format!("zarrin-cross-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut failures = Vec::new();
+
+    for path in &programs {
+        let name = path.file_stem().unwrap().to_string_lossy().to_string();
+
+        let interpreted = Command::new(env!("CARGO_BIN_EXE_zarrinc"))
+            .arg("run")
+            .arg(path)
+            .output()
+            .expect("failed to invoke zarrinc");
+
+        let exe = dir.join(&name);
+        let build = Command::new(env!("CARGO_BIN_EXE_zarrinc"))
+            .args(["build", path.to_str().unwrap(), "-o", exe.to_str().unwrap()])
+            .output()
+            .expect("failed to invoke zarrinc");
+        if !build.status.success() {
+            failures.push(format!(
+                "{}: native build failed\n    {}",
+                name,
+                String::from_utf8_lossy(&build.stderr).trim().replace('\n', "\n    ")
+            ));
+            continue;
+        }
+
+        let native = Command::new(&exe).output().expect("failed to run the executable");
+        let (want, got) = (
+            String::from_utf8_lossy(&interpreted.stdout),
+            String::from_utf8_lossy(&native.stdout),
+        );
+        if want != got {
+            failures.push(format!(
+                "{}: output differs\n    interpreter: {:?}\n    native:      {:?}",
+                name, want, got
+            ));
+        } else if interpreted.status.code() != native.status.code() {
+            failures.push(format!(
+                "{}: exit status differs — interpreter {:?}, native {:?}",
+                name,
+                interpreted.status.code(),
+                native.status.code()
+            ));
+        }
+    }
+
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(
+        failures.is_empty(),
+        "\nthe two backends disagree:\n\n{}\n",
+        failures.join("\n")
+    );
+}

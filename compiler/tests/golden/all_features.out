@@ -10,4 +10,17 @@ Rgb(255, 128, 0)
 hello world
 100
 5
+20
+world
+true
+padded
+tab	sep
+a brace { stays put }
+20
+3
+42
+lucky
+blue
+11
+21
 === All features passed! ===

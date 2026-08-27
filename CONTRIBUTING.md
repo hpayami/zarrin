@@ -52,3 +52,10 @@ A new builtin needs an entry in `compiler/src/builtins.rs` and a call in the
 Three backends have to agree on the language's semantics — the type checker,
 the interpreter and the LLVM backend. When you change behaviour in one, check
 the other two.
+
+`every_example_agrees_across_backends` in `llvm_backend.rs` runs every program
+in `examples/` through the interpreter and as a native executable and requires
+identical output and exit status. Most bugs found in the native backend were
+found exactly this way, so an example that exercises a feature is worth more
+than one that only demonstrates it. That test needs `--features llvm`; without
+it the whole file is skipped.

@@ -7,6 +7,7 @@
 #![cfg(feature = "llvm")]
 
 use crate::ast::*;
+use crate::builtins;
 use crate::diagnostic::{Diagnostic, Span};
 use crate::variants::{builtin_enums, Lookup, Variant, VariantIndex};
 use inkwell::builder::Builder;
@@ -50,6 +51,8 @@ pub struct Codegen<'ctx> {
     /// Variables known to hold a value of a given enum, so `print` can show
     /// the variant name instead of the address it is represented by.
     var_enum_type: HashMap<String, String>,
+    /// Locals known to hold a boolean.
+    var_bool: std::collections::HashSet<String>,
     /// Source of the program being compiled, so a check that fails at run time
     /// can print the same diagnostic the interpreter would.
     path: String,
@@ -89,6 +92,7 @@ impl<'ctx> Codegen<'ctx> {
             struct_fields: HashMap::new(),
             var_struct_type: HashMap::new(),
             var_enum_type: HashMap::new(),
+            var_bool: std::collections::HashSet::new(),
             path: String::new(),
             src: String::new(),
             current_span: Span::new(1, 1),
@@ -218,6 +222,30 @@ impl<'ctx> Codegen<'ctx> {
 
     fn is_enum(&self, name: &str) -> bool {
         self.enum_variants.contains_key(name) || builtin_enums().iter().any(|(n, _)| n == name)
+    }
+
+    /// Whether this expression yields a boolean. Booleans are i64 0/1 here, so
+    /// `print` showed 1 where the interpreter shows true.
+    fn is_bool_expr(&self, e: &Expr) -> bool {
+        match e {
+            Expr::Bool(_) => true,
+            Expr::Unary(UnaryOp::Not, _) => true,
+            Expr::Binary(_, op, _) => matches!(
+                op,
+                BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge | BinOp::And | BinOp::Or
+            ),
+            Expr::Ident(n) => self.var_bool.contains(n),
+            Expr::MethodCall(_, m, _) => matches!(m.as_str(), "is_some" | "is_none" | "is_ok" | "is_err"),
+            Expr::Call(callee, _) => {
+                let Expr::Ident(n) = callee.as_ref() else { return false };
+                if let Some((_, ret)) = builtins::signature(n) {
+                    return ret == Type::Bool;
+                }
+                matches!(self.fn_ret_types.get(n), Some(Type::Bool))
+            }
+            Expr::If { then_body, .. } => self.is_bool_expr(then_body),
+            _ => false,
+        }
     }
 
     /// Which struct, if any, this expression produces. Field access used to
@@ -527,6 +555,14 @@ impl<'ctx> Codegen<'ctx> {
                     _ => panic!("cannot call non-function"),
                 };
                 if name == "print" {
+                    if self.is_bool_expr(&args[0]) {
+                        let v = self.gen_expr(&args[0]);
+                        let iv = self.value_to_int(&v);
+                        let text = self.gen_bool_to_str(iv);
+                        let fmt = self.string_global("%s\n");
+                        self.builder.build_call(self.printf, &[fmt.into(), text.into()], "call_printf").unwrap();
+                        return CgValue::Int(self.i64.const_int(0, false));
+                    }
                     if let Some(en) = self.infer_enum_type(&args[0]) {
                         let v = self.gen_expr(&args[0]);
                         let iv = self.value_to_int(&v);
@@ -563,6 +599,11 @@ impl<'ctx> Codegen<'ctx> {
                     return CgValue::Str(str_ptr);
                 }
                 if name == "to_string" {
+                    if self.is_bool_expr(&args[0]) {
+                        let v = self.gen_expr(&args[0]);
+                        let iv = self.value_to_int(&v);
+                        return CgValue::Str(self.gen_bool_to_str(iv));
+                    }
                     if let Some(en) = self.infer_enum_type(&args[0]) {
                         let v = self.gen_expr(&args[0]);
                         let iv = self.value_to_int(&v);
@@ -1098,6 +1139,7 @@ Expr::Match { scrutinee, arms } => {
                     (sv_int_raw, None)
                 };
                 let mut arm_values: Vec<(IntValue<'ctx>, BasicBlock<'ctx>)> = Vec::new();
+                let mut arm_shape: Option<CgValue<'ctx>> = None;
                 let mut current_check = self.context.append_basic_block(parent, "match_check");
                 self.builder.build_unconditional_branch(current_check).unwrap();
                 for (i, (patterns, guard, body)) in arms.iter().enumerate() {
@@ -1222,6 +1264,7 @@ Expr::Match { scrutinee, arms } => {
                     };
                     let bv = self.gen_expr(body);
                     let bv_int = self.value_to_int(&bv);
+                    if arm_shape.is_none() { arm_shape = Some(bv.clone()); }
                     arm_values.push((bv_int, body_bb));
                     self.builder.build_unconditional_branch(merge).unwrap();
                     if let Some(nc) = next_check {
@@ -1240,7 +1283,7 @@ Expr::Match { scrutinee, arms } => {
                 for (v, bb) in &arm_values {
                     phi.add_incoming(&[(&*v, *bb)]);
                 }
-                CgValue::Int(phi.as_basic_value().into_int_value())
+                self.reshape_like(phi.as_basic_value().into_int_value(), arm_shape.as_ref())
             }
             Expr::If { cond, then_body, else_body } => {
                 let cond_val = self.gen_expr(cond);
@@ -1278,7 +1321,7 @@ Expr::Match { scrutinee, arms } => {
                 self.builder.position_at_end(merge_bb);
                 let phi = self.builder.build_phi(self.i64, "if.result").unwrap();
                 phi.add_incoming(&[(&then_int, then_bb), (&else_int, else_bb)]);
-                CgValue::Int(phi.as_basic_value().into_int_value())
+                self.reshape_like(phi.as_basic_value().into_int_value(), Some(&then_val))
             }
             Expr::While { cond, body } => {
                 let fn_val = self.builder.get_insert_block().unwrap().get_parent().unwrap();
@@ -1721,6 +1764,30 @@ Expr::Match { scrutinee, arms } => {
         buf
     }
 
+    /// Every branch of a match or an if is merged through an i64 phi. Put the
+    /// result back into whatever shape the branches produced, or a string arm
+    /// comes out as the number its pointer happens to be.
+    fn reshape_like(&self, merged: IntValue<'ctx>, sample: Option<&CgValue<'ctx>>) -> CgValue<'ctx> {
+        match sample {
+            Some(CgValue::Str(_)) => CgValue::Str(
+                self.builder.build_int_to_ptr(merged, self.context.ptr_type(AddressSpace::default()), "merge_str").unwrap(),
+            ),
+            Some(CgValue::Float(_)) => CgValue::Float(
+                self.builder.build_bit_cast(merged, self.f64, "merge_f").unwrap().into_float_value(),
+            ),
+            _ => CgValue::Int(merged),
+        }
+    }
+
+    fn gen_bool_to_str(&self, v: IntValue<'ctx>) -> PointerValue<'ctx> {
+        let ptr_ty = self.context.ptr_type(AddressSpace::default());
+        let t = self.builder.build_global_string_ptr("true", "true_txt").unwrap().as_pointer_value();
+        let f = self.builder.build_global_string_ptr("false", "false_txt").unwrap().as_pointer_value();
+        let zero = self.i64.const_zero();
+        let is_true = self.builder.build_int_compare(inkwell::IntPredicate::NE, v, zero, "is_true").unwrap();
+        self.builder.build_select(is_true, t, f, "bool_txt").unwrap().into_pointer_value()
+    }
+
     fn value_to_int(&self, v: &CgValue<'ctx>) -> IntValue<'ctx> {
         match v {
             CgValue::Int(val) => *val,
@@ -1766,6 +1833,11 @@ Expr::Match { scrutinee, arms } => {
                 }
                 if let Some(en) = self.infer_enum_type(value) {
                     self.var_enum_type.insert(name.clone(), en);
+                }
+                if self.is_bool_expr(value) {
+                    self.var_bool.insert(name.clone());
+                } else {
+                    self.var_bool.remove(name);
                 }
                 let v = self.gen_expr(value);
                 let (ptr, ty_name) = match &v {
@@ -2273,6 +2345,7 @@ pub fn compile_to_executable(program: &Program, out_path: &str, src_path: &str, 
                 cg.builder.position_at_end(entry);
                 cg.named.clear();
                 cg.var_enum_type.clear();
+                cg.var_bool.clear();
                 cg.var_struct_type.clear();
 
                 let mut terminated = false;
@@ -2308,6 +2381,7 @@ pub fn compile_to_executable(program: &Program, out_path: &str, src_path: &str, 
                         cg.builder.position_at_end(entry);
                         cg.named.clear();
                 cg.var_enum_type.clear();
+                cg.var_bool.clear();
                 cg.var_struct_type.clear();
                         let mut terminated = false;
                         for (i, (pname, pty)) in params.iter().enumerate() {
@@ -2358,6 +2432,7 @@ pub fn compile_to_executable(program: &Program, out_path: &str, src_path: &str, 
     cg.builder.position_at_end(entry);
     cg.named.clear();
                 cg.var_enum_type.clear();
+                cg.var_bool.clear();
                 cg.var_struct_type.clear();
 
     if has_user_main {

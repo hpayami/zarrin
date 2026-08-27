@@ -90,5 +90,45 @@ fn main() {
     }
     print(i);
 
+    // for loop over a range, with continue
+    let evens = 0;
+    for k in 0..10 {
+        if k % 2 == 1 { continue; }
+        evens = evens + k;
+    }
+    print(evens);
+
+    // string builtins and escape sequences
+    print(substring("hello world", 6, 11));
+    print(contains("hello", "ell"));
+    print(trim("  padded  "));
+    print("tab\tsep");
+    print("a brace \{ stays put \}");
+
+    // arrays
+    let xs = [10, 20, 30];
+    print(xs[1]);
+    print(len(xs));
+
+    // Option, and a match with a guard and a qualified pattern
+    let maybe = Some(41);
+    if maybe.is_some() { print(maybe.unwrap() + 1); }
+    let grade = match a {
+        n if n > 100 => "big",
+        7 => "lucky",
+        _ => "other",
+    };
+    print(grade);
+    print(match c { Color::Blue => "blue", _ => "not blue" });
+
+    // a struct built by a function, read back through its fields
+    let q = shifted(p);
+    print(q.x);
+    print(q.y);
+
     print("=== All features passed! ===");
+}
+
+fn shifted(src: Point) -> Point {
+    return Point { x: src.x + 1, y: src.y + 1 };
 }
