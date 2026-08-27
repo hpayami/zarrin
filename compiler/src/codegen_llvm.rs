@@ -1240,24 +1240,182 @@ Expr::Match { scrutinee, arms } => {
         result_ptr
     }
 
+    /// Format a float the way the interpreter does: the shortest decimal that
+    /// reads back as the same double, in plain notation, no exponent.
+    ///
+    /// This used to be `sprintf("%.6f")`, which both lost precision
+    /// (0.3333333333333333 came out as 0.333333) and padded whole numbers
+    /// (12 as 12.000000), so the two backends printed different things for the
+    /// same program.
+    ///
+    /// The shortest form is found by asking for one more decimal place until
+    /// the result parses back to the original value. A whole number needs a
+    /// second pass: at zero decimals `%f` prints the double's exact binary
+    /// expansion, which for large magnitudes is far longer than the shortest
+    /// form, so its digits are replaced with the correctly rounded ones from
+    /// `%e` followed by zeros.
     fn gen_float_to_str(&self, val: FloatValue<'ctx>) -> PointerValue<'ctx> {
-        let malloc_type = self.context.ptr_type(AddressSpace::default()).fn_type(&[self.i64.into()], false);
-        let malloc_fn = self.module.get_function("malloc").unwrap_or_else(|| self.module.add_function("malloc", malloc_type, None));
-        let buf = self.builder.build_call(malloc_fn, &[self.i64.const_int(64, false).into()], "float_buf").unwrap().try_as_basic_value().left().unwrap().into_pointer_value();
+        const CAP: u64 = 4200; // widest expansion of a subnormal, plus room
+        let ptr_ty = self.context.ptr_type(AddressSpace::default());
+        let i32_ty = self.context.i32_type();
 
-        let byte_ptr_ty = self.i8.ptr_type(AddressSpace::default());
-        let byte_ptr = self.builder.build_bit_cast(buf, byte_ptr_ty, "float_byte_ptr").unwrap().into_pointer_value();
+        let snprintf = self.module.get_function("snprintf").unwrap_or_else(|| {
+            let ty = i32_ty.fn_type(&[ptr_ty.into(), self.i64.into(), ptr_ty.into()], true);
+            self.module.add_function("snprintf", ty, None)
+        });
+        let strtod = self.module.get_function("strtod").unwrap_or_else(|| {
+            let ty = self.f64.fn_type(&[ptr_ty.into(), ptr_ty.into()], false);
+            self.module.add_function("strtod", ty, None)
+        });
+        let strlen = self.module.get_function("strlen").unwrap_or_else(|| {
+            let ty = self.i64.fn_type(&[ptr_ty.into()], false);
+            self.module.add_function("strlen", ty, None)
+        });
 
-        let sprintf_type = self.i64.fn_type(&[
-            byte_ptr_ty.into(),
-            byte_ptr_ty.into(),
-        ], true);
-        let sprintf_fn = self.module.get_function("sprintf").unwrap_or_else(|| self.module.add_function("sprintf", sprintf_type, None));
+        let buf = self.heap_slots(CAP / 8, "float_buf");
+        let ebuf = self.heap_slots(8, "float_ebuf");
+        let cap = self.i64.const_int(CAP, false);
+        let null = ptr_ty.const_null();
+        let fmt_f = self.builder.build_global_string_ptr("%.*f", "fmt_f").unwrap().as_pointer_value();
+        let fmt_g = self.builder.build_global_string_ptr("%.*g", "fmt_g").unwrap().as_pointer_value();
+        let fmt_e = self.builder.build_global_string_ptr("%.*e", "fmt_e").unwrap().as_pointer_value();
 
-        let fmt = self.builder.build_global_string_ptr("%.6f", "float_fmt").unwrap().as_pointer_value();
+        let f = self.builder.get_insert_block().unwrap().get_parent().unwrap();
+        let bb = |n: &str| self.context.append_basic_block(f, n);
 
-        self.builder.build_call(sprintf_fn, &[byte_ptr.into(), fmt.into(), val.into()], "call_sprintf").unwrap();
+        // --- NaN: never compares equal to itself, so the search below would
+        // --- run to the cap and then print printf's spelling, "nan" ---------
+        let (nan_bb, num_bb) = (bb("float_nan"), bb("float_num"));
+        let is_nan = self.builder.build_float_compare(inkwell::FloatPredicate::UNO, val, val, "is_nan").unwrap();
+        self.builder.build_conditional_branch(is_nan, nan_bb, num_bb).unwrap();
+        self.builder.position_at_end(nan_bb);
+        let fmt_s = self.builder.build_global_string_ptr("%s", "fmt_s").unwrap().as_pointer_value();
+        let nan_txt = self.builder.build_global_string_ptr("NaN", "nan_txt").unwrap().as_pointer_value();
+        self.builder.build_call(snprintf, &[buf.into(), cap.into(), fmt_s.into(), nan_txt.into()], "").unwrap();
+        let nan_exit = self.builder.get_insert_block().unwrap();
+        self.builder.position_at_end(num_bb);
 
+        // --- shortest number of decimals that round-trips -------------------
+        let d_ptr = self.builder.build_alloca(self.i64, "fd").unwrap();
+        self.builder.build_store(d_ptr, self.i64.const_zero()).unwrap();
+        let (d_head, d_next, d_done) = (bb("fd_head"), bb("fd_next"), bb("fd_done"));
+        self.builder.build_unconditional_branch(d_head).unwrap();
+
+        self.builder.position_at_end(d_head);
+        let d = self.builder.build_load(self.i64, d_ptr, "d").unwrap().into_int_value();
+        let d32 = self.builder.build_int_truncate(d, i32_ty, "d32").unwrap();
+        self.builder.build_call(snprintf, &[buf.into(), cap.into(), fmt_f.into(), d32.into(), val.into()], "").unwrap();
+        let back = self.builder.build_call(strtod, &[buf.into(), null.into()], "back").unwrap()
+            .try_as_basic_value().left().unwrap().into_float_value();
+        let exact = self.builder.build_float_compare(inkwell::FloatPredicate::OEQ, back, val, "exact").unwrap();
+        let capped = self.builder.build_int_compare(inkwell::IntPredicate::SGE, d, self.i64.const_int(1100, false), "capped").unwrap();
+        let stop = self.builder.build_or(exact, capped, "stop").unwrap();
+        self.builder.build_conditional_branch(stop, d_done, d_next).unwrap();
+
+        self.builder.position_at_end(d_next);
+        let d1 = self.builder.build_int_add(d, self.i64.const_int(1, false), "d1").unwrap();
+        self.builder.build_store(d_ptr, d1).unwrap();
+        self.builder.build_unconditional_branch(d_head).unwrap();
+
+        self.builder.position_at_end(d_done);
+        let d = self.builder.build_load(self.i64, d_ptr, "d_final").unwrap().into_int_value();
+        let whole = self.builder.build_int_compare(inkwell::IntPredicate::EQ, d, self.i64.const_zero(), "whole").unwrap();
+        let pinf = self.builder.build_float_compare(inkwell::FloatPredicate::OEQ, val, self.f64.const_float(f64::INFINITY), "pinf").unwrap();
+        let ninf = self.builder.build_float_compare(inkwell::FloatPredicate::OEQ, val, self.f64.const_float(f64::NEG_INFINITY), "ninf").unwrap();
+        let infinite = self.builder.build_or(pinf, ninf, "infinite").unwrap();
+        let finite = self.builder.build_not(infinite, "finite").unwrap();
+        let rewrite = self.builder.build_and(whole, finite, "rewrite").unwrap();
+        let (fixup, finish) = (bb("float_fixup"), bb("float_done"));
+        self.builder.build_conditional_branch(rewrite, fixup, finish).unwrap();
+
+        // --- whole numbers: shortest significant digits, then zeros ---------
+        self.builder.position_at_end(fixup);
+        let len = self.builder.build_call(strlen, &[buf.into()], "len").unwrap()
+            .try_as_basic_value().left().unwrap().into_int_value();
+        let first = self.builder.build_load(self.i8, buf, "first").unwrap().into_int_value();
+        let is_neg = self.builder.build_int_compare(inkwell::IntPredicate::EQ, first, self.i8.const_int('-' as u64, false), "is_neg").unwrap();
+        let neg = self.builder.build_int_z_extend(is_neg, self.i64, "neg").unwrap();
+
+        let p_ptr = self.builder.build_alloca(self.i64, "fp").unwrap();
+        self.builder.build_store(p_ptr, self.i64.const_int(1, false)).unwrap();
+        let (p_head, p_next, p_done) = (bb("fp_head"), bb("fp_next"), bb("fp_done"));
+        self.builder.build_unconditional_branch(p_head).unwrap();
+
+        self.builder.position_at_end(p_head);
+        let pv = self.builder.build_load(self.i64, p_ptr, "p").unwrap().into_int_value();
+        let p32 = self.builder.build_int_truncate(pv, i32_ty, "p32").unwrap();
+        self.builder.build_call(snprintf, &[ebuf.into(), self.i64.const_int(64, false).into(), fmt_g.into(), p32.into(), val.into()], "").unwrap();
+        let back2 = self.builder.build_call(strtod, &[ebuf.into(), null.into()], "back2").unwrap()
+            .try_as_basic_value().left().unwrap().into_float_value();
+        let exact2 = self.builder.build_float_compare(inkwell::FloatPredicate::OEQ, back2, val, "exact2").unwrap();
+        let capped2 = self.builder.build_int_compare(inkwell::IntPredicate::SGE, pv, self.i64.const_int(17, false), "capped2").unwrap();
+        let stop2 = self.builder.build_or(exact2, capped2, "stop2").unwrap();
+        self.builder.build_conditional_branch(stop2, p_done, p_next).unwrap();
+
+        self.builder.position_at_end(p_next);
+        let p1 = self.builder.build_int_add(pv, self.i64.const_int(1, false), "p1").unwrap();
+        self.builder.build_store(p_ptr, p1).unwrap();
+        self.builder.build_unconditional_branch(p_head).unwrap();
+
+        self.builder.position_at_end(p_done);
+        let p = self.builder.build_load(self.i64, p_ptr, "p_final").unwrap().into_int_value();
+        let pm1 = self.builder.build_int_sub(p, self.i64.const_int(1, false), "pm1").unwrap();
+        let pm1_32 = self.builder.build_int_truncate(pm1, i32_ty, "pm1_32").unwrap();
+        self.builder.build_call(snprintf, &[ebuf.into(), self.i64.const_int(64, false).into(), fmt_e.into(), pm1_32.into(), val.into()], "").unwrap();
+
+        // copy p digits out of "d.ddde+XX", skipping the point
+        let j_ptr = self.builder.build_alloca(self.i64, "j").unwrap();
+        let k_ptr = self.builder.build_alloca(self.i64, "k").unwrap();
+        let g_ptr = self.builder.build_alloca(self.i64, "got").unwrap();
+        self.builder.build_store(j_ptr, neg).unwrap();
+        self.builder.build_store(k_ptr, neg).unwrap();
+        self.builder.build_store(g_ptr, self.i64.const_zero()).unwrap();
+        let (c_head, c_write, c_skip, pad_head, pad_body) =
+            (bb("copy_head"), bb("copy_write"), bb("copy_skip"), bb("pad_head"), bb("pad_body"));
+        self.builder.build_unconditional_branch(c_head).unwrap();
+
+        self.builder.position_at_end(c_head);
+        let got = self.builder.build_load(self.i64, g_ptr, "got_v").unwrap().into_int_value();
+        let more = self.builder.build_int_compare(inkwell::IntPredicate::SLT, got, p, "more").unwrap();
+        self.builder.build_conditional_branch(more, c_write, pad_head).unwrap();
+
+        self.builder.position_at_end(c_write);
+        let k = self.builder.build_load(self.i64, k_ptr, "k_v").unwrap().into_int_value();
+        let src = unsafe { self.builder.build_gep(self.i8, ebuf, &[k], "src").unwrap() };
+        let ch = self.builder.build_load(self.i8, src, "ch").unwrap().into_int_value();
+        let is_dot = self.builder.build_int_compare(inkwell::IntPredicate::EQ, ch, self.i8.const_int('.' as u64, false), "is_dot").unwrap();
+        let write_bb = bb("do_write");
+        self.builder.build_conditional_branch(is_dot, c_skip, write_bb).unwrap();
+
+        self.builder.position_at_end(write_bb);
+        let j = self.builder.build_load(self.i64, j_ptr, "j_v").unwrap().into_int_value();
+        let dst = unsafe { self.builder.build_gep(self.i8, buf, &[j], "dst").unwrap() };
+        self.builder.build_store(dst, ch).unwrap();
+        self.builder.build_store(j_ptr, self.builder.build_int_add(j, self.i64.const_int(1, false), "j1").unwrap()).unwrap();
+        self.builder.build_store(g_ptr, self.builder.build_int_add(got, self.i64.const_int(1, false), "got1").unwrap()).unwrap();
+        self.builder.build_unconditional_branch(c_skip).unwrap();
+
+        self.builder.position_at_end(c_skip);
+        let k2 = self.builder.build_load(self.i64, k_ptr, "k2").unwrap().into_int_value();
+        self.builder.build_store(k_ptr, self.builder.build_int_add(k2, self.i64.const_int(1, false), "k1").unwrap()).unwrap();
+        self.builder.build_unconditional_branch(c_head).unwrap();
+
+        // the rest of the original digits become zeros; the terminator is already there
+        self.builder.position_at_end(pad_head);
+        let jp = self.builder.build_load(self.i64, j_ptr, "jp").unwrap().into_int_value();
+        let need = self.builder.build_int_compare(inkwell::IntPredicate::SLT, jp, len, "need").unwrap();
+        self.builder.build_conditional_branch(need, pad_body, finish).unwrap();
+
+        self.builder.position_at_end(pad_body);
+        let zdst = unsafe { self.builder.build_gep(self.i8, buf, &[jp], "zdst").unwrap() };
+        self.builder.build_store(zdst, self.i8.const_int('0' as u64, false)).unwrap();
+        self.builder.build_store(j_ptr, self.builder.build_int_add(jp, self.i64.const_int(1, false), "jp1").unwrap()).unwrap();
+        self.builder.build_unconditional_branch(pad_head).unwrap();
+
+        self.builder.position_at_end(nan_exit);
+        self.builder.build_unconditional_branch(finish).unwrap();
+
+        self.builder.position_at_end(finish);
         buf
     }
 
@@ -1278,9 +1436,12 @@ Expr::Match { scrutinee, arms } => {
                     .unwrap();
             }
             CgValue::Float(v) => {
-                let fmt = self.string_global("%f\n");
+                // Same formatting as to_string, so `print(x)` and
+                // `print(to_string(x))` agree, and both match the interpreter.
+                let s = self.gen_float_to_str(*v);
+                let fmt = self.string_global("%s\n");
                 self.builder
-                    .build_call(self.printf, &[fmt.into(), (*v).into()], "call_printf")
+                    .build_call(self.printf, &[fmt.into(), s.into()], "call_printf")
                     .unwrap();
             }
             CgValue::Str(ptr) => {

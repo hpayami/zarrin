@@ -65,9 +65,8 @@ program to print exactly what the interpreter prints. Those tests are skipped
 unless the feature is on, and on macOS they re-run each executable under Guard
 Malloc, which faults on a heap overrun instead of letting it pass unnoticed.
 
-Two known differences from the interpreter: `print` on an enum shows its
-address rather than the variant name, and floats print through `printf`'s `%f`
-(`78.500000`) where the interpreter uses the shortest representation (`78.5`).
+One known difference from the interpreter: `print` on an enum shows its
+address rather than the variant name.
 
 ## Tests
 

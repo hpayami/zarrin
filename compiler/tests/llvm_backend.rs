@@ -230,16 +230,65 @@ fn main() { print(f(0)); print(f(50)); }
 }
 
 #[test]
-fn the_float_match_example_compiles() {
-    // examples/enum_match.zr, which llc used to reject outright. Output is not
-    // compared: this backend prints floats with printf's %f ("78.500000")
-    // while the interpreter uses Rust's shortest representation ("78.5").
-    let Some(out) = build_and_run(
+fn the_float_match_example_agrees() {
+    // examples/enum_match.zr, which llc used to reject outright.
+    assert_agrees_with_interpreter(
         r#"
 enum Shape { Circle(float), Rect(float, float) }
 fn area(s: Shape) -> float { return match s { Circle(r) => 3.14 * r * r, Rect(w, h) => w * h }; }
 fn main() { print(area(Circle(5.0))); print(area(Rect(3.0, 4.0))); }
 "#,
-    ) else { return };
-    assert!(out.starts_with("78.5"), "unexpected output: {}", out);
+    );
+}
+
+// --- float formatting -------------------------------------------------------
+//
+// This backend printed floats with `sprintf("%.6f")`: 12 came out as
+// 12.000000, and 1/3 was truncated to 0.333333. It now searches for the
+// shortest decimal that reads back as the same double, which is what the
+// interpreter (Rust's Display) produces.
+
+#[test]
+fn whole_numbers_print_without_a_fraction() {
+    assert_agrees_with_interpreter(r#"fn main() { print(12.0); print(1.0); print(100.0); }"#);
+}
+
+#[test]
+fn precision_is_not_truncated() {
+    assert_agrees_with_interpreter(
+        r#"fn main() { print(1.0 / 3.0); print(2.0 / 7.0 * 1000000.0); print(0.1 + 0.2); }"#,
+    );
+}
+
+#[test]
+fn small_and_large_magnitudes() {
+    assert_agrees_with_interpreter(
+        r#"
+fn main() {
+    print(0.000000123);
+    print(123456789012345.6789);
+    print(100000.0 * 100000.0);
+    print(0.00001);
+}
+"#,
+    );
+}
+
+#[test]
+fn signs_and_zero() {
+    assert_agrees_with_interpreter(r#"fn main() { print(0.0); print(0.0 - 0.0); print(0.0 - 0.5); print(0.0 - 7.25); }"#);
+}
+
+#[test]
+fn nan_and_infinity() {
+    // NaN never compares equal to itself, so the search runs to its cap;
+    // infinity round-trips immediately but has no digits to rewrite.
+    assert_agrees_with_interpreter(
+        r#"fn main() { print(1.0 / 0.0 - 1.0 / 0.0); print(1.0 / 0.0); print(0.0 - 1.0 / 0.0); }"#,
+    );
+}
+
+#[test]
+fn to_string_and_print_agree_on_floats() {
+    assert_agrees_with_interpreter(r#"fn main() { print(78.5); print(to_string(78.5)); }"#);
 }
