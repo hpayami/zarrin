@@ -6,3 +6,6 @@ a.out
 *.ll
 *.o
 *.exe
+
+# macOS Finder metadata, in any directory
+.DS_Store
