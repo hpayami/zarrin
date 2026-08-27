@@ -771,6 +771,71 @@ fn main() {
     );
 }
 
+// --- allocation ---------------------------------------------------------------
+
+/// Compile `src` and hand back the LLVM IR the backend emitted alongside it.
+fn emitted_ir(src: &str) -> Option<String> {
+    if !enabled() {
+        return None;
+    }
+    let n = N.fetch_add(1, Ordering::SeqCst);
+    let dir: PathBuf = std::env::temp_dir().join(format!("zarrin-ir-{}-{}", std::process::id(), n));
+    std::fs::create_dir_all(&dir).unwrap();
+    let file = dir.join("prog.zr");
+    std::fs::write(&file, src).unwrap();
+    let exe = dir.join("prog");
+    let build = Command::new(env!("CARGO_BIN_EXE_zarrinc"))
+        .args(["build", file.to_str().unwrap(), "-o", exe.to_str().unwrap()])
+        .output()
+        .expect("failed to invoke zarrinc");
+    assert!(build.status.success(), "native build failed:\n{}", String::from_utf8_lossy(&build.stderr));
+    let ir = std::fs::read_to_string(exe.with_extension("ll")).expect("no .ll beside the executable");
+    let _ = std::fs::remove_dir_all(&dir);
+    Some(ir)
+}
+
+#[test]
+fn printing_a_float_allocates_nothing() {
+    // The formatter wrote into a 4200-byte heap buffer that was never freed and
+    // never escaped the call: printing 200k floats reached 937 MB resident,
+    // against 7 MB for the interpreter. It formats into frame memory now.
+    let Some(ir) = emitted_ir("fn main() { print(1.5); }\n") else { return };
+    assert!(ir.contains("%float_buf = alloca"), "the scratch buffer is not on the frame:\n{}", ir);
+    assert_eq!(
+        ir.matches("call ptr @malloc").count(),
+        0,
+        "printing a float still allocates:\n{}",
+        ir
+    );
+}
+
+#[test]
+fn a_float_string_that_escapes_is_still_allocated() {
+    // to_string hands the text to the program, so it cannot live in the frame.
+    let Some(ir) = emitted_ir("fn main() { let s = to_string(1.5); print(s); }\n") else { return };
+    assert!(ir.contains("call ptr @malloc"), "an escaping float string was not copied out:\n{}", ir);
+}
+
+#[test]
+fn float_strings_keep_their_values_when_several_are_live() {
+    // Each must get its own allocation; sharing one buffer would have the
+    // second overwrite the first.
+    assert_agrees_with_interpreter(
+        r#"
+enum S { Pair(float, float), One(float) }
+fn main() {
+    let a = to_string(2.5);
+    let b = to_string(3.5);
+    print(a + "/" + b);
+    print(Pair(1.25, 6.75));
+    print(One(0.5));
+    print("{a} and {b}");
+    print(to_string(1.0 / 3.0));
+}
+"#,
+    );
+}
+
 // --- every example, both backends -------------------------------------------
 
 /// Walk `examples/` and require the native executable to behave exactly like

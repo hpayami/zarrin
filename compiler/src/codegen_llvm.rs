@@ -181,6 +181,19 @@ impl<'ctx> Codegen<'ctx> {
         self.builder.position_at_end(ok);
     }
 
+    /// An alloca in the function's entry block, so a buffer inside a loop is
+    /// reserved once for the frame rather than on every iteration.
+    fn entry_alloca(&self, ty: inkwell::types::BasicTypeEnum<'ctx>, name: &str) -> PointerValue<'ctx> {
+        let f = self.builder.get_insert_block().unwrap().get_parent().unwrap();
+        let entry = f.get_first_basic_block().unwrap();
+        let b = self.context.create_builder();
+        match entry.get_first_instruction() {
+            Some(first) => b.position_before(&first),
+            None => b.position_at_end(entry),
+        }
+        b.build_alloca(ty, name).unwrap()
+    }
+
     fn heap_bytes(&self, bytes: IntValue<'ctx>, name: &str) -> PointerValue<'ctx> {
         self.builder
             .build_call(self.malloc_fn(), &[bytes.into()], name)
@@ -352,8 +365,10 @@ impl<'ctx> Codegen<'ctx> {
                     let raw = self.builder.build_load(self.i64, fp, "payload_v").unwrap().into_int_value();
                     parts.push(match ty {
                         Type::Float => {
+                            // Several payload strings are live at once while the
+                            // variant text is assembled, so each needs its own.
                             let fv = self.builder.build_bit_cast(raw, self.f64, "i2f").unwrap().into_float_value();
-                            self.gen_float_to_str(fv)
+                            self.gen_float_to_owned(fv)
                         }
                         Type::String => self.builder.build_int_to_ptr(raw, ptr_ty, "payload_s").unwrap(),
                         Type::Named(n) if self.is_enum(n) && depth < 3 => {
@@ -607,7 +622,7 @@ impl<'ctx> Codegen<'ctx> {
                         }
                         CgValue::Str(s) => return val,
                         CgValue::Float(f) => {
-                            let str_ptr = self.gen_float_to_str(*f);
+                            let str_ptr = self.gen_float_to_owned(*f);
                             return CgValue::Str(str_ptr);
                         }
                     }
@@ -1595,6 +1610,9 @@ Expr::Match { scrutinee, arms } => {
     /// expansion, which for large magnitudes is far longer than the shortest
     /// form, so its digits are replaced with the correctly rounded ones from
     /// `%e` followed by zeros.
+    /// Format a float into frame memory. The result is only valid until the
+    /// next call, so anything that keeps it must copy first — see
+    /// `gen_float_to_owned`.
     fn gen_float_to_str(&self, val: FloatValue<'ctx>) -> PointerValue<'ctx> {
         const CAP: u64 = 4200; // widest expansion of a subnormal, plus room
         let ptr_ty = self.context.ptr_type(AddressSpace::default());
@@ -1613,8 +1631,10 @@ Expr::Match { scrutinee, arms } => {
             self.module.add_function("strlen", ty, None)
         });
 
-        let buf = self.heap_slots(CAP / 8, "float_buf");
-        let ebuf = self.heap_slots(8, "float_ebuf");
+        // Scratch for the formatting itself: it never outlives this call.
+        // These were heap and never freed, which cost 4.2 KB per printed float.
+        let buf = self.entry_alloca(self.i8.array_type(CAP as u32).into(), "float_buf");
+        let ebuf = self.entry_alloca(self.i8.array_type(64).into(), "float_ebuf");
         let cap = self.i64.const_int(CAP, false);
         let null = ptr_ty.const_null();
         let fmt_f = self.builder.build_global_string_ptr("%.*f", "fmt_f").unwrap().as_pointer_value();
@@ -1760,6 +1780,27 @@ Expr::Match { scrutinee, arms } => {
         buf
     }
 
+    /// The same text, in an allocation of exactly the size it needs, for the
+    /// cases where it escapes the expression that produced it.
+    fn gen_float_to_owned(&self, val: FloatValue<'ctx>) -> PointerValue<'ctx> {
+        let ptr_ty = self.context.ptr_type(AddressSpace::default());
+        let scratch = self.gen_float_to_str(val);
+        let strlen = self.module.get_function("strlen").unwrap_or_else(|| {
+            let ty = self.i64.fn_type(&[ptr_ty.into()], false);
+            self.module.add_function("strlen", ty, None)
+        });
+        let memcpy = self.module.get_function("memcpy").unwrap_or_else(|| {
+            let ty = self.context.void_type().fn_type(&[ptr_ty.into(), ptr_ty.into(), self.i64.into()], false);
+            self.module.add_function("memcpy", ty, None)
+        });
+        let len = self.builder.build_call(strlen, &[scratch.into()], "flen").unwrap()
+            .try_as_basic_value().left().unwrap().into_int_value();
+        let size = self.builder.build_int_add(len, self.i64.const_int(1, false), "fsize").unwrap();
+        let owned = self.heap_bytes(size, "float_owned");
+        self.builder.build_call(memcpy, &[owned.into(), scratch.into(), size.into()], "").unwrap();
+        owned
+    }
+
     /// Every branch of a match or an if is merged through an i64 phi. Put the
     /// result back into whatever shape the branches produced, or a string arm
     /// comes out as the number its pointer happens to be.
@@ -1803,6 +1844,7 @@ Expr::Match { scrutinee, arms } => {
             CgValue::Float(v) => {
                 // Same formatting as to_string, so `print(x)` and
                 // `print(to_string(x))` agree, and both match the interpreter.
+                // printf consumes it on the spot, so the frame buffer serves.
                 let s = self.gen_float_to_str(*v);
                 let fmt = self.string_global("%s\n");
                 self.builder

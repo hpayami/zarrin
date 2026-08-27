@@ -32,8 +32,14 @@ literal brace — an unescaped `{` starts an interpolation. There is no `\0`: th
 native backend uses NUL-terminated strings, so an embedded NUL would behave
 differently there.
 
-Not yet: generics (parsed, then ignored), and freeing memory in the native
-backend.
+Not yet: generics, which are parsed and then ignored.
+
+The native backend never frees. Values that outlive the expression building
+them — structs, enum payloads, arrays, strings — are allocated and left, so a
+long-running loop that builds them grows without bound. Scratch that does *not*
+outlive its expression lives on the frame instead, which is why printing is
+flat; the rest waits on a decision about how the language reclaims memory, and
+the README's "optional explicit memory control" is the goal it points at.
 
 ## Build
 

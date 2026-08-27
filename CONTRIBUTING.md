@@ -53,6 +53,11 @@ Three backends have to agree on the language's semantics — the type checker,
 the interpreter and the LLVM backend. When you change behaviour in one, check
 the other two.
 
+Nothing in the native backend frees, so prefer the frame for anything that does
+not outlive the expression producing it: `entry_alloca` reserves it once per
+call rather than once per loop iteration. Reach for `heap_bytes` only when the
+value escapes, and size it to what is needed.
+
 The LLVM backend erases every value to i64, so it has to know an expression's
 type to emit the right code. It asks the type checker: `TypeChecker::type_of`,
 against a `TypeEnv` the backend keeps in step with the locals in scope. Do not
