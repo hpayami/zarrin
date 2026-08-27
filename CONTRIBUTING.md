@@ -138,9 +138,18 @@ same `id(x)` in every copy of `twice`. And the generic originals stay in the
 program: trait `impl` bodies are not walked by the checker, so calls in them are
 never rewritten, and removing the originals would break programs that run today.
 
+Two tests compare the backends against each other, and both need
+`--features llvm`; without it they are skipped.
+
 `every_example_agrees_across_backends` in `llvm_backend.rs` runs every program
 in `examples/` through the interpreter and as a native executable and requires
-identical output and exit status. Most bugs found in the native backend were
-found exactly this way, so an example that exercises a feature is worth more
-than one that only demonstrates it. That test needs `--features llvm`; without
-it the whole file is skipped.
+identical output and exit status. An example that exercises a feature is worth
+more than one that only demonstrates it.
+
+`differential.rs` does the same over `tests/differential/`, a corpus written to
+catch the two disagreeing rather than to show the language off: failing
+programs, empty and one-element cases, the extremes of an integer, non-ASCII
+strings. Adding a case is dropping a `.zr` file in — there is no expected
+output to write down, because the interpreter is the answer. Reach for it
+whenever you touch something both backends implement; fourteen differences
+turned up the first time it ran.

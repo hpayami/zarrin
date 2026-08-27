@@ -1,0 +1,7 @@
+// The checker matches a struct literal's fields by position, so listing them
+// in another order is a type error even though every field is right.
+struct P { x: int, y: float, tag: string }
+fn main() {
+    let q = P { tag: "u", y: 0.5, x: 9 };
+    print(q);
+}

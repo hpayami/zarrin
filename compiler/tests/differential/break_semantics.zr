@@ -1,0 +1,25 @@
+fn main() {
+    let i = 0;
+    while i < 5 {
+        print(i);
+        i = i + 1;
+        break;
+    }
+    print("after while");
+    for j in 0..5 {
+        if j == 2 { break; }
+        print(j);
+    }
+    print("after for");
+    let k = 0;
+    while k < 3 {
+        let m = 0;
+        while m < 3 {
+            if m == 1 { break; }
+            print(k * 10 + m);
+            m = m + 1;
+        }
+        k = k + 1;
+    }
+    print("after nested");
+}

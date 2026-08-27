@@ -1,0 +1,13 @@
+fn main() {
+    print(len(""));
+    print(len("héllo"));
+    print(substring("hello", 1, 3));
+    print(substring("hello", 0, 0));
+    print(contains("hello", ""));
+    print(char_at("hello", 0));
+    print(char_at("hello", 4));
+    print(trim(""));
+    print(trim("\t x \n"));
+    print(to_string(true));
+    print(int_to_str(-5));
+}

@@ -1,0 +1,12 @@
+fn main() {
+    let xs = [1, 2, 3];
+    print(array_len(xs));
+    print(array_get(xs, 0));
+    print(array_get(array_set(xs, 1, 99), 1));
+    print(xs[1]);
+    print(len(xs));
+    print(xs[0] + xs[2]);
+    let zs = ["a", "b"];
+    print(zs[1]);
+    print(len(zs));
+}

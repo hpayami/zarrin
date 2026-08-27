@@ -1,0 +1,11 @@
+struct P { x: int, y: float, tag: string }
+fn make(n: int) -> P {
+    return P { x: n, y: 1.5, tag: "t" };
+}
+fn main() {
+    let p = make(3);
+    print(p.x);
+    print(p.y);
+    print(p.tag);
+    print(p);
+}

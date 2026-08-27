@@ -1,0 +1,9 @@
+fn main() {
+    let a = if true { 1 } else { 2 };
+    print(a);
+    let b = if false { "y" } else { "n" };
+    print(b);
+    let c = if 1 > 2 { 1.5 } else { 2.5 };
+    print(c);
+    if 0 { print("zero true"); } else { print("zero false"); }
+}

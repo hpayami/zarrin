@@ -1,0 +1,12 @@
+struct Inner { v: int }
+struct Outer { i: Inner, o: Option<int> }
+enum Wrap { Has(Inner), Nothing }
+fn main() {
+    let o = Outer { i: Inner { v: 7 }, o: Some(3) };
+    print(o);
+    print(o.i.v);
+    print(o.o);
+    print(Has(Inner { v: 1 }));
+    print(Nothing);
+    print([Inner { v: 1 }, Inner { v: 2 }]);
+}

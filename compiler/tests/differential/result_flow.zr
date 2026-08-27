@@ -1,0 +1,11 @@
+fn parse(n: int) -> Result<int, string> {
+    if n > 0 { return Ok(n); }
+    return Err("bad");
+}
+fn main() {
+    print(parse(1));
+    print(parse(-1));
+    print(parse(1).is_ok());
+    print(parse(-1).is_err());
+    print(match parse(-1) { Ok(v) => "ok", Err(e) => e });
+}

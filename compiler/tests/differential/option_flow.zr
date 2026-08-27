@@ -1,0 +1,13 @@
+fn find(n: int) -> Option<int> {
+    if n > 0 { return Some(n * 2); }
+    return None;
+}
+fn main() {
+    print(find(3));
+    print(find(-1));
+    print(find(3).is_some());
+    print(find(-1).is_none());
+    print(find(3).unwrap());
+    let r = match find(4) { Some(v) => v, None => 0 };
+    print(r);
+}

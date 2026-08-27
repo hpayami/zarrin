@@ -1,0 +1,15 @@
+fn main() {
+    let a = split("a,b,c", ",");
+    print(len(a));
+    print(a[0]);
+    print(a[2]);
+    let b = split("abc", ",");
+    print(len(b));
+    print(b[0]);
+    let c = split("", ",");
+    print(len(c));
+    let d = split("a,,b", ",");
+    print(len(d));
+    print(d[1]);
+    print(split("x-y", "-")[1]);
+}

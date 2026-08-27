@@ -1,0 +1,4 @@
+extern fn abs(n: int) -> int;
+fn main() {
+    print(abs(0 - 5));
+}

@@ -1,0 +1,9 @@
+fn main() {
+    let e = [];
+    print(len(e));
+    print(e);
+    print(0..0);
+    for x in 0..0 { print("never"); }
+    for y in [] { print("never"); }
+    print("done");
+}

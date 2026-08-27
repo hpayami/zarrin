@@ -1,0 +1,11 @@
+fn main() {
+    let n = 5;
+    let f = 2.5;
+    let s = "str";
+    let b = true;
+    print("n={n} f={f} s={s} b={b}");
+    print("{n}{n}");
+    print("{n + 1}");
+    print("");
+    print("no holes");
+}

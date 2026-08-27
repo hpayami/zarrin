@@ -1,0 +1,12 @@
+fn id<T>(x: T) -> T {
+    return x;
+}
+fn pick<A, B>(a: A, b: B, first: bool) -> A {
+    return a;
+}
+fn main() {
+    print(id([1, 2]));
+    print(id(Some(1.5)));
+    print(pick("s", 1, true));
+    print(id(1..3));
+}

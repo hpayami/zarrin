@@ -1,0 +1,16 @@
+fn nothing() {
+    print("side effect");
+}
+fn early(n: int) -> int {
+    if n > 0 { return 1; }
+    return 0;
+}
+fn implicit(n: int) -> int {
+    return n * 2;
+}
+fn main() {
+    nothing();
+    print(early(1));
+    print(early(-1));
+    print(implicit(21));
+}

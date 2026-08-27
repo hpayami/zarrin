@@ -1,0 +1,5 @@
+// Both backends implement joining a string to a number, and the checker
+// rejects it. Either it should be allowed or that code should go.
+fn main() {
+    print("a" + 1);
+}

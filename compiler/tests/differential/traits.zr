@@ -1,0 +1,12 @@
+struct Dog { name: string }
+trait Speak { fn speak(self) -> string; }
+impl Speak for Dog {
+    fn speak(self) -> string {
+        return "woof";
+    }
+}
+fn main() {
+    let d = Dog { name: "rex" };
+    print(d.speak());
+    print(d.name);
+}

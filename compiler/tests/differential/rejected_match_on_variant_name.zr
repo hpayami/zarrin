@@ -1,0 +1,5 @@
+// `match Green {` is read as a struct literal. It works on a variable.
+enum Color { Red, Green, Blue }
+fn main() {
+    print(match Green { Red => 0, Green => 1, Blue => 2 });
+}

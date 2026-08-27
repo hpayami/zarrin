@@ -1,0 +1,15 @@
+fn f(n: int) -> string {
+    return match n {
+        x if x < 0 => "neg",
+        0 => "zero",
+        1 | 2 | 3 => "small",
+        _ => "big",
+    };
+}
+fn main() {
+    print(f(-1));
+    print(f(0));
+    print(f(2));
+    print(f(99));
+    print(match true { true => "t", false => "f" });
+}

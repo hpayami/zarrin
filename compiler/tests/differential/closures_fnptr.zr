@@ -1,0 +1,9 @@
+fn twice(n: int) -> int {
+    return n * 2;
+}
+fn apply(f: fn(int) -> int, n: int) -> int {
+    return f(n);
+}
+fn main() {
+    print(apply(twice, 5));
+}

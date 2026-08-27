@@ -1,0 +1,14 @@
+fn main() {
+    let found = for i in 0..10 {
+        if i * i > 20 { break i; }
+    };
+    print(found);
+    let none = for i in 0..3 {
+        print(i);
+    };
+    print(none);
+    let w = while true {
+        break 42;
+    };
+    print(w);
+}

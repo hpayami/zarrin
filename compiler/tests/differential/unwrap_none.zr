@@ -1,0 +1,5 @@
+fn main() {
+    print("before");
+    let o = None;
+    print(o.unwrap());
+}

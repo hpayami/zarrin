@@ -1,0 +1,12 @@
+macro double(x) {
+    return x + x;
+}
+macro shout(s) {
+    return s + "!";
+}
+fn main() {
+    print(double(4));
+    print(double(1.5));
+    print(shout("hi"));
+    print(double(double(2)));
+}

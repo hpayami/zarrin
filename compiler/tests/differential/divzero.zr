@@ -1,0 +1,5 @@
+fn main() {
+    print("before");
+    let n = 0;
+    print(7 / n);
+}

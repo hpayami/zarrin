@@ -1,0 +1,21 @@
+fn main() {
+    let i = 0;
+    while i < 10 {
+        if i == 3 { i = i + 1; continue; }
+        if i == 6 { break; }
+        print(i);
+        i = i + 1;
+    }
+    let n = 0;
+    while true {
+        n = n + 1;
+        if n > 2 { break; }
+    }
+    print(n);
+    for a in 0..3 {
+        for b in 0..2 {
+            if b == 1 { continue; }
+            print(a * 10 + b);
+        }
+    }
+}

@@ -1,0 +1,10 @@
+fn main() {
+    let s = "";
+    let i = 0;
+    while i < 50 {
+        s = s + "ab";
+        i = i + 1;
+    }
+    print(len(s));
+    print(substring(s, 0, 4));
+}

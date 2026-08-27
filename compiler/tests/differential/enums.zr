@@ -1,0 +1,12 @@
+enum Color { Red, Green, Blue }
+enum Shape { Circle(float), Rect(float, float), Dot }
+fn main() {
+    print(Red);
+    print(Blue);
+    print(Circle(2.5));
+    print(Rect(1.0, 2.0));
+    print(Dot);
+    let c = Green;
+    print(match c { Red => 0, Green => 1, Blue => 2 });
+    print(match Rect(3.0, 4.0) { Circle(r) => r, Rect(w, h) => w * h, Dot => 0.0 });
+}
