@@ -18,6 +18,7 @@ pub enum TypeError {
     UnknownField { ty: String, field: String },
     MissingImpl { trait_name: String, type_name: String, method: String },
     AmbiguousVariant { name: String, candidates: Vec<String> },
+    NonExhaustiveMatch { ty: String, missing: Vec<String> },
     /// Raised inside a nested statement, which already knows where it is.
     Located(Box<Diagnostic>),
 }
@@ -41,6 +42,17 @@ impl std::fmt::Display for TypeError {
             TypeError::UnknownField { ty, field } => write!(f, "type `{}` has no field `{}`", ty, field),
             TypeError::MissingImpl { trait_name, type_name, method } => write!(f, "trait `{}` for `{}` missing method `{}`", trait_name, type_name, method),
             TypeError::Located(d) => write!(f, "{}", d.message),
+            TypeError::NonExhaustiveMatch { ty, missing } if missing.is_empty() => write!(
+                f,
+                "match on `{}` is not exhaustive; add a `_` arm",
+                ty
+            ),
+            TypeError::NonExhaustiveMatch { ty, missing } => write!(
+                f,
+                "match on `{}` does not cover {}",
+                ty,
+                missing.iter().map(|m| format!("`{}`", m)).collect::<Vec<_>>().join(", ")
+            ),
             TypeError::AmbiguousVariant { name, candidates } => write!(
                 f,
                 "variant `{}` is declared by {}; rename one of them to disambiguate",
@@ -428,6 +440,7 @@ impl TypeChecker {
             }
             Expr::Match { scrutinee, arms } => {
                 let scrutinee_ty = Self::check_expr(scrutinee, env)?;
+                Self::check_exhaustive(&scrutinee_ty, arms, env)?;
                 let mut result_ty = None;
                 for (patterns, guard, body) in arms {
                     env.push_scope();
@@ -502,6 +515,88 @@ impl TypeChecker {
                     _ => Err(TypeError::TypeMismatch { expected: "array".into(), found: format!("{:?}", arr_ty) }),
                 }
             }
+        }
+    }
+
+    /// Every value the scrutinee can take has to be matched by something. An
+    /// arm carrying a guard covers nothing, because the guard can turn it down.
+    fn check_exhaustive(
+        ty: &Type,
+        arms: &[(Vec<Pattern>, Option<Expr>, Expr)],
+        env: &TypeEnv,
+    ) -> Result<(), TypeError> {
+        let irrefutable = |p: &Pattern| matches!(p, Pattern::Wildcard | Pattern::Variable(_));
+        let unguarded: Vec<&Vec<Pattern>> = arms
+            .iter()
+            .filter(|(_, guard, _)| guard.is_none())
+            .map(|(pats, _, _)| pats)
+            .collect();
+
+        if unguarded.iter().any(|pats| pats.iter().any(|p| irrefutable(p))) {
+            return Ok(());
+        }
+
+        let name = |t: &Type| match t {
+            Type::Named(n) => n.clone(),
+            Type::Int => "int".into(),
+            Type::Float => "float".into(),
+            Type::Bool => "bool".into(),
+            Type::String => "string".into(),
+            other => format!("{:?}", other),
+        };
+
+        match ty {
+            // Nothing is known about the value, so nothing can be proven.
+            Type::Inferred => Ok(()),
+            Type::Bool => {
+                let mut seen = [false, false];
+                for pats in &unguarded {
+                    for p in pats.iter() {
+                        if let Pattern::Literal(Expr::Bool(b)) = p {
+                            seen[*b as usize] = true;
+                        }
+                    }
+                }
+                let missing: Vec<String> = [("false", seen[0]), ("true", seen[1])]
+                    .iter()
+                    .filter(|(_, hit)| !hit)
+                    .map(|(n, _)| (*n).to_string())
+                    .collect();
+                if missing.is_empty() {
+                    Ok(())
+                } else {
+                    Err(TypeError::NonExhaustiveMatch { ty: "bool".into(), missing })
+                }
+            }
+            Type::Named(n) if env.variants.is_enum(n) => {
+                let mut covered: Vec<String> = Vec::new();
+                for pats in &unguarded {
+                    for p in pats.iter() {
+                        // A variant is only covered when its payload is bound
+                        // wholesale; `C(0)` leaves the rest of `C` unmatched.
+                        if let Pattern::EnumVariant { name: vn, inner } = p {
+                            if inner.iter().all(|i| irrefutable(i)) {
+                                if let Lookup::Unique(v) = env.variants.lookup(vn) {
+                                    covered.push(v.name);
+                                }
+                            }
+                        }
+                    }
+                }
+                let missing: Vec<String> = env
+                    .variants
+                    .variants_of(n)
+                    .into_iter()
+                    .filter(|v| !covered.contains(&v.name))
+                    .map(|v| v.name)
+                    .collect();
+                if missing.is_empty() {
+                    Ok(())
+                } else {
+                    Err(TypeError::NonExhaustiveMatch { ty: n.clone(), missing })
+                }
+            }
+            other => Err(TypeError::NonExhaustiveMatch { ty: name(other), missing: Vec::new() }),
         }
     }
 

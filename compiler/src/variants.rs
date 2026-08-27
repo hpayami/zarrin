@@ -68,6 +68,24 @@ impl VariantIndex {
         }
     }
 
+    /// Every variant of an enum, in declaration order. Collected from the
+    /// index and sorted by tag, because the map's own order is not stable.
+    pub fn variants_of(&self, enum_name: &str) -> Vec<Variant> {
+        let mut found: Vec<Variant> = self
+            .by_name
+            .values()
+            .flatten()
+            .filter(|v| v.enum_name == enum_name)
+            .cloned()
+            .collect();
+        found.sort_by_key(|v| v.tag);
+        found
+    }
+
+    pub fn is_enum(&self, name: &str) -> bool {
+        self.by_name.values().flatten().any(|v| v.enum_name == name)
+    }
+
     /// Accepts both a bare name (`Red`) and a qualified one (`Color::Red`).
     pub fn lookup(&self, name: &str) -> Lookup {
         if let Some((enum_name, vname)) = name.split_once("::") {

@@ -146,10 +146,13 @@ fn run_reports_type_errors_with_a_position_too() {
 
 #[test]
 fn runtime_failures_report_a_position() {
+    // A match the checker cannot prove complete: `array_get` has no element
+    // type to reason about, so this is one of the few ways an unmatched value
+    // still reaches run time.
     assert_diagnostic(
-        "enum C { R, G }\nfn main() {\n    let c = G;\n    let v = match c { R => 1 };\n}\n",
+        "fn main() {\n    let a = [1, 2];\n    let v = match array_get(a, 0) { 5 => 10, 6 => 20 };\n}\n",
         "no matching pattern",
-        4,
+        3,
         5,
     );
 }

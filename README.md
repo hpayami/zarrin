@@ -22,6 +22,10 @@ The language has functions, `let` bindings with inference, structs, enums with
 payloads, traits and `impl`, `match` with guards and multi-patterns, macros,
 `extern` functions, arrays, string interpolation, and the usual control flow.
 
+A `match` must cover its scrutinee: every variant of an enum, both booleans, or
+a `_` arm. An arm carrying a guard covers nothing, since the guard can turn it
+down.
+
 Errors — syntax, type, and run time — are reported against the source with a
 line, a column and the offending line quoted. Positions are recorded per
 statement, so a type or run-time error points at the statement it happened in

@@ -165,3 +165,71 @@ fn main() {
         &["7", "10", "5", "4", "9", "done 3"],
     );
 }
+
+// --- match exhaustiveness ----------------------------------------------------
+//
+// An incomplete match used to compile and fail at run time — or, in the native
+// backend before it was fixed, quietly run the last arm for a value nothing
+// matched. The checker rejects it now.
+
+#[test]
+fn a_match_missing_variants_names_them() {
+    assert_check_error(
+        "enum C { R, G, B }\nfn f(c: C) -> int { return match c { R => 1 }; }\nfn main() { print(f(R)); }\n",
+        "does not cover `G`, `B`",
+    );
+}
+
+#[test]
+fn covering_every_variant_needs_no_wildcard() {
+    assert_checks("enum C { R, G, B }\nfn f(c: C) -> int { return match c { R => 1, G => 2, B => 3 }; }\nfn main() { print(f(R)); }\n");
+    assert_checks("fn f(o: Option) -> int { return match o { Some(v) => v, None => 0 }; }\nfn main() { print(f(None)); }\n");
+}
+
+#[test]
+fn a_match_on_a_scalar_needs_a_catch_all() {
+    assert_check_error(
+        "fn f(n: int) -> int { return match n { 0 => 10, 1 => 20 }; }\nfn main() { print(f(0)); }\n",
+        "add a `_` arm",
+    );
+    assert_checks("fn f(n: int) -> int { return match n { 0 => 10, _ => 20 }; }\nfn main() { print(f(0)); }\n");
+}
+
+#[test]
+fn a_guarded_arm_covers_nothing() {
+    // The guard can turn the arm down, so it cannot be what makes a match
+    // complete — f(3) would have matched no arm at all.
+    assert_check_error(
+        "fn f(n: int) -> int { return match n { 0 => 7, x if x > 10 => 1 }; }\nfn main() { print(f(0)); }\n",
+        "add a `_` arm",
+    );
+    assert_checks("fn f(n: int) -> int { return match n { 0 => 7, x if x > 10 => 1, _ => 0 }; }\nfn main() { print(f(0)); }\n");
+}
+
+#[test]
+fn a_variant_is_only_covered_when_its_payload_is_bound() {
+    // `C(0)` matches one value of C, not all of it.
+    assert_check_error(
+        "enum S { C(int), R(int, int) }\nfn f(s: S) -> int { return match s { C(0) => 1, R(w, h) => w * h }; }\nfn main() { print(f(C(1))); }\n",
+        "does not cover `C`",
+    );
+    assert_checks(
+        "enum S { C(int), R(int, int) }\nfn f(s: S) -> int { return match s { C(r) => r, R(w, h) => w * h }; }\nfn main() { print(f(C(1))); }\n",
+    );
+}
+
+#[test]
+fn both_booleans_or_a_catch_all() {
+    assert_checks("fn f(b: bool) -> int { return match b { true => 1, false => 0 }; }\nfn main() { print(f(true)); }\n");
+    assert_check_error(
+        "fn f(b: bool) -> int { return match b { true => 1 }; }\nfn main() { print(f(true)); }\n",
+        "does not cover `false`",
+    );
+}
+
+#[test]
+fn an_unknown_scrutinee_type_is_left_alone() {
+    // `array_get` has no element type to reason about, so nothing can be
+    // proven and nothing is claimed.
+    assert_checks("fn main() { let a = [1, 2]; let v = match array_get(a, 0) { 5 => 10, 6 => 20 }; }\n");
+}

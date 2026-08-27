@@ -262,8 +262,8 @@ fn main() { print(f(C(5))); print(f(C(500))); print(f(R(3, 4))); }
 fn a_guard_on_the_last_arm_compiles() {
     assert_agrees_with_interpreter(
         r#"
-fn f(n: int) -> int { return match n { 0 => 7, x if x > 10 => 1 }; }
-fn main() { print(f(0)); print(f(50)); }
+fn f(n: int) -> int { return match n { 0 => 7, x if x > 10 => 1, _ => 0 }; }
+fn main() { print(f(0)); print(f(50)); print(f(3)); }
 "#,
     );
 }
@@ -600,17 +600,13 @@ fn main() {
 // wrong answer instead of the interpreter's error.
 
 #[test]
-fn an_unmatched_enum_value_stops_the_program() {
+fn an_unmatched_value_stops_the_program() {
+    // The last arm used to run whatever its pattern, so an unmatched value
+    // produced a plausible wrong answer. The checker rejects most incomplete
+    // matches outright now; this one it cannot, because `array_get` gives it
+    // no element type to reason about.
     assert_fails_like_the_interpreter(
-        "enum C { R, G, B }\nfn f(c: C) -> int { return match c { R => 1 }; }\nfn main() { print(f(R)); print(f(G)); }\n",
-    );
-}
-
-#[test]
-fn an_unmatched_literal_stops_the_program() {
-    // This answered 20 for f(99): the last arm ran regardless of its pattern.
-    assert_fails_like_the_interpreter(
-        "fn f(n: int) -> int { return match n { 0 => 10, 1 => 20 }; }\nfn main() { print(f(0)); print(f(99)); }\n",
+        "fn main() {\n    let a = [7, 8];\n    print(array_get(a, 0));\n    print(match array_get(a, 0) { 5 => 10, 6 => 20 });\n}\n",
     );
 }
 
