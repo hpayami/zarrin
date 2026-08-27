@@ -422,3 +422,85 @@ fn main() { print(f(R)); print(f(G)); }
 "#,
     );
 }
+
+// --- struct fields ----------------------------------------------------------
+//
+// Field access required a variable bound directly to a struct literal, and the
+// loaded word was always treated as an int. Everything else either refused to
+// compile ("variable 'p' is not a struct", "cannot determine struct type") or
+// printed a bit pattern.
+
+#[test]
+fn fields_of_a_struct_returned_from_a_function() {
+    assert_agrees_with_interpreter(
+        r#"
+struct P { x: int, y: int }
+fn make(a: int) -> P { return P { x: a, y: a + 1 }; }
+fn main() { let p = make(10); print(p.x); print(p.y); print(make(5).x); }
+"#,
+    );
+}
+
+#[test]
+fn fields_of_a_struct_parameter() {
+    assert_agrees_with_interpreter(
+        r#"
+struct P { x: int, y: int }
+fn sum(p: P) -> int { return p.x + p.y; }
+fn main() { print(sum(P { x: 3, y: 4 })); }
+"#,
+    );
+}
+
+#[test]
+fn nested_struct_fields() {
+    assert_agrees_with_interpreter(
+        r#"
+struct Inner { v: int }
+struct Outer { i: Inner, k: int }
+fn main() { let o = Outer { i: Inner { v: 9 }, k: 1 }; print(o.i.v); print(o.k); }
+"#,
+    );
+}
+
+#[test]
+fn fields_keep_their_declared_type() {
+    // A float field printed its bit pattern (4612811918334230528 for 2.5) and a
+    // string field its address.
+    assert_agrees_with_interpreter(
+        r#"
+struct M { a: int, b: float, c: string }
+fn main() { let m = M { a: 1, b: 2.5, c: "hi" }; print(m.a); print(m.b); print(m.c); }
+"#,
+    );
+}
+
+#[test]
+fn self_resolves_to_the_impl_type() {
+    // The parser types a `self` parameter as `Self`, so a method reading its
+    // own fields could not tell which struct it belonged to.
+    assert_agrees_with_interpreter(
+        r#"
+struct S { w: float, name: string }
+impl S { fn label(self) -> string { return self.name; } fn width(self) -> float { return self.w; } }
+fn main() { let s = S { w: 1.5, name: "boxy" }; print(s.label()); print(s.width()); }
+"#,
+    );
+}
+
+#[test]
+fn a_struct_field_holding_an_enum_prints_by_name() {
+    assert_agrees_with_interpreter(
+        r#"
+enum Color { Red, Rgb(int, int, int) }
+struct Style { c: Color, name: string }
+struct Box { s: Style, n: int }
+fn main() {
+    let b = Box { s: Style { c: Red, name: "inner" }, n: 7 };
+    print(b.n);
+    print(b.s.c);
+    print("{b.s.name} / {b.s.c}");
+}
+"#,
+    );
+}

@@ -44,7 +44,7 @@ pub struct Codegen<'ctx> {
     functions: HashMap<String, FunctionValue<'ctx>>,
     fn_ret_types: HashMap<String, Type>,
     named: HashMap<String, (PointerValue<'ctx>, String)>,
-    struct_fields: HashMap<String, Vec<String>>,
+    struct_fields: HashMap<String, Vec<(String, Type)>>,
     var_struct_type: HashMap<String, String>,
     /// Variables known to hold a value of a given enum, so `print` can show
     /// the variant name instead of the address it is represented by.
@@ -146,6 +146,39 @@ impl<'ctx> Codegen<'ctx> {
         self.enum_variants.contains_key(name) || builtin_enums().iter().any(|(n, _)| n == name)
     }
 
+    /// Which struct, if any, this expression produces. Field access used to
+    /// insist on a variable bound directly to a struct literal, so a struct
+    /// returned from a function, taken as a parameter, or nested inside
+    /// another struct had no readable fields at all.
+    fn infer_struct_type(&self, e: &Expr) -> Option<String> {
+        let named_struct = |t: &Type| match t {
+            Type::Named(n) if self.struct_fields.contains_key(n) => Some(n.clone()),
+            _ => None,
+        };
+        match e {
+            Expr::StructLit { name, .. } => Some(name.clone()),
+            Expr::Ident(n) => self.var_struct_type.get(n).cloned(),
+            Expr::Call(callee, _) => {
+                let Expr::Ident(n) = callee.as_ref() else { return None };
+                self.fn_ret_types.get(n).and_then(named_struct)
+            }
+            Expr::MethodCall(_, m, _) => self.fn_ret_types.get(m).and_then(named_struct),
+            Expr::FieldAccess(obj, field) => {
+                let owner = self.infer_struct_type(obj)?;
+                self.field_type(&owner, field).as_ref().and_then(named_struct)
+            }
+            _ => None,
+        }
+    }
+
+    fn field_type(&self, struct_name: &str, field: &str) -> Option<Type> {
+        self.struct_fields
+            .get(struct_name)?
+            .iter()
+            .find(|(n, _)| n == field)
+            .map(|(_, t)| t.clone())
+    }
+
     /// Which enum, if any, this expression produces. The backend erases types
     /// into i64, so `print` has to recover this statically to render a variant.
     fn infer_enum_type(&self, e: &Expr) -> Option<String> {
@@ -165,6 +198,10 @@ impl<'ctx> Codegen<'ctx> {
                     .or_else(|| self.fn_ret_types.get(n).and_then(named_enum))
             }
             Expr::MethodCall(_, m, _) => self.fn_ret_types.get(m).and_then(named_enum),
+            Expr::FieldAccess(obj, field) => {
+                let owner = self.infer_struct_type(obj)?;
+                self.field_type(&owner, field).as_ref().and_then(named_enum)
+            }
             _ => None,
         }
     }
@@ -815,6 +852,7 @@ impl<'ctx> Codegen<'ctx> {
             Expr::StructLit { name, fields } => {
                 let field_defs = self.struct_fields.get(name).cloned()
                     .unwrap_or_else(|| panic!("unknown struct: {}", name));
+                let field_defs: Vec<String> = field_defs.into_iter().map(|(n, _)| n).collect();
                 let num_fields = field_defs.len() as u64;
                 let array_ty = self.i64.array_type(num_fields as u32);
                 let alloca = self.heap_slots(num_fields, &format!("{}_struct", name));
@@ -845,22 +883,27 @@ impl<'ctx> Codegen<'ctx> {
                     _ => panic!("field access on non-struct"),
                 };
                 let obj_ptr = self.builder.build_int_to_ptr(obj_ptr_val, self.context.ptr_type(AddressSpace::default()), "obj_ptr").unwrap();
-                let struct_name = match obj.as_ref() {
-                    Expr::Ident(n) => self.var_struct_type.get(n).cloned()
-                        .unwrap_or_else(|| panic!("variable '{}' is not a struct", n)),
-                    Expr::StructLit { name, .. } => name.clone(),
-                    _ => panic!("cannot determine struct type"),
-                };
+                let struct_name = self.infer_struct_type(obj)
+                    .unwrap_or_else(|| panic!("cannot determine the struct type of `.{}`", field));
                 let field_defs = self.struct_fields.get(&struct_name)
                     .unwrap_or_else(|| panic!("unknown struct type for field access: {}", struct_name));
-                let field_idx = field_defs.iter().position(|f| f == field)
+                let field_idx = field_defs.iter().position(|(n, _)| n == field)
                     .unwrap_or_else(|| panic!("field `{}` not found in struct `{}`", field, struct_name));
+                let field_ty = field_defs[field_idx].1.clone();
                 let num_fields = field_defs.len() as u64;
                 let array_ty = self.i64.array_type(num_fields as u32);
                 let field_ptr = unsafe {
                     self.builder.build_gep(array_ty, obj_ptr, &[self.i64.const_int(0, false), self.i64.const_int(field_idx as u64, false)], &format!("{}_{}", struct_name, field)).unwrap()
                 };
-                CgValue::Int(self.builder.build_load(self.i64, field_ptr, field).unwrap().into_int_value())
+                let raw = self.builder.build_load(self.i64, field_ptr, field).unwrap().into_int_value();
+                // Fields are stored as raw words; the declared type says how to
+                // read one back. Without this a float field printed its bit
+                // pattern and a string field its address.
+                match field_ty {
+                    Type::Float => CgValue::Float(self.builder.build_bit_cast(raw, self.f64, "f_field").unwrap().into_float_value()),
+                    Type::String => CgValue::Str(self.builder.build_int_to_ptr(raw, self.context.ptr_type(AddressSpace::default()), "s_field").unwrap()),
+                    _ => CgValue::Int(raw),
+                }
             }
             Expr::MethodCall(obj, method, args) => {
                 let obj_val = self.gen_expr(obj);
@@ -1619,8 +1662,8 @@ Expr::Match { scrutinee, arms } => {
         if *terminated { return; }
         match s {
             Stmt::Let { name, value, .. } => {
-                if let Expr::StructLit { name: struct_name, .. } = &value {
-                    self.var_struct_type.insert(name.clone(), struct_name.clone());
+                if let Some(sn) = self.infer_struct_type(value) {
+                    self.var_struct_type.insert(name.clone(), sn);
                 }
                 if let Some(en) = self.infer_enum_type(value) {
                     self.var_enum_type.insert(name.clone(), en);
@@ -2076,7 +2119,7 @@ pub fn compile_to_executable(program: &Program, out_path: &str) {
     for s in &program.stmts {
         match s {
             Stmt::Struct { name, fields, .. } => {
-                cg.struct_fields.insert(name.clone(), fields.iter().map(|(n, _)| n.clone()).collect());
+                cg.struct_fields.insert(name.clone(), fields.clone());
             }
             Stmt::Enum { name, variants } => {
                 cg.enum_variants.insert(name.clone(), variants.clone());
@@ -2129,6 +2172,7 @@ pub fn compile_to_executable(program: &Program, out_path: &str) {
                 cg.builder.position_at_end(entry);
                 cg.named.clear();
                 cg.var_enum_type.clear();
+                cg.var_struct_type.clear();
 
                 let mut terminated = false;
                 for (i, (pname, pty)) in params.iter().enumerate() {
@@ -2139,6 +2183,8 @@ pub fn compile_to_executable(program: &Program, out_path: &str) {
                     if let Type::Named(t) = pty {
                         if cg.is_enum(t) {
                             cg.var_enum_type.insert(pname.clone(), t.clone());
+                        } else if cg.struct_fields.contains_key(t) {
+                            cg.var_struct_type.insert(pname.clone(), t.clone());
                         }
                     }
                 }
@@ -2153,7 +2199,7 @@ pub fn compile_to_executable(program: &Program, out_path: &str) {
                     }
                 }
             }
-            Stmt::Impl { methods, .. } => {
+            Stmt::Impl { methods, type_name, .. } => {
                 for m in methods {
                     if let Stmt::Fn { name, params, body, ret, .. } = m {
                         let func = cg.functions[name];
@@ -2161,15 +2207,27 @@ pub fn compile_to_executable(program: &Program, out_path: &str) {
                         cg.builder.position_at_end(entry);
                         cg.named.clear();
                 cg.var_enum_type.clear();
+                cg.var_struct_type.clear();
                         let mut terminated = false;
                         for (i, (pname, pty)) in params.iter().enumerate() {
                             let ptr = cg.builder.build_alloca(cg.i64, pname).unwrap();
                             let arg = func.get_nth_param(i as u32).unwrap().into_int_value();
                             cg.builder.build_store(ptr, arg).unwrap();
                             cg.named.insert(pname.clone(), (ptr, "int".to_string()));
-                            if let Type::Named(t) = pty {
-                                if cg.is_enum(t) {
-                                    cg.var_enum_type.insert(pname.clone(), t.clone());
+                            // The parser types a `self` parameter as `Self`;
+                            // the impl block is what says which type that is.
+                            let declared = match pname.as_str() {
+                                "self" | "&self" | "&mut" => Some(type_name.clone()),
+                                _ => match pty {
+                                    Type::Named(t) => Some(t.clone()),
+                                    _ => None,
+                                },
+                            };
+                            if let Some(t) = declared {
+                                if cg.is_enum(&t) {
+                                    cg.var_enum_type.insert(pname.clone(), t);
+                                } else if cg.struct_fields.contains_key(&t) {
+                                    cg.var_struct_type.insert(pname.clone(), t);
                                 }
                             }
                         }
@@ -2199,6 +2257,7 @@ pub fn compile_to_executable(program: &Program, out_path: &str) {
     cg.builder.position_at_end(entry);
     cg.named.clear();
                 cg.var_enum_type.clear();
+                cg.var_struct_type.clear();
 
     if has_user_main {
         let user_main = cg.module.get_function("_zarrin_main").unwrap();
