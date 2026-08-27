@@ -747,3 +747,52 @@ fn arithmetic_that_fits_is_untouched() {
         &["13", "9223372036854775807", "-9223372036854775807", "9223372036854775807"],
     );
 }
+
+// ---------------------------------------------------------------------------
+// Strings are counted in characters
+//
+// `len` counted bytes while `char_at` counted characters, so
+// `substring(s, 0, len(s))` was not `s`, and walking a string by index went
+// wrong the moment anything in it was not ASCII.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn len_counts_characters() {
+    assert_output(
+        "fn main() { print(len(\"héllo\")); print(len(\"日本語\")); print(len(\"abc\")); print(len(\"\")); }\n",
+        &["5", "3", "3", "0"],
+    );
+}
+
+#[test]
+fn substring_takes_character_indices() {
+    assert_output(
+        "fn main() {\n\
+         \x20   print(substring(\"héllo\", 0, 2));\n\
+         \x20   print(substring(\"héllo\", 1, 3));\n\
+         \x20   print(substring(\"日本語\", 1, 3));\n\
+         \x20   print(substring(\"héllo\", 0, len(\"héllo\")));\n}\n",
+        &["hé", "él", "本語", "héllo"],
+    );
+}
+
+#[test]
+fn walking_a_string_by_index_rebuilds_it() {
+    assert_output(
+        "fn main() {\n\
+         \x20   let s = \"aébc\";\n\
+         \x20   let out = \"\";\n\
+         \x20   let i = 0;\n\
+         \x20   while i < len(s) { out = out + char_at(s, i); i = i + 1; }\n\
+         \x20   print(out);\n}\n",
+        &["aébc"],
+    );
+}
+
+#[test]
+fn char_at_past_the_end_is_an_error() {
+    // It used to answer with a NUL character, which is not a character the
+    // program asked for and is one byte long when printed.
+    assert_run_fails("fn main() { print(char_at(\"abc\", 3)); }\n", "char_at index 3 is out of bounds");
+    assert_run_fails("fn main() { print(char_at(\"\", 0)); }\n", "char_at index 0 is out of bounds");
+}

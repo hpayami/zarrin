@@ -312,22 +312,33 @@ impl Interpreter {
             ExprKind::Call(callee, args) => {
                 let name = match &*callee.kind { ExprKind::Ident(n) => n, _ => rt_fail!(self, "cannot call non-function") };
                 if name == "print" { let v = self.eval_expr(&args[0]); println!("{}", value_to_string(&v)); return Value::Unit; }
-                if name == "len" { let v = self.eval_expr(&args[0]); return match v { Value::Str(s) => Value::Int(s.len() as i64), Value::Array(a) => Value::Int(a.len() as i64), _ => rt_fail!(self, "len expects string or array") }; }
+                if name == "len" { let v = self.eval_expr(&args[0]); return match v { // Characters, not bytes: `substring(s, 0, len(s))` has to be `s`
+                    // whatever is in it, and `char_at` has always counted
+                    // characters.
+                    Value::Str(s) => Value::Int(s.chars().count() as i64), Value::Array(a) => Value::Int(a.len() as i64), _ => rt_fail!(self, "len expects string or array") }; }
                 if name == "to_string" { let v = self.eval_expr(&args[0]); return Value::Str(value_to_string(&v)); }
                 if name == "int_to_str" { let v = self.eval_expr(&args[0]); return match v { Value::Int(n) => Value::Str(n.to_string()), _ => rt_fail!(self, "int_to_str expects int") }; }
                 if name == "panic" { let v = self.eval_expr(&args[0]); rt_fail!(self, "{}", value_to_string(&v)); }
                 if name == "array_len" { let v = self.eval_expr(&args[0]); return match v { Value::Array(a) => Value::Int(a.len() as i64), _ => rt_fail!(self, "array_len expects array") }; }
                 if name == "array_get" { let arr = self.eval_expr(&args[0]); let idx = self.eval_expr(&args[1]); return match (arr, idx) { (Value::Array(a), Value::Int(i)) => { let k = self.checked_index(a.len(), i, "array"); a[k].clone() }, _ => rt_fail!(self, "array_get expects array and int") }; }
                 if name == "array_set" { let arr = self.eval_expr(&args[0]); let idx = self.eval_expr(&args[1]); let val = self.eval_expr(&args[2]); if let (Value::Array(mut a), Value::Int(i)) = (arr, idx) { let k = self.checked_index(a.len(), i, "array"); a[k] = val; return Value::Array(a); } else { rt_fail!(self, "array_set expects array, int, value"); } }
-                if name == "substring" { let s = self.eval_expr(&args[0]); let start = self.eval_expr(&args[1]); let end = self.eval_expr(&args[2]); if let (Value::Str(s), Value::Int(start), Value::Int(end)) = (s, start, end) { let b = self.checked_index(s.len() + 1, start, "substring start");
-                    let e = self.checked_index(s.len() + 1, end, "substring end");
+                if name == "substring" { let s = self.eval_expr(&args[0]); let start = self.eval_expr(&args[1]); let end = self.eval_expr(&args[2]); if let (Value::Str(s), Value::Int(start), Value::Int(end)) = (s, start, end) {
+                    // Character indices, so bounds can never fall inside a
+                    // character — which used to be its own failure.
+                    let chars = s.chars().count();
+                    let b = self.checked_index(chars + 1, start, "substring start");
+                    let e = self.checked_index(chars + 1, end, "substring end");
                     if b > e { rt_fail!(self, "substring start {} is past end {}", b, e); }
-                    if !s.is_char_boundary(b) || !s.is_char_boundary(e) { rt_fail!(self, "substring bounds fall inside a character"); }
-                    return Value::Str(s[b..e].to_string()); } else { rt_fail!(self, "substring expects string, int, int"); } }
+                    return Value::Str(s.chars().skip(b).take(e - b).collect()); } else { rt_fail!(self, "substring expects string, int, int"); } }
                 if name == "contains" { let s = self.eval_expr(&args[0]); let needle = self.eval_expr(&args[1]); if let (Value::Str(s), Value::Str(needle)) = (s, needle) { return Value::Bool(s.contains(&needle)); } else { rt_fail!(self, "contains expects string, string"); } }
                 if name == "split" { let s = self.eval_expr(&args[0]); let delim = self.eval_expr(&args[1]); if let (Value::Str(s), Value::Str(delim)) = (s, delim) { return Value::Array(s.split(&delim).map(|part| Value::Str(part.to_string())).collect()); } else { rt_fail!(self, "split expects string, string"); } }
                 if name == "trim" { let s = self.eval_expr(&args[0]); if let Value::Str(s) = s { return Value::Str(s.trim().to_string()); } else { rt_fail!(self, "trim expects string"); } }
-                if name == "char_at" { let s = self.eval_expr(&args[0]); let idx = self.eval_expr(&args[1]); if let (Value::Str(s), Value::Int(i)) = (s, idx) { let ch = s.chars().nth(i as usize).unwrap_or('\0'); return Value::Str(ch.to_string()); } else { rt_fail!(self, "char_at expects string, int"); } }
+                if name == "char_at" { let s = self.eval_expr(&args[0]); let idx = self.eval_expr(&args[1]); if let (Value::Str(s), Value::Int(i)) = (s, idx) {
+                    // Past the end used to answer with a NUL character, which
+                    // is not a character the program asked for; an index out of
+                    // range says so here as it does for an array.
+                    let k = self.checked_index(s.chars().count(), i, "char_at");
+                    return Value::Str(s.chars().nth(k).unwrap().to_string()); } else { rt_fail!(self, "char_at expects string, int"); } }
                 if let Some(v) = self.resolve_variant(name) {
                     let eval_args: Vec<Value> = args.iter().map(|a| self.eval_expr(a)).collect();
                     return Value::EnumVariant { enum_name: v.enum_name, variant: v.name, args: eval_args };

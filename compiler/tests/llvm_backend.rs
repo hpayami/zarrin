@@ -1839,3 +1839,62 @@ fn main() {
 "#,
     );
 }
+
+// ---------------------------------------------------------------------------
+// Characters, not bytes
+//
+// The native backend indexed strings by byte where the interpreter indexed by
+// character, so `char_at("héllo", 1)` was half of a character — invalid UTF-8
+// that printed as a replacement mark.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn strings_are_indexed_by_character() {
+    assert_agrees_with_interpreter(
+        r#"
+fn main() {
+    print(len("héllo"));
+    print(char_at("héllo", 1));
+    print(substring("héllo", 0, 2));
+    print(substring("héllo", 1, 3));
+    print(substring("héllo", 0, len("héllo")));
+    print(len("日本語"));
+    print(char_at("日本語", 0));
+    print(substring("日本語", 1, 3));
+    print(len(""));
+    print(substring("", 0, 0));
+}
+"#,
+    );
+}
+
+#[test]
+fn a_string_walked_by_index_comes_back_whole() {
+    assert_agrees_with_interpreter(
+        r#"
+fn main() {
+    let s = "aébc日";
+    let out = "";
+    let i = 0;
+    while i < len(s) {
+        out = out + char_at(s, i);
+        i = i + 1;
+    }
+    print(out);
+    print(out == s);
+}
+"#,
+    );
+}
+
+#[test]
+fn char_at_past_the_end_stops_the_program() {
+    assert_fails_like_the_interpreter(
+        r#"
+fn main() {
+    print("before");
+    print(char_at("abc", 3));
+}
+"#,
+    );
+}

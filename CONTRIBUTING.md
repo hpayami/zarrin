@@ -96,6 +96,11 @@ the same name and a string declared there was never released. A path that
 leaves early (`return`, `break`) has already released through
 `release_all_open`, so it ends its block with `abandon_block` instead.
 
+A string index is a character index. The native backend works in bytes, so
+`len`, `char_at` and `substring` go through `zarrin.char_len` and
+`zarrin.char_offset` to convert — indexing by byte there is what made
+`char_at("héllo", 1)` half of a character.
+
 A string is an address in the native backend, so any question about its
 contents goes through `strcmp` — `==`, the ordering operators, and a string
 pattern in a `match`. Comparing two addresses asks whether both sides are the

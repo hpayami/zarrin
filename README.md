@@ -58,6 +58,10 @@ subexpression that caused it, down to the individual argument. Run-time
 failures are reported against the statement, which is as far as the value being
 blamed can be traced.
 
+Strings are counted and indexed in characters, not bytes: `len("héllo")` is 5,
+`char_at(s, 1)` is `é`, and `substring(s, 0, len(s))` is `s` whatever is in it.
+An index past the last character is an error, as it is for an array.
+
 String literals take `\n`, `\t`, `\r`, `\"`, `\\`, and `\{` / `\}` for a
 literal brace — an unescaped `{` starts an interpolation. There is no `\0`: the
 native backend uses NUL-terminated strings, so an embedded NUL would behave

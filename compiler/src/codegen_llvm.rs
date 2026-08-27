@@ -277,6 +277,160 @@ impl<'ctx> Codegen<'ctx> {
         self.builder.position_at_end(ok);
     }
 
+    /// How many characters a string holds. A UTF-8 character is one lead byte
+    /// and any number of continuation bytes, and only lead bytes are counted.
+    ///
+    /// `len`, `char_at` and `substring` all speak in characters, so that
+    /// `substring(s, 0, len(s))` is `s` whatever is in it. Counting bytes here
+    /// meant `char_at("héllo", 1)` handed back half of a character.
+    fn char_len_fn(&self) -> FunctionValue<'ctx> {
+        const NAME: &str = "zarrin.char_len";
+        if let Some(f) = self.module.get_function(NAME) {
+            return f;
+        }
+        let ptr_ty = self.context.ptr_type(AddressSpace::default());
+        let func = self.module.add_function(NAME, self.i64.fn_type(&[ptr_ty.into()], false), None);
+        let saved = self.builder.get_insert_block();
+        let entry = self.context.append_basic_block(func, "entry");
+        let head = self.context.append_basic_block(func, "head");
+        let body = self.context.append_basic_block(func, "body");
+        let done = self.context.append_basic_block(func, "done");
+        self.builder.position_at_end(entry);
+        let p = func.get_nth_param(0).unwrap().into_pointer_value();
+        let i = self.builder.build_alloca(self.i64, "i").unwrap();
+        let n = self.builder.build_alloca(self.i64, "n").unwrap();
+        self.builder.build_store(i, self.i64.const_zero()).unwrap();
+        self.builder.build_store(n, self.i64.const_zero()).unwrap();
+        self.builder.build_unconditional_branch(head).unwrap();
+
+        self.builder.position_at_end(head);
+        let iv = self.builder.build_load(self.i64, i, "iv").unwrap().into_int_value();
+        let bp = unsafe { self.builder.build_gep(self.i8, p, &[iv], "bp").unwrap() };
+        let b = self.builder.build_load(self.i8, bp, "b").unwrap().into_int_value();
+        let at_end = self.builder
+            .build_int_compare(inkwell::IntPredicate::EQ, b, self.i8.const_zero(), "at_end")
+            .unwrap();
+        self.builder.build_conditional_branch(at_end, done, body).unwrap();
+
+        self.builder.position_at_end(body);
+        let lead = self.is_lead_byte(b);
+        let nv = self.builder.build_load(self.i64, n, "nv").unwrap().into_int_value();
+        let bumped = self.builder.build_int_add(nv, self.i64.const_int(1, false), "bumped").unwrap();
+        let next_n = self.builder.build_select(lead, bumped, nv, "next_n").unwrap().into_int_value();
+        self.builder.build_store(n, next_n).unwrap();
+        let next_i = self.builder.build_int_add(iv, self.i64.const_int(1, false), "next_i").unwrap();
+        self.builder.build_store(i, next_i).unwrap();
+        self.builder.build_unconditional_branch(head).unwrap();
+
+        self.builder.position_at_end(done);
+        let total = self.builder.build_load(self.i64, n, "total").unwrap().into_int_value();
+        self.builder.build_return(Some(&total)).unwrap();
+        if let Some(b) = saved {
+            self.builder.position_at_end(b);
+        }
+        func
+    }
+
+    /// Whether a byte starts a character: everything except `10xxxxxx`.
+    fn is_lead_byte(&self, b: IntValue<'ctx>) -> IntValue<'ctx> {
+        let masked = self.builder.build_and(b, self.i8.const_int(0xC0, false), "masked").unwrap();
+        self.builder
+            .build_int_compare(inkwell::IntPredicate::NE, masked, self.i8.const_int(0x80, false), "is_lead")
+            .unwrap()
+    }
+
+    /// Where the nth character starts, in bytes. `n` equal to the length gives
+    /// the end of the string, which is what an exclusive range needs.
+    fn char_offset_fn(&self) -> FunctionValue<'ctx> {
+        const NAME: &str = "zarrin.char_offset";
+        if let Some(f) = self.module.get_function(NAME) {
+            return f;
+        }
+        let ptr_ty = self.context.ptr_type(AddressSpace::default());
+        let func = self.module.add_function(
+            NAME,
+            self.i64.fn_type(&[ptr_ty.into(), self.i64.into()], false),
+            None,
+        );
+        let saved = self.builder.get_insert_block();
+        let entry = self.context.append_basic_block(func, "entry");
+        let head = self.context.append_basic_block(func, "head");
+        let step = self.context.append_basic_block(func, "step");
+        let skip = self.context.append_basic_block(func, "skip");
+        let advance = self.context.append_basic_block(func, "advance");
+        let done = self.context.append_basic_block(func, "done");
+        self.builder.position_at_end(entry);
+        let p = func.get_nth_param(0).unwrap().into_pointer_value();
+        let want = func.get_nth_param(1).unwrap().into_int_value();
+        let i = self.builder.build_alloca(self.i64, "i").unwrap();
+        let seen = self.builder.build_alloca(self.i64, "seen").unwrap();
+        self.builder.build_store(i, self.i64.const_zero()).unwrap();
+        self.builder.build_store(seen, self.i64.const_zero()).unwrap();
+        self.builder.build_unconditional_branch(head).unwrap();
+
+        // enough characters walked, or the string ran out
+        self.builder.position_at_end(head);
+        let seen_v = self.builder.build_load(self.i64, seen, "seen_v").unwrap().into_int_value();
+        let iv = self.builder.build_load(self.i64, i, "iv").unwrap().into_int_value();
+        let reached = self.builder
+            .build_int_compare(inkwell::IntPredicate::SGE, seen_v, want, "reached")
+            .unwrap();
+        self.builder.build_conditional_branch(reached, done, step).unwrap();
+
+        self.builder.position_at_end(step);
+        let bp = unsafe { self.builder.build_gep(self.i8, p, &[iv], "bp").unwrap() };
+        let b = self.builder.build_load(self.i8, bp, "b").unwrap().into_int_value();
+        let at_end = self.builder
+            .build_int_compare(inkwell::IntPredicate::EQ, b, self.i8.const_zero(), "at_end")
+            .unwrap();
+        let past_lead = self.builder.build_int_add(iv, self.i64.const_int(1, false), "past_lead").unwrap();
+        self.builder.build_store(i, past_lead).unwrap();
+        self.builder.build_conditional_branch(at_end, done, skip).unwrap();
+
+        // walk over this character's continuation bytes
+        self.builder.position_at_end(skip);
+        let jv = self.builder.build_load(self.i64, i, "jv").unwrap().into_int_value();
+        let cp = unsafe { self.builder.build_gep(self.i8, p, &[jv], "cp").unwrap() };
+        let cb = self.builder.build_load(self.i8, cp, "cb").unwrap().into_int_value();
+        let lead = self.is_lead_byte(cb);
+        let at_nul = self.builder
+            .build_int_compare(inkwell::IntPredicate::EQ, cb, self.i8.const_zero(), "cb_end")
+            .unwrap();
+        let stop = self.builder.build_or(lead, at_nul, "stop_skip").unwrap();
+        let next_j = self.builder.build_int_add(jv, self.i64.const_int(1, false), "next_j").unwrap();
+        let keep = self.context.append_basic_block(func, "keep_skipping");
+        self.builder.build_conditional_branch(stop, advance, keep).unwrap();
+        self.builder.position_at_end(keep);
+        self.builder.build_store(i, next_j).unwrap();
+        self.builder.build_unconditional_branch(skip).unwrap();
+
+        self.builder.position_at_end(advance);
+        let seen_now = self.builder.build_load(self.i64, seen, "seen_now").unwrap().into_int_value();
+        let bumped = self.builder.build_int_add(seen_now, self.i64.const_int(1, false), "bumped").unwrap();
+        self.builder.build_store(seen, bumped).unwrap();
+        self.builder.build_unconditional_branch(head).unwrap();
+
+        self.builder.position_at_end(done);
+        let off = self.builder.build_load(self.i64, i, "off").unwrap().into_int_value();
+        self.builder.build_return(Some(&off)).unwrap();
+        if let Some(b) = saved {
+            self.builder.position_at_end(b);
+        }
+        func
+    }
+
+    fn gen_char_len(&self, p: PointerValue<'ctx>) -> IntValue<'ctx> {
+        let f = self.char_len_fn();
+        self.builder.build_call(f, &[p.into()], "char_len").unwrap()
+            .try_as_basic_value().left().unwrap().into_int_value()
+    }
+
+    fn gen_char_offset(&self, p: PointerValue<'ctx>, n: IntValue<'ctx>) -> IntValue<'ctx> {
+        let f = self.char_offset_fn();
+        self.builder.build_call(f, &[p.into(), n.into()], "char_off").unwrap()
+            .try_as_basic_value().left().unwrap().into_int_value()
+    }
+
     /// Stop with the interpreter's message when a divisor is zero.
     fn gen_nonzero_check(&self, divisor: IntValue<'ctx>, message: &str) {
         let f = self.builder.get_insert_block().unwrap().get_parent().unwrap();
@@ -1456,6 +1610,9 @@ impl<'ctx> Codegen<'ctx> {
                 }
                 if name == "len" {
                     let v = self.gen_expr(&args[0]);
+                    if let CgValue::Str(ptr) = v {
+                        return CgValue::Int(self.gen_char_len(ptr));
+                    }
                     return match v {
                         CgValue::Str(ptr) => {
                             let strlen_type = self.i64.fn_type(&[self.context.ptr_type(AddressSpace::default()).into()], false);
@@ -1580,12 +1737,10 @@ impl<'ctx> Codegen<'ctx> {
                     let s_ptr = match s_val { CgValue::Str(p) => p, _ => panic!("substring expects string") };
                     let start = self.value_to_int(&start_val);
                     let end = self.value_to_int(&end_val);
-                    // The interpreter bounds-checks against len + 1, so an index
-                    // one past the last byte is a valid end.
-                    let strlen_ty = self.i64.fn_type(&[self.context.ptr_type(AddressSpace::default()).into()], false);
-                    let strlen_f = self.module.get_function("strlen").unwrap_or_else(|| self.module.add_function("strlen", strlen_ty, None));
-                    let s_len = self.builder.build_call(strlen_f, &[s_ptr.into()], "sub_srclen").unwrap()
-                        .try_as_basic_value().left().unwrap().into_int_value();
+                    // Character indices, like `len` and `char_at`. The bounds
+                    // check goes to len + 1, so one past the last character is
+                    // a valid end.
+                    let s_len = self.gen_char_len(s_ptr);
                     let limit = self.builder.build_int_add(s_len, self.i64.const_int(1, false), "sub_limit").unwrap();
                     self.gen_bounds_check(start, limit, "substring start");
                     self.gen_bounds_check(end, limit, "substring end");
@@ -1607,10 +1762,12 @@ impl<'ctx> Codegen<'ctx> {
                         self.i64.into(),
                     ], false);
                     let memcpy_fn = self.module.get_function("memcpy").unwrap_or_else(|| self.module.add_function("memcpy", memcpy_type, None));
-                    let sub_len = self.builder.build_int_sub(end, start, "sub_len").unwrap();
+                    let from = self.gen_char_offset(s_ptr, start);
+                    let to = self.gen_char_offset(s_ptr, end);
+                    let sub_len = self.builder.build_int_sub(to, from, "sub_len").unwrap();
                     let buf = self.scratch_bytes(self.builder.build_int_add(sub_len, self.i64.const_int(1, false), "sub_alloc").unwrap(), "sub_buf");
                     let src_ptr = unsafe {
-                        self.builder.build_gep(self.i8, s_ptr, &[start], "src_ptr").unwrap()
+                        self.builder.build_gep(self.i8, s_ptr, &[from], "src_ptr").unwrap()
                     };
                     self.builder.build_call(memcpy_fn, &[buf.into(), src_ptr.into(), sub_len.into()], "sub_cp").unwrap();
                     let null_ptr = unsafe {
@@ -1669,22 +1826,27 @@ impl<'ctx> Codegen<'ctx> {
                     let idx_val = self.gen_expr(&args[1]);
                     let s_ptr = match s_val { CgValue::Str(p) => p, _ => panic!("char_at expects string") };
                     let idx_int = self.value_to_int(&idx_val);
-                    let byte_ptr_ty = self.context.ptr_type(AddressSpace::default());
-                    let char_ptr = unsafe {
-                        self.builder.build_gep(self.i8, s_ptr, &[idx_int], "char_ptr").unwrap()
-                    };
-                    let buf = {
-                        let malloc_type = self.context.ptr_type(AddressSpace::default()).fn_type(&[self.i64.into()], false);
-                        let malloc_fn = self.module.get_function("malloc").unwrap_or_else(|| self.module.add_function("malloc", malloc_type, None));
-                        self.scratch_bytes(self.i64.const_int(2, false), "char_buf")
-                    };
-                    let ch = self.builder.build_load(self.i8, char_ptr, "ch").unwrap().into_int_value();
-                    let buf_byte = self.builder.build_bit_cast(buf, self.i8.ptr_type(AddressSpace::default()), "buf_byte").unwrap().into_pointer_value();
-                    self.builder.build_store(buf_byte, ch).unwrap();
-                    let null_ptr = unsafe {
-                        self.builder.build_gep(self.i8, buf_byte, &[self.i64.const_int(1, false)], "null_ptr").unwrap()
-                    };
-                    self.builder.build_store(null_ptr, self.i8.const_int(0, false)).unwrap();
+                    // The index counts characters, and a character is one to
+                    // four bytes: this took the byte at that index and called
+                    // it a string, which for anything but ASCII was half of
+                    // one. Past the end it read whatever followed.
+                    let count = self.gen_char_len(s_ptr);
+                    self.gen_bounds_check(idx_int, count, "char_at");
+                    let from = self.gen_char_offset(s_ptr, idx_int);
+                    let next = self.builder.build_int_add(idx_int, self.i64.const_int(1, false), "next_char").unwrap();
+                    let to = self.gen_char_offset(s_ptr, next);
+                    let width = self.builder.build_int_sub(to, from, "char_width").unwrap();
+                    let size = self.builder.build_int_add(width, self.i64.const_int(1, false), "char_size").unwrap();
+                    let buf = self.scratch_bytes(size, "char_buf");
+                    let src = unsafe { self.builder.build_gep(self.i8, s_ptr, &[from], "char_src").unwrap() };
+                    let memcpy_fn = self.module.get_function("memcpy").unwrap_or_else(|| {
+                        let ptr_ty = self.context.ptr_type(AddressSpace::default());
+                        let ty = self.context.void_type().fn_type(&[ptr_ty.into(), ptr_ty.into(), self.i64.into()], false);
+                        self.module.add_function("memcpy", ty, None)
+                    });
+                    self.builder.build_call(memcpy_fn, &[buf.into(), src.into(), width.into()], "char_cp").unwrap();
+                    let end_ptr = unsafe { self.builder.build_gep(self.i8, buf, &[width], "char_nul").unwrap() };
+                    self.builder.build_store(end_ptr, self.i8.const_zero()).unwrap();
                     return CgValue::Str(buf);
                 }
                 if name == "split" {
