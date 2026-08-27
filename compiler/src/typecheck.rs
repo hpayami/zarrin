@@ -2,6 +2,7 @@
 
 use crate::ast::*;
 use crate::builtins;
+use crate::diagnostic::Diagnostic;
 use crate::variants::{Lookup, VariantIndex};
 use std::collections::HashMap;
 
@@ -17,6 +18,14 @@ pub enum TypeError {
     UnknownField { ty: String, field: String },
     MissingImpl { trait_name: String, type_name: String, method: String },
     AmbiguousVariant { name: String, candidates: Vec<String> },
+    /// Raised inside a nested statement, which already knows where it is.
+    Located(Box<Diagnostic>),
+}
+
+impl From<Diagnostic> for TypeError {
+    fn from(d: Diagnostic) -> Self {
+        TypeError::Located(Box::new(d))
+    }
 }
 
 impl std::fmt::Display for TypeError {
@@ -31,6 +40,7 @@ impl std::fmt::Display for TypeError {
             TypeError::WrongArity { name, expected, found } => write!(f, "`{}` expects {} args, found {}", name, expected, found),
             TypeError::UnknownField { ty, field } => write!(f, "type `{}` has no field `{}`", ty, field),
             TypeError::MissingImpl { trait_name, type_name, method } => write!(f, "trait `{}` for `{}` missing method `{}`", trait_name, type_name, method),
+            TypeError::Located(d) => write!(f, "{}", d.message),
             TypeError::AmbiguousVariant { name, candidates } => write!(
                 f,
                 "variant `{}` is declared by {}; rename one of them to disambiguate",
@@ -86,7 +96,7 @@ impl TypeEnv {
         for (_, type_name_impl, methods) in &self.impls {
             if type_name_impl == type_name {
                 for m in methods {
-                    if let Stmt::Fn { name, params, ret, .. } = m {
+                    if let StmtKind::Fn { name, params, ret, .. } = &m.kind {
                         if name == method_name {
                             return Some((params.clone(), ret.clone()));
                         }
@@ -109,27 +119,27 @@ fn compatible(a: &Type, b: &Type) -> bool {
 pub struct TypeChecker;
 
 impl TypeChecker {
-    pub fn check(program: &Program) -> Result<(), TypeError> {
+    pub fn check(program: &Program) -> Result<(), Diagnostic> {
         let mut env = TypeEnv::new(program);
 
         for s in &program.stmts {
-            match s {
-                Stmt::Fn { name, params, ret, .. } => {
+            match &s.kind {
+                StmtKind::Fn { name, params, ret, .. } => {
                     let param_tys: Vec<Type> = params.iter().map(|(_, t)| t.clone()).collect();
                     env.functions.insert(name.clone(), (param_tys, ret.clone()));
                 }
-                Stmt::Struct { name, fields, .. } => {
+                StmtKind::Struct { name, fields, .. } => {
                     env.structs.insert(name.clone(), fields.clone());
                 }
-                Stmt::Trait { name, methods } => {
+                StmtKind::Trait { name, methods } => {
                     env.traits.insert(name.clone(), methods.clone());
                 }
-                Stmt::ExternFn { name, params, ret } => {
+                StmtKind::ExternFn { name, params, ret } => {
                     let param_tys: Vec<Type> = params.iter().map(|(_, t)| t.clone()).collect();
                     env.extern_fns.insert(name.clone(), (param_tys, ret.clone()));
                 }
-                Stmt::Impl { .. } => {}
-                Stmt::Macro { name, params, .. } => {
+                StmtKind::Impl { .. } => {}
+                StmtKind::Macro { name, params, .. } => {
                     // A macro is substituted, not called, so its result type is
                     // only known after expansion.
                     env.macros.insert(name.clone(), params.len());
@@ -139,7 +149,7 @@ impl TypeChecker {
         }
 
         for s in &program.stmts {
-            if let Stmt::Impl { trait_name, type_name, methods } = s {
+            if let StmtKind::Impl { trait_name, type_name, methods } = &s.kind {
                 // An inherent `impl T { .. }` has no trait name and nothing to
                 // check against; only a named trait imposes requirements.
                 let trait_methods = if trait_name.is_empty() {
@@ -147,19 +157,20 @@ impl TypeChecker {
                 } else {
                     match env.traits.get(trait_name) {
                         Some(m) => m.clone(),
-                        None => return Err(TypeError::UndefinedTrait(trait_name.clone())),
+                        None => return Err(Diagnostic::new(
+                            TypeError::UndefinedTrait(trait_name.clone()).to_string(), s.span)),
                     }
                 };
                 for tm in &trait_methods {
                     let found = methods.iter().any(|m| {
-                        if let Stmt::Fn { name, .. } = m { name == &tm.name } else { false }
+                        if let StmtKind::Fn { name, .. } = &m.kind { name == &tm.name } else { false }
                     });
                     if !found {
-                        return Err(TypeError::MissingImpl {
+                        return Err(Diagnostic::new(TypeError::MissingImpl {
                             trait_name: trait_name.clone(),
                             type_name: type_name.clone(),
                             method: tm.name.clone(),
-                        });
+                        }.to_string(), s.span));
                     }
                 }
                 env.impls.push((trait_name.clone(), type_name.clone(), methods.clone()));
@@ -172,16 +183,27 @@ impl TypeChecker {
         Ok(())
     }
 
-    fn check_stmt(stmt: &Stmt, env: &mut TypeEnv) -> Result<(), TypeError> {
-        match stmt {
-            Stmt::Let { name, ty, value } => {
+    /// Statements are the granularity the AST records positions at, so this is
+    /// where a type error picks up the location it is reported against. An error
+    /// coming back from a nested statement already carries one.
+    fn check_stmt(stmt: &Stmt, env: &mut TypeEnv) -> Result<(), Diagnostic> {
+        Self::check_stmt_inner(stmt, env).map_err(|e| match e {
+            // keep the innermost position rather than the enclosing statement's
+            TypeError::Located(d) => *d,
+            other => Diagnostic::new(other.to_string(), stmt.span),
+        })
+    }
+
+    fn check_stmt_inner(stmt: &Stmt, env: &mut TypeEnv) -> Result<(), TypeError> {
+        match &stmt.kind {
+            StmtKind::Let { name, ty, value } => {
                 let val_ty = Self::check_expr(value, env)?;
                 if *ty != Type::Inferred && !compatible(ty, &val_ty) {
                     return Err(TypeError::TypeMismatch { expected: format!("{:?}", ty), found: format!("{:?}", val_ty) });
                 }
                 env.define(name, val_ty);
             }
-            Stmt::Fn { params, ret, body, .. } => {
+            StmtKind::Fn { params, ret, body, .. } => {
                 env.push_scope();
                 let prev = env.current_return.clone();
                 env.current_return = Some(ret.clone());
@@ -190,23 +212,23 @@ impl TypeChecker {
                 env.current_return = prev;
                 env.pop_scope();
             }
-            Stmt::Struct { .. } | Stmt::Enum { .. } | Stmt::Trait { .. } | Stmt::Macro { .. } | Stmt::ExternFn { .. } | Stmt::Impl { .. } | Stmt::Import(_) => {}
-            Stmt::While { cond, body } => {
+            StmtKind::Struct { .. } | StmtKind::Enum { .. } | StmtKind::Trait { .. } | StmtKind::Macro { .. } | StmtKind::ExternFn { .. } | StmtKind::Impl { .. } | StmtKind::Import(_) => {}
+            StmtKind::While { cond, body } => {
                 Self::check_expr(cond, env)?;
                 env.push_scope();
                 for s in body { Self::check_stmt(s, env)?; }
                 env.pop_scope();
             }
-            Stmt::For { var, iter, body } => {
+            StmtKind::For { var, iter, body } => {
                 Self::check_expr(iter, env)?;
                 env.push_scope();
                 env.define(var, Type::Int);
                 for s in body { Self::check_stmt(s, env)?; }
                 env.pop_scope();
             }
-            Stmt::Break(_) => {}
-            Stmt::Continue(_) => {}
-            Stmt::Assign { name, value } => {
+            StmtKind::Break(_) => {}
+            StmtKind::Continue(_) => {}
+            StmtKind::Assign { name, value } => {
                 let val_ty = Self::check_expr(value, env)?;
                 if let Some(var_ty) = env.lookup(name) {
                     if !compatible(&var_ty, &val_ty) {
@@ -214,7 +236,7 @@ impl TypeChecker {
                     }
                 }
             }
-            Stmt::If { cond, then_body, else_body } => {
+            StmtKind::If { cond, then_body, else_body } => {
                 Self::check_expr(cond, env)?;
                 env.push_scope();
                 for s in then_body { Self::check_stmt(s, env)?; }
@@ -225,8 +247,8 @@ impl TypeChecker {
                     env.pop_scope();
                 }
             }
-            Stmt::Expr(e) => { Self::check_expr(e, env)?; }
-            Stmt::Return(e) => {
+            StmtKind::Expr(e) => { Self::check_expr(e, env)?; }
+            StmtKind::Return(e) => {
                 let ret_ty = env.current_return.clone().unwrap_or(Type::Unit);
                 match e {
                     Some(expr) => {

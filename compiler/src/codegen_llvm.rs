@@ -1660,8 +1660,8 @@ Expr::Match { scrutinee, arms } => {
 
     fn gen_stmt(&mut self, s: &Stmt, fn_val: FunctionValue<'ctx>, terminated: &mut bool) {
         if *terminated { return; }
-        match s {
-            Stmt::Let { name, value, .. } => {
+        match &s.kind {
+            StmtKind::Let { name, value, .. } => {
                 if let Some(sn) = self.infer_struct_type(value) {
                     self.var_struct_type.insert(name.clone(), sn);
                 }
@@ -1686,7 +1686,7 @@ Expr::Match { scrutinee, arms } => {
                 };
                 self.named.insert(name.clone(), (ptr, ty_name));
             }
-            Stmt::Assign { name, value } => {
+            StmtKind::Assign { name, value } => {
                 let v = self.gen_expr(value);
                 if let Some((ptr, _)) = self.named.get(name) {
                     self.builder.build_store(*ptr, v.as_basic()).unwrap();
@@ -1694,10 +1694,10 @@ Expr::Match { scrutinee, arms } => {
                     panic!("undefined variable for assign: {}", name);
                 }
             }
-            Stmt::Expr(e) => {
+            StmtKind::Expr(e) => {
                 self.gen_expr(e);
             }
-            Stmt::Return(e) => {
+            StmtKind::Return(e) => {
                 match e {
                     Some(x) => {
                         let v = self.gen_expr(x);
@@ -1717,7 +1717,7 @@ Expr::Match { scrutinee, arms } => {
                 }
                 *terminated = true;
             }
-            Stmt::If { cond, then_body, else_body } => {
+            StmtKind::If { cond, then_body, else_body } => {
                 let cond_val = self.gen_expr(cond);
                 let cond_bool = self.to_i1(&cond_val);
 
@@ -1759,7 +1759,7 @@ Expr::Match { scrutinee, arms } => {
 
                 self.builder.position_at_end(merge_bb);
             }
-            Stmt::While { cond, body } => {
+            StmtKind::While { cond, body } => {
                 let loop_bb = self.context.append_basic_block(fn_val, "while");
                 let body_bb = self.context.append_basic_block(fn_val, "while_body");
                 let after_bb = self.context.append_basic_block(fn_val, "while_end");
@@ -1788,7 +1788,7 @@ Expr::Match { scrutinee, arms } => {
 
                 self.builder.position_at_end(after_bb);
             }
-            Stmt::Break(val) => {
+            StmtKind::Break(val) => {
                 if let Some(exit_bb) = self.loop_exit.last().cloned() {
                     if let Some(expr) = val {
                         let bv = self.gen_expr(expr);
@@ -1802,14 +1802,14 @@ Expr::Match { scrutinee, arms } => {
                     self.builder.position_at_end(dead_bb);
                 }
             }
-            Stmt::Continue(_) => {
+            StmtKind::Continue(_) => {
                 if let Some(cont_bb) = self.loop_continue.last().cloned() {
                     self.builder.build_unconditional_branch(cont_bb).unwrap();
                     let dead_bb = self.context.append_basic_block(self.builder.get_insert_block().unwrap().get_parent().unwrap(), "dead");
                     self.builder.position_at_end(dead_bb);
                 }
             }
-            Stmt::For { var, iter, body } => {
+            StmtKind::For { var, iter, body } => {
                 if let Expr::Range(start_expr, end_expr) = iter {
                     let start_val = self.gen_expr(start_expr);
                     let end_val = self.gen_expr(end_expr);
@@ -1856,8 +1856,8 @@ Expr::Match { scrutinee, arms } => {
                     panic!("LLVM backend: for loop requires range expression");
                 }
             }
-            Stmt::Fn { .. } | Stmt::Struct { .. } | Stmt::Enum { .. } | Stmt::Trait { .. }
-            | Stmt::Macro { .. } | Stmt::ExternFn { .. } | Stmt::Impl { .. } | Stmt::Import(_) => {}
+            StmtKind::Fn { .. } | StmtKind::Struct { .. } | StmtKind::Enum { .. } | StmtKind::Trait { .. }
+            | StmtKind::Macro { .. } | StmtKind::ExternFn { .. } | StmtKind::Impl { .. } | StmtKind::Import(_) => {}
         }
     }
 }
@@ -1871,10 +1871,10 @@ fn expand_macros_in_expr(expr: &Expr, macros: &HashMap<String, (Vec<String>, Vec
                     arg_map.insert(p.clone(), substitute_expr(&args[i], &HashMap::new(), macros));
                 }
                 if body.len() == 1 {
-                    if let Stmt::Expr(e) = &body[0] {
+                    if let StmtKind::Expr(e) = &body[0].kind {
                         return substitute_expr(e, &arg_map, macros);
                     }
-                    if let Stmt::Return(Some(e)) = &body[0] {
+                    if let StmtKind::Return(Some(e)) = &body[0].kind {
                         return substitute_expr(e, &arg_map, macros);
                     }
                 }
@@ -1959,7 +1959,7 @@ fn substitute_expr(expr: &Expr, arg_map: &HashMap<String, Expr>, macros: &HashMa
 fn expand_macros_program(program: &Program) -> Program {
     let mut macros: HashMap<String, (Vec<String>, Vec<Stmt>)> = HashMap::new();
     for s in &program.stmts {
-        if let Stmt::Macro { name, params, body } = s {
+        if let StmtKind::Macro { name, params, body } = &s.kind {
             macros.insert(name.clone(), (params.clone(), body.clone()));
         }
     }
@@ -1968,28 +1968,28 @@ fn expand_macros_program(program: &Program) -> Program {
     }
     let mut new_stmts = Vec::new();
     for s in &program.stmts {
-        match s {
-            Stmt::Macro { .. } => {}
-            Stmt::Fn { name, generics, params, ret, body } => {
+        match &s.kind {
+            StmtKind::Macro { .. } => {}
+            StmtKind::Fn { name, generics, params, ret, body } => {
                 let new_body: Vec<Stmt> = body.iter().flat_map(|s| expand_macros_in_stmt(s, &macros)).collect();
-                new_stmts.push(Stmt::Fn { name: name.clone(), generics: generics.clone(), params: params.clone(), ret: ret.clone(), body: new_body });
+                new_stmts.push(Stmt::new(StmtKind::Fn { name: name.clone(), generics: generics.clone(), params: params.clone(), ret: ret.clone(), body: new_body }, s.span));
             }
-            Stmt::Expr(e) => { new_stmts.push(Stmt::Expr(expand_macros_in_expr(e, &macros))); }
-            Stmt::Let { name, ty, value } => { new_stmts.push(Stmt::Let { name: name.clone(), ty: ty.clone(), value: expand_macros_in_expr(value, &macros) }); }
-            Stmt::Assign { name, value } => { new_stmts.push(Stmt::Assign { name: name.clone(), value: expand_macros_in_expr(value, &macros) }); }
-            Stmt::Return(e) => { new_stmts.push(Stmt::Return(e.as_ref().map(|e| expand_macros_in_expr(e, &macros)))); }
-            Stmt::While { cond, body } => {
+            StmtKind::Expr(e) => { new_stmts.push(Stmt::new(StmtKind::Expr(expand_macros_in_expr(e, &macros)), s.span)); }
+            StmtKind::Let { name, ty, value } => { new_stmts.push(Stmt::new(StmtKind::Let { name: name.clone(), ty: ty.clone(), value: expand_macros_in_expr(value, &macros) }, s.span)); }
+            StmtKind::Assign { name, value } => { new_stmts.push(Stmt::new(StmtKind::Assign { name: name.clone(), value: expand_macros_in_expr(value, &macros) }, s.span)); }
+            StmtKind::Return(e) => { new_stmts.push(Stmt::new(StmtKind::Return(e.as_ref().map(|e| expand_macros_in_expr(e, &macros))), s.span)); }
+            StmtKind::While { cond, body } => {
                 let new_body: Vec<Stmt> = body.iter().flat_map(|s| expand_macros_in_stmt(s, &macros)).collect();
-                new_stmts.push(Stmt::While { cond: expand_macros_in_expr(cond, &macros), body: new_body });
+                new_stmts.push(Stmt::new(StmtKind::While { cond: expand_macros_in_expr(cond, &macros), body: new_body }, s.span));
             }
-            Stmt::For { var, iter, body } => {
+            StmtKind::For { var, iter, body } => {
                 let new_body: Vec<Stmt> = body.iter().flat_map(|s| expand_macros_in_stmt(s, &macros)).collect();
-                new_stmts.push(Stmt::For { var: var.clone(), iter: expand_macros_in_expr(iter, &macros), body: new_body });
+                new_stmts.push(Stmt::new(StmtKind::For { var: var.clone(), iter: expand_macros_in_expr(iter, &macros), body: new_body }, s.span));
             }
-            Stmt::If { cond, then_body, else_body } => {
+            StmtKind::If { cond, then_body, else_body } => {
                 let new_then: Vec<Stmt> = then_body.iter().flat_map(|s| expand_macros_in_stmt(s, &macros)).collect();
                 let new_else = else_body.as_ref().map(|v| v.iter().flat_map(|s| expand_macros_in_stmt(s, &macros)).collect());
-                new_stmts.push(Stmt::If { cond: expand_macros_in_expr(cond, &macros), then_body: new_then, else_body: new_else });
+                new_stmts.push(Stmt::new(StmtKind::If { cond: expand_macros_in_expr(cond, &macros), then_body: new_then, else_body: new_else }, s.span));
             }
             _ => new_stmts.push(s.clone()),
         }
@@ -1998,8 +1998,8 @@ fn expand_macros_program(program: &Program) -> Program {
 }
 
 fn expand_macros_in_stmt(stmt: &Stmt, macros: &HashMap<String, (Vec<String>, Vec<Stmt>)>) -> Vec<Stmt> {
-    match stmt {
-        Stmt::Expr(e) => {
+    match &stmt.kind {
+        StmtKind::Expr(e) => {
             if let Expr::Call(callee, args) = e {
                 if let Expr::Ident(mname) = callee.as_ref() {
                     if let Some((params, body)) = macros.get(mname) {
@@ -2009,9 +2009,9 @@ fn expand_macros_in_stmt(stmt: &Stmt, macros: &HashMap<String, (Vec<String>, Vec
                     }
                 }
             }
-            vec![Stmt::Expr(expand_macros_in_expr(e, macros))]
+            vec![Stmt::new(StmtKind::Expr(expand_macros_in_expr(e, macros)), stmt.span)]
         }
-        Stmt::Let { name, ty, value } => {
+        StmtKind::Let { name, ty, value } => {
             if let Expr::Call(callee, args) = value {
                 if let Expr::Ident(mname) = callee.as_ref() {
                     if let Some((params, body)) = macros.get(mname) {
@@ -2021,22 +2021,22 @@ fn expand_macros_in_stmt(stmt: &Stmt, macros: &HashMap<String, (Vec<String>, Vec
                     }
                 }
             }
-            vec![Stmt::Let { name: name.clone(), ty: ty.clone(), value: expand_macros_in_expr(value, macros) }]
+            vec![Stmt::new(StmtKind::Let { name: name.clone(), ty: ty.clone(), value: expand_macros_in_expr(value, macros) }, stmt.span)]
         }
-        Stmt::Assign { name, value } => vec![Stmt::Assign { name: name.clone(), value: expand_macros_in_expr(value, macros) }],
-        Stmt::Return(e) => vec![Stmt::Return(e.as_ref().map(|e| expand_macros_in_expr(e, macros)))],
-        Stmt::While { cond, body } => {
+        StmtKind::Assign { name, value } => vec![Stmt::new(StmtKind::Assign { name: name.clone(), value: expand_macros_in_expr(value, macros) }, stmt.span)],
+        StmtKind::Return(e) => vec![Stmt::new(StmtKind::Return(e.as_ref().map(|e| expand_macros_in_expr(e, macros))), stmt.span)],
+        StmtKind::While { cond, body } => {
             let new_body: Vec<Stmt> = body.iter().flat_map(|s| expand_macros_in_stmt(s, macros)).collect();
-            vec![Stmt::While { cond: expand_macros_in_expr(cond, macros), body: new_body }]
+            vec![Stmt::new(StmtKind::While { cond: expand_macros_in_expr(cond, macros), body: new_body }, stmt.span)]
         }
-        Stmt::For { var, iter, body } => {
+        StmtKind::For { var, iter, body } => {
             let new_body: Vec<Stmt> = body.iter().flat_map(|s| expand_macros_in_stmt(s, macros)).collect();
-            vec![Stmt::For { var: var.clone(), iter: expand_macros_in_expr(iter, macros), body: new_body }]
+            vec![Stmt::new(StmtKind::For { var: var.clone(), iter: expand_macros_in_expr(iter, macros), body: new_body }, stmt.span)]
         }
-        Stmt::If { cond, then_body, else_body } => {
+        StmtKind::If { cond, then_body, else_body } => {
             let new_then: Vec<Stmt> = then_body.iter().flat_map(|s| expand_macros_in_stmt(s, macros)).collect();
             let new_else = else_body.as_ref().map(|v| v.iter().flat_map(|s| expand_macros_in_stmt(s, macros)).collect());
-            vec![Stmt::If { cond: expand_macros_in_expr(cond, macros), then_body: new_then, else_body: new_else }]
+            vec![Stmt::new(StmtKind::If { cond: expand_macros_in_expr(cond, macros), then_body: new_then, else_body: new_else }, stmt.span)]
         }
         _ => vec![stmt.clone()],
     }
@@ -2049,32 +2049,32 @@ fn expand_macro_call_inline(params: &[String], body: &[Stmt], args: &[Expr], ret
     }
     let mut result = Vec::new();
     for s in body {
-        match s {
-            Stmt::Let { name, ty: _, value } => {
+        match &s.kind {
+            StmtKind::Let { name, ty: _, value } => {
                 let substituted_val = substitute_expr(value, &arg_map, macros);
-                result.push(Stmt::Let { name: name.clone(), ty: Type::Inferred, value: substituted_val });
+                result.push(Stmt::new(StmtKind::Let { name: name.clone(), ty: Type::Inferred, value: substituted_val }, s.span));
             }
-            Stmt::Return(Some(e)) => {
+            StmtKind::Return(Some(e)) => {
                 let substituted = substitute_expr(e, &arg_map, macros);
                 if let Some(var) = &return_var {
-                    result.push(Stmt::Let { name: var.clone(), ty: Type::Inferred, value: substituted });
+                    result.push(Stmt::new(StmtKind::Let { name: var.clone(), ty: Type::Inferred, value: substituted }, s.span));
                 } else {
-                    result.push(Stmt::Return(Some(substituted)));
+                    result.push(Stmt::new(StmtKind::Return(Some(substituted)), s.span));
                 }
             }
-            Stmt::Assign { name, value } => {
+            StmtKind::Assign { name, value } => {
                 let substituted = substitute_expr(value, &arg_map, macros);
-                result.push(Stmt::Assign { name: name.clone(), value: substituted });
+                result.push(Stmt::new(StmtKind::Assign { name: name.clone(), value: substituted }, s.span));
             }
-            Stmt::If { cond, then_body, else_body } => {
+            StmtKind::If { cond, then_body, else_body } => {
                 let substituted_cond = substitute_expr(cond, &arg_map, macros);
                 let new_then: Vec<Stmt> = then_body.iter().flat_map(|s| expand_macro_call_inline_single(s, &arg_map, return_var.clone(), macros)).collect();
                 let new_else = else_body.as_ref().map(|v| v.iter().flat_map(|s| expand_macro_call_inline_single(s, &arg_map, return_var.clone(), macros)).collect());
-                result.push(Stmt::If { cond: substituted_cond, then_body: new_then, else_body: new_else });
+                result.push(Stmt::new(StmtKind::If { cond: substituted_cond, then_body: new_then, else_body: new_else }, s.span));
             }
-            Stmt::Expr(e) => {
+            StmtKind::Expr(e) => {
                 let substituted = substitute_expr(e, &arg_map, macros);
-                result.push(Stmt::Expr(substituted));
+                result.push(Stmt::new(StmtKind::Expr(substituted), s.span));
             }
             _ => result.push(s.clone()),
         }
@@ -2083,26 +2083,26 @@ fn expand_macro_call_inline(params: &[String], body: &[Stmt], args: &[Expr], ret
 }
 
 fn expand_macro_call_inline_single(stmt: &Stmt, arg_map: &HashMap<String, Expr>, return_var: Option<String>, macros: &HashMap<String, (Vec<String>, Vec<Stmt>)>) -> Vec<Stmt> {
-    match stmt {
-        Stmt::Let { name, ty: _, value } => {
+    match &stmt.kind {
+        StmtKind::Let { name, ty: _, value } => {
             let substituted_val = substitute_expr(value, arg_map, macros);
-            vec![Stmt::Let { name: name.clone(), ty: Type::Inferred, value: substituted_val }]
+            vec![Stmt::new(StmtKind::Let { name: name.clone(), ty: Type::Inferred, value: substituted_val }, stmt.span)]
         }
-        Stmt::Return(Some(e)) => {
+        StmtKind::Return(Some(e)) => {
             let substituted = substitute_expr(e, arg_map, macros);
             if let Some(var) = &return_var {
-                vec![Stmt::Let { name: var.clone(), ty: Type::Inferred, value: substituted }]
+                vec![Stmt::new(StmtKind::Let { name: var.clone(), ty: Type::Inferred, value: substituted }, stmt.span)]
             } else {
-                vec![Stmt::Return(Some(substituted))]
+                vec![Stmt::new(StmtKind::Return(Some(substituted)), stmt.span)]
             }
         }
-        Stmt::Assign { name, value } => {
+        StmtKind::Assign { name, value } => {
             let substituted = substitute_expr(value, arg_map, macros);
-            vec![Stmt::Assign { name: name.clone(), value: substituted }]
+            vec![Stmt::new(StmtKind::Assign { name: name.clone(), value: substituted }, stmt.span)]
         }
-        Stmt::Expr(e) => {
+        StmtKind::Expr(e) => {
             let substituted = substitute_expr(e, arg_map, macros);
-            vec![Stmt::Expr(substituted)]
+            vec![Stmt::new(StmtKind::Expr(substituted), stmt.span)]
         }
         _ => vec![stmt.clone()],
     }
@@ -2117,11 +2117,11 @@ pub fn compile_to_executable(program: &Program, out_path: &str) {
 
     // Register struct fields and enum variants
     for s in &program.stmts {
-        match s {
-            Stmt::Struct { name, fields, .. } => {
+        match &s.kind {
+            StmtKind::Struct { name, fields, .. } => {
                 cg.struct_fields.insert(name.clone(), fields.clone());
             }
-            Stmt::Enum { name, variants } => {
+            StmtKind::Enum { name, variants } => {
                 cg.enum_variants.insert(name.clone(), variants.clone());
             }
             _ => {}
@@ -2130,8 +2130,8 @@ pub fn compile_to_executable(program: &Program, out_path: &str) {
 
     // Pre-declare all functions (including impl methods)
     for s in &program.stmts {
-        match s {
-            Stmt::Fn { name, params, ret, .. } => {
+        match &s.kind {
+            StmtKind::Fn { name, params, ret, .. } => {
                 let internal_name = if name == "main" { "_zarrin_main".to_string() } else { name.clone() };
                 let param_types: Vec<BasicMetadataTypeEnum> = params.iter().map(|_| cg.i64.into()).collect();
                 let fn_type = if matches!(ret, Type::Unit) {
@@ -2143,9 +2143,9 @@ pub fn compile_to_executable(program: &Program, out_path: &str) {
                 cg.functions.insert(name.clone(), func);
                 cg.fn_ret_types.insert(name.clone(), ret.clone());
             }
-            Stmt::Impl { methods, .. } => {
+            StmtKind::Impl { methods, .. } => {
                 for m in methods {
-                    if let Stmt::Fn { name, params, ret, .. } = m {
+                    if let StmtKind::Fn { name, params, ret, .. } = &m.kind {
                         let param_types: Vec<BasicMetadataTypeEnum> = params.iter().map(|_| cg.i64.into()).collect();
                         let fn_type = if matches!(ret, Type::Unit) {
                             context.void_type().fn_type(&param_types, false)
@@ -2164,9 +2164,9 @@ pub fn compile_to_executable(program: &Program, out_path: &str) {
 
     // Generate function bodies
     for s in &program.stmts {
-        match s {
-            Stmt::Fn { params, body, ret, .. } => {
-                let name = if let Stmt::Fn { name, .. } = s { name } else { unreachable!() };
+        match &s.kind {
+            StmtKind::Fn { params, body, ret, .. } => {
+                let name = if let StmtKind::Fn { name, .. } = &s.kind { name } else { unreachable!() };
                 let func = cg.functions[name];
                 let entry = context.append_basic_block(func, "entry");
                 cg.builder.position_at_end(entry);
@@ -2199,9 +2199,9 @@ pub fn compile_to_executable(program: &Program, out_path: &str) {
                     }
                 }
             }
-            Stmt::Impl { methods, type_name, .. } => {
+            StmtKind::Impl { methods, type_name, .. } => {
                 for m in methods {
-                    if let Stmt::Fn { name, params, body, ret, .. } = m {
+                    if let StmtKind::Fn { name, params, body, ret, .. } = &m.kind {
                         let func = cg.functions[name];
                         let entry = context.append_basic_block(func, "entry");
                         cg.builder.position_at_end(entry);
@@ -2249,7 +2249,7 @@ pub fn compile_to_executable(program: &Program, out_path: &str) {
     }
 
     // Generate main
-    let has_user_main = program.stmts.iter().any(|s| matches!(s, Stmt::Fn { name, .. } if name == "main"));
+    let has_user_main = program.stmts.iter().any(|s| matches!(&s.kind, StmtKind::Fn { name, .. } if name == "main"));
 
     let main_type = context.i64_type().fn_type(&[], false);
     let main_fn = cg.module.add_function("main", main_type, None);
@@ -2266,9 +2266,9 @@ pub fn compile_to_executable(program: &Program, out_path: &str) {
     } else {
         let mut terminated = false;
         for s in &program.stmts {
-            match s {
-                Stmt::Fn { .. } | Stmt::Struct { .. } | Stmt::Enum { .. } | Stmt::Trait { .. }
-                | Stmt::Macro { .. } | Stmt::ExternFn { .. } | Stmt::Impl { .. } => {}
+            match &s.kind {
+                StmtKind::Fn { .. } | StmtKind::Struct { .. } | StmtKind::Enum { .. } | StmtKind::Trait { .. }
+                | StmtKind::Macro { .. } | StmtKind::ExternFn { .. } | StmtKind::Impl { .. } => {}
                 _ => cg.gen_stmt(s, main_fn, &mut terminated),
             }
         }

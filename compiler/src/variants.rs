@@ -10,7 +10,7 @@
 //! It also resolves qualified names (`Color::Red`), which the pattern parser
 //! produces but no backend previously understood.
 
-use crate::ast::{Program, Stmt, Type};
+use crate::ast::{Program, StmtKind, Type};
 use std::collections::HashMap;
 
 #[derive(Debug, Clone)]
@@ -48,7 +48,7 @@ impl VariantIndex {
             idx.add_enum(&name, &variants);
         }
         for s in &program.stmts {
-            if let Stmt::Enum { name, variants } = s {
+            if let StmtKind::Enum { name, variants } = &s.kind {
                 idx.add_enum(name, variants);
             }
         }

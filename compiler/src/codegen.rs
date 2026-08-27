@@ -1,6 +1,7 @@
 //! Minimal tree-walk interpreter used as the default backend.
 
 use crate::ast::*;
+use crate::diagnostic::{Diagnostic, Span};
 use crate::variants::{Lookup, VariantIndex};
 use std::collections::HashMap;
 
@@ -19,7 +20,18 @@ enum Value {
     Array(Vec<Value>),
 }
 
+/// Report a run-time failure against the statement being evaluated.
+macro_rules! rt_fail {
+    ($self:expr, $($arg:tt)*) => { $self.fail(format!($($arg)*)) };
+}
+
 pub struct Interpreter {
+    /// Source text and path, so a failure can be shown the way a syntax error is.
+    path: String,
+    src: String,
+    /// Statement currently being evaluated. Positions are recorded per
+    /// statement, which is as precise as the AST gets.
+    current_span: Span,
     // Static program context: fixed once the program is loaded.
     fns: HashMap<String, Stmt>,
     structs: HashMap<String, Vec<(String, Type)>>,
@@ -39,8 +51,11 @@ pub struct Interpreter {
 }
 
 impl Interpreter {
-    pub fn new(program: &Program) -> Self {
+    pub fn new(program: &Program, path: &str, src: &str) -> Self {
         let mut interp = Interpreter {
+            path: path.to_string(),
+            src: src.to_string(),
+            current_span: Span::new(1, 1),
             fns: HashMap::new(),
             structs: HashMap::new(),
             variants: VariantIndex::build(program),
@@ -55,12 +70,12 @@ impl Interpreter {
             break_value: None,
         };
         for s in &program.stmts {
-            match s {
-                Stmt::Fn { name, .. } => { interp.fns.insert(name.clone(), s.clone()); }
-                Stmt::Struct { name, fields, .. } => { interp.structs.insert(name.clone(), fields.clone()); }
-                Stmt::Impl { trait_name, type_name, methods } => { interp.impls.push((trait_name.clone(), type_name.clone(), methods.clone())); }
-                Stmt::Macro { name, .. } => { interp.macros.insert(name.clone(), s.clone()); }
-                Stmt::ExternFn { name, .. } => { interp.extern_fns.insert(name.clone(), s.clone()); }
+            match &s.kind {
+                StmtKind::Fn { name, .. } => { interp.fns.insert(name.clone(), s.clone()); }
+                StmtKind::Struct { name, fields, .. } => { interp.structs.insert(name.clone(), fields.clone()); }
+                StmtKind::Impl { trait_name, type_name, methods } => { interp.impls.push((trait_name.clone(), type_name.clone(), methods.clone())); }
+                StmtKind::Macro { name, .. } => { interp.macros.insert(name.clone(), s.clone()); }
+                StmtKind::ExternFn { name, .. } => { interp.extern_fns.insert(name.clone(), s.clone()); }
                 _ => {}
             }
         }
@@ -73,8 +88,25 @@ impl Interpreter {
         match self.variants.lookup(name) {
             Lookup::Unique(v) => Some(v),
             Lookup::Unknown => None,
-            Lookup::Ambiguous(c) => panic!("variant `{}` is declared by {}; rename one of them to disambiguate", name, c.join(" and ")),
+            Lookup::Ambiguous(c) => rt_fail!(self, "variant `{}` is declared by {}; rename one of them to disambiguate", name, c.join(" and ")),
         }
+    }
+
+    /// Print a diagnostic and stop. The interpreter has no error type to
+    /// propagate; before this these were bare panics with no location and a
+    /// Rust backtrace note.
+    fn fail(&self, message: String) -> ! {
+        eprint!("{}", Diagnostic::new(message, self.current_span).render(&self.path, &self.src));
+        std::process::exit(1);
+    }
+
+    /// Bounds-check an index, reporting through `fail` rather than letting
+    /// Rust's own panic surface with no position and no source line.
+    fn checked_index(&self, len: usize, i: i64, what: &str) -> usize {
+        if i < 0 || i as usize >= len {
+            rt_fail!(self, "{} index {} is out of bounds for length {}", what, i, len);
+        }
+        i as usize
     }
 
     fn push_scope(&mut self) { self.scopes.push(HashMap::new()); }
@@ -104,7 +136,7 @@ impl Interpreter {
             if let Some(v) = scope.get(name) { return v.clone(); }
         }
         if let Some(v) = self.globals.get(name) { return v.clone(); }
-        panic!("undefined variable: {}", name)
+        rt_fail!(self, "undefined variable: {}", name)
     }
 
     /// Run a function/method/macro body in a fresh frame: globals stay visible,
@@ -124,21 +156,22 @@ impl Interpreter {
         // Top-level statements run with an empty scope stack, so their `let`
         // bindings become globals that `main` and every function can see.
         for s in &program.stmts {
-            if matches!(s, Stmt::Fn { .. } | Stmt::Struct { .. } | Stmt::Enum { .. } | Stmt::Trait { .. } | Stmt::Macro { .. } | Stmt::ExternFn { .. } | Stmt::Impl { .. }) { continue; }
+            if matches!(s.kind, StmtKind::Fn { .. } | StmtKind::Struct { .. } | StmtKind::Enum { .. } | StmtKind::Trait { .. } | StmtKind::Macro { .. } | StmtKind::ExternFn { .. } | StmtKind::Impl { .. }) { continue; }
             self.eval_stmt(s);
         }
-        if let Some(Stmt::Fn { body, .. }) = self.fns.get("main").cloned() {
+        if let Some(Stmt { kind: StmtKind::Fn { body, .. }, .. }) = self.fns.get("main").cloned() {
             self.call_frame(HashMap::new(), &body);
         }
     }
 
     fn eval_stmt(&mut self, stmt: &Stmt) {
-        match stmt {
-            Stmt::Let { name, value, .. } => { let v = self.eval_expr(value); self.declare(name, v); }
-            Stmt::Fn { .. } | Stmt::Struct { .. } | Stmt::Enum { .. } | Stmt::Trait { .. } | Stmt::Macro { .. } | Stmt::ExternFn { .. } | Stmt::Impl { .. } | Stmt::Import(_) => {}
-            Stmt::Expr(e) => { self.eval_expr(e); }
-            Stmt::Return(e) => { self.returned = Some(match e { Some(x) => self.eval_expr(x), None => Value::Unit }); }
-            Stmt::While { cond, body } => {
+        self.current_span = stmt.span;
+        match &stmt.kind {
+            StmtKind::Let { name, value, .. } => { let v = self.eval_expr(value); self.declare(name, v); }
+            StmtKind::Fn { .. } | StmtKind::Struct { .. } | StmtKind::Enum { .. } | StmtKind::Trait { .. } | StmtKind::Macro { .. } | StmtKind::ExternFn { .. } | StmtKind::Impl { .. } | StmtKind::Import(_) => {}
+            StmtKind::Expr(e) => { self.eval_expr(e); }
+            StmtKind::Return(e) => { self.returned = Some(match e { Some(x) => self.eval_expr(x), None => Value::Unit }); }
+            StmtKind::While { cond, body } => {
                 loop {
                     let cv = self.eval_expr(cond);
                     let truthy = match cv { Value::Bool(b) => b, Value::Int(n) => n != 0, _ => true };
@@ -154,7 +187,7 @@ impl Interpreter {
                     if self.should_break { self.should_break = false; self.break_value = None; break; }
                 }
             }
-            Stmt::For { var, iter, body } => {
+            StmtKind::For { var, iter, body } => {
                 let iter_val = self.eval_expr(iter);
                 match iter_val {
                     Value::Range(start, end) => {
@@ -189,22 +222,22 @@ impl Interpreter {
                             i += 1;
                         }
                     }
-                    _ => panic!("for loop requires int or range"),
+                    _ => rt_fail!(self, "for loop requires int or range"),
                 }
             }
-            Stmt::Break(val) => {
+            StmtKind::Break(val) => {
                 if let Some(expr) = val {
                     self.break_value = Some(self.eval_expr(expr));
                 }
                 self.should_break = true;
                 return;
             }
-            Stmt::Continue(_) => { self.should_continue = true; return; }
-            Stmt::Assign { name, value } => {
+            StmtKind::Continue(_) => { self.should_continue = true; return; }
+            StmtKind::Assign { name, value } => {
                 let v = self.eval_expr(value);
                 self.assign(name, v);
             }
-            Stmt::If { cond, then_body, else_body } => {
+            StmtKind::If { cond, then_body, else_body } => {
                 let cv = self.eval_expr(cond);
                 let truthy = match cv { Value::Bool(b) => b, Value::Int(n) => n != 0, Value::Str(s) => !s.is_empty(), Value::Unit => false, _ => true };
                 let branch = if truthy { Some(then_body) } else { else_body.as_ref() };
@@ -234,7 +267,7 @@ impl Interpreter {
                 }
                 self.lookup(name)
             }
-            Expr::Binary(l, op, r) => { let lv = self.eval_expr(l); let rv = self.eval_expr(r); eval_binop(&lv, op, &rv) }
+            Expr::Binary(l, op, r) => { let lv = self.eval_expr(l); let rv = self.eval_expr(r); self.eval_binop(&lv, op, &rv) }
             Expr::Unary(op, e) => {
                 let v = self.eval_expr(e);
                 match (op, &v) {
@@ -242,24 +275,28 @@ impl Interpreter {
                     (UnaryOp::Neg, Value::Float(f)) => Value::Float(-f),
                     (UnaryOp::Not, Value::Bool(b)) => Value::Bool(!b),
                     (UnaryOp::Not, Value::Int(n)) => Value::Int(if *n == 0 { 1 } else { 0 }),
-                    _ => panic!("invalid unary operation {:?} on {:?}", op, v),
+                    _ => rt_fail!(self, "invalid unary operation {:?} on {:?}", op, v),
                 }
             }
             Expr::Call(callee, args) => {
-                let name = match callee.as_ref() { Expr::Ident(n) => n, _ => panic!("cannot call non-function") };
+                let name = match callee.as_ref() { Expr::Ident(n) => n, _ => rt_fail!(self, "cannot call non-function") };
                 if name == "print" { let v = self.eval_expr(&args[0]); println!("{}", value_to_string(&v)); return Value::Unit; }
-                if name == "len" { let v = self.eval_expr(&args[0]); return match v { Value::Str(s) => Value::Int(s.len() as i64), Value::Array(a) => Value::Int(a.len() as i64), _ => panic!("len expects string or array") }; }
+                if name == "len" { let v = self.eval_expr(&args[0]); return match v { Value::Str(s) => Value::Int(s.len() as i64), Value::Array(a) => Value::Int(a.len() as i64), _ => rt_fail!(self, "len expects string or array") }; }
                 if name == "to_string" { let v = self.eval_expr(&args[0]); return Value::Str(value_to_string(&v)); }
-                if name == "int_to_str" { let v = self.eval_expr(&args[0]); return match v { Value::Int(n) => Value::Str(n.to_string()), _ => panic!("int_to_str expects int") }; }
-                if name == "panic" { let v = self.eval_expr(&args[0]); panic!("{}", value_to_string(&v)); }
-                if name == "array_len" { let v = self.eval_expr(&args[0]); return match v { Value::Array(a) => Value::Int(a.len() as i64), _ => panic!("array_len expects array") }; }
-                if name == "array_get" { let arr = self.eval_expr(&args[0]); let idx = self.eval_expr(&args[1]); return match (arr, idx) { (Value::Array(a), Value::Int(i)) => a[i as usize].clone(), _ => panic!("array_get expects array and int") }; }
-                if name == "array_set" { let arr = self.eval_expr(&args[0]); let idx = self.eval_expr(&args[1]); let val = self.eval_expr(&args[2]); if let (Value::Array(mut a), Value::Int(i)) = (arr, idx) { a[i as usize] = val; return Value::Array(a); } else { panic!("array_set expects array, int, value"); } }
-                if name == "substring" { let s = self.eval_expr(&args[0]); let start = self.eval_expr(&args[1]); let end = self.eval_expr(&args[2]); if let (Value::Str(s), Value::Int(start), Value::Int(end)) = (s, start, end) { return Value::Str(s[start as usize..end as usize].to_string()); } else { panic!("substring expects string, int, int"); } }
-                if name == "contains" { let s = self.eval_expr(&args[0]); let needle = self.eval_expr(&args[1]); if let (Value::Str(s), Value::Str(needle)) = (s, needle) { return Value::Bool(s.contains(&needle)); } else { panic!("contains expects string, string"); } }
-                if name == "split" { let s = self.eval_expr(&args[0]); let delim = self.eval_expr(&args[1]); if let (Value::Str(s), Value::Str(delim)) = (s, delim) { return Value::Array(s.split(&delim).map(|part| Value::Str(part.to_string())).collect()); } else { panic!("split expects string, string"); } }
-                if name == "trim" { let s = self.eval_expr(&args[0]); if let Value::Str(s) = s { return Value::Str(s.trim().to_string()); } else { panic!("trim expects string"); } }
-                if name == "char_at" { let s = self.eval_expr(&args[0]); let idx = self.eval_expr(&args[1]); if let (Value::Str(s), Value::Int(i)) = (s, idx) { let ch = s.chars().nth(i as usize).unwrap_or('\0'); return Value::Str(ch.to_string()); } else { panic!("char_at expects string, int"); } }
+                if name == "int_to_str" { let v = self.eval_expr(&args[0]); return match v { Value::Int(n) => Value::Str(n.to_string()), _ => rt_fail!(self, "int_to_str expects int") }; }
+                if name == "panic" { let v = self.eval_expr(&args[0]); rt_fail!(self, "{}", value_to_string(&v)); }
+                if name == "array_len" { let v = self.eval_expr(&args[0]); return match v { Value::Array(a) => Value::Int(a.len() as i64), _ => rt_fail!(self, "array_len expects array") }; }
+                if name == "array_get" { let arr = self.eval_expr(&args[0]); let idx = self.eval_expr(&args[1]); return match (arr, idx) { (Value::Array(a), Value::Int(i)) => { let k = self.checked_index(a.len(), i, "array"); a[k].clone() }, _ => rt_fail!(self, "array_get expects array and int") }; }
+                if name == "array_set" { let arr = self.eval_expr(&args[0]); let idx = self.eval_expr(&args[1]); let val = self.eval_expr(&args[2]); if let (Value::Array(mut a), Value::Int(i)) = (arr, idx) { let k = self.checked_index(a.len(), i, "array"); a[k] = val; return Value::Array(a); } else { rt_fail!(self, "array_set expects array, int, value"); } }
+                if name == "substring" { let s = self.eval_expr(&args[0]); let start = self.eval_expr(&args[1]); let end = self.eval_expr(&args[2]); if let (Value::Str(s), Value::Int(start), Value::Int(end)) = (s, start, end) { let b = self.checked_index(s.len() + 1, start, "substring start");
+                    let e = self.checked_index(s.len() + 1, end, "substring end");
+                    if b > e { rt_fail!(self, "substring start {} is past end {}", b, e); }
+                    if !s.is_char_boundary(b) || !s.is_char_boundary(e) { rt_fail!(self, "substring bounds fall inside a character"); }
+                    return Value::Str(s[b..e].to_string()); } else { rt_fail!(self, "substring expects string, int, int"); } }
+                if name == "contains" { let s = self.eval_expr(&args[0]); let needle = self.eval_expr(&args[1]); if let (Value::Str(s), Value::Str(needle)) = (s, needle) { return Value::Bool(s.contains(&needle)); } else { rt_fail!(self, "contains expects string, string"); } }
+                if name == "split" { let s = self.eval_expr(&args[0]); let delim = self.eval_expr(&args[1]); if let (Value::Str(s), Value::Str(delim)) = (s, delim) { return Value::Array(s.split(&delim).map(|part| Value::Str(part.to_string())).collect()); } else { rt_fail!(self, "split expects string, string"); } }
+                if name == "trim" { let s = self.eval_expr(&args[0]); if let Value::Str(s) = s { return Value::Str(s.trim().to_string()); } else { rt_fail!(self, "trim expects string"); } }
+                if name == "char_at" { let s = self.eval_expr(&args[0]); let idx = self.eval_expr(&args[1]); if let (Value::Str(s), Value::Int(i)) = (s, idx) { let ch = s.chars().nth(i as usize).unwrap_or('\0'); return Value::Str(ch.to_string()); } else { rt_fail!(self, "char_at expects string, int"); } }
                 if let Some(v) = self.resolve_variant(name) {
                     let eval_args: Vec<Value> = args.iter().map(|a| self.eval_expr(a)).collect();
                     return Value::EnumVariant { enum_name: v.enum_name, variant: v.name, args: eval_args };
@@ -270,8 +307,8 @@ impl Interpreter {
                 if let Some(extern_fn) = self.extern_fns.get(name).cloned() {
                     return self.call_extern_fn(&extern_fn, args);
                 }
-                let func = self.fns.get(name).unwrap_or_else(|| panic!("undefined function: {}", name)).clone();
-                if let Stmt::Fn { params, body, .. } = func {
+                let func = self.fns.get(name).unwrap_or_else(|| rt_fail!(self, "undefined function: {}", name)).clone();
+                if let StmtKind::Fn { params, body, .. } = func.kind {
                     // Arguments are evaluated in the caller's frame, then bound in a fresh one.
                     let mut frame = HashMap::new();
                     for (i, (pname, _)) in params.iter().enumerate() {
@@ -287,12 +324,12 @@ impl Interpreter {
                     match &obj_val {
                         Value::EnumVariant { enum_name, variant, args: inner } if enum_name == "Option" => {
                             if variant == "Some" { return inner[0].clone(); }
-                            panic!("unwrap() called on None");
+                            rt_fail!(self, "unwrap() called on None");
                         }
                         Value::EnumVariant { enum_name, variant, args: inner } if enum_name == "Result" => {
                             if variant == "Ok" { return inner[0].clone(); }
-                            if variant == "Err" { panic!("unwrap() called on Err"); }
-                            panic!("unknown Result variant: {}", variant);
+                            if variant == "Err" { rt_fail!(self, "unwrap() called on Err"); }
+                            rt_fail!(self, "unknown Result variant: {}", variant);
                         }
                         _ => {}
                     }
@@ -320,14 +357,14 @@ impl Interpreter {
                 let type_name = match &obj_val {
                     Value::Struct { name, .. } => name.clone(),
                     Value::EnumVariant { enum_name, .. } => enum_name.clone(),
-                    _ => panic!("no methods on this value"),
+                    _ => rt_fail!(self, "no methods on this value"),
                 };
                 let impls_clone = self.impls.clone();
                 for (tn, impl_type, methods) in &impls_clone {
                     if impl_type == &type_name {
                         let _ = tn;
                         for m in methods {
-                            if let Stmt::Fn { name: mname, params, body, .. } = m {
+                            if let StmtKind::Fn { name: mname, params, body, .. } = &m.kind {
                                 if mname == method {
                                     let self_count = if params.first().map(|(n, _)| n == "self" || n == "&self").unwrap_or(false) { 1 } else { 0 };
                                     let arg_vals: Vec<Value> = args.iter().map(|a| self.eval_expr(a)).collect();
@@ -340,12 +377,12 @@ impl Interpreter {
                         }
                     }
                 }
-                panic!("method `{}` not found for `{}`", method, type_name);
+                rt_fail!(self, "method `{}` not found for `{}`", method, type_name);
             }
             Expr::FieldAccess(obj, field) => {
                 match self.eval_expr(obj) {
-                    Value::Struct { fields, .. } => fields.get(field).cloned().unwrap_or_else(|| panic!("field `{}` not found", field)),
-                    _ => panic!("cannot access field on non-struct"),
+                    Value::Struct { fields, .. } => fields.get(field).cloned().unwrap_or_else(|| rt_fail!(self, "field `{}` not found", field)),
+                    _ => rt_fail!(self, "cannot access field on non-struct"),
                 }
             }
             Expr::StructLit { name, fields } => {
@@ -376,7 +413,7 @@ impl Interpreter {
                         self.pop_scope();
                     }
                 }
-                panic!("no matching pattern");
+                rt_fail!(self, "no matching pattern");
             }
             Expr::If { cond, then_body, else_body } => {
                 let cv = self.eval_expr(cond);
@@ -459,7 +496,7 @@ impl Interpreter {
                             self.pop_scope();
                         }
                     }
-                    _ => panic!("for loop requires range or array"),
+                    _ => rt_fail!(self, "for loop requires range or array"),
                 }
                 result
             }
@@ -468,7 +505,7 @@ impl Interpreter {
                 let bv = self.eval_expr(b);
                 match (av, bv) {
                     (Value::Int(a), Value::Int(b)) => Value::Range(a, b),
-                    _ => panic!("range requires two ints"),
+                    _ => rt_fail!(self, "range requires two ints"),
                 }
             }
             Expr::ArrayLit(elems) => {
@@ -479,15 +516,15 @@ impl Interpreter {
                 let arr_val = self.eval_expr(arr);
                 let idx_val = self.eval_expr(idx);
                 match (arr_val, idx_val) {
-                    (Value::Array(a), Value::Int(i)) => a[i as usize].clone(),
-                    _ => panic!("array indexing requires array and int"),
+                    (Value::Array(a), Value::Int(i)) => { let k = self.checked_index(a.len(), i, "array"); a[k].clone() }
+                    _ => rt_fail!(self, "array indexing requires array and int"),
                 }
             }
         }
     }
 
     fn expand_macro(&mut self, macro_stmt: &Stmt, args: &[Expr]) -> Value {
-        if let Stmt::Macro { params, body, .. } = macro_stmt {
+        if let StmtKind::Macro { params, body, .. } = &macro_stmt.kind {
             let mut frame = HashMap::new();
             for (i, pname) in params.iter().enumerate() {
                 let v = self.eval_expr(&args[i]);
@@ -500,7 +537,7 @@ impl Interpreter {
     }
 
     fn call_extern_fn(&mut self, extern_fn: &Stmt, args: &[Expr]) -> Value {
-            if let Stmt::ExternFn { name, .. } = extern_fn {
+            if let StmtKind::ExternFn { name, .. } = &extern_fn.kind {
             match name.as_str() {
                 "clock" => {
                     use std::time::{SystemTime, UNIX_EPOCH};
@@ -515,7 +552,7 @@ impl Interpreter {
                     Value::Unit
                 }
                 _ => {
-                    panic!("extern fn `{}` not yet implemented in interpreter", name);
+                    rt_fail!(self, "extern fn `{}` not yet implemented in interpreter", name);
                 }
             }
         } else {
@@ -544,7 +581,8 @@ impl Interpreter {
     }
 }
 
-fn eval_binop(l: &Value, op: &BinOp, r: &Value) -> Value {
+impl Interpreter {
+fn eval_binop(&self, l: &Value, op: &BinOp, r: &Value) -> Value {
     match (l, r) {
         (Value::Int(a), Value::Int(b)) => match op {
             BinOp::Add => Value::Int(a + b), BinOp::Sub => Value::Int(a - b),
@@ -557,28 +595,29 @@ fn eval_binop(l: &Value, op: &BinOp, r: &Value) -> Value {
         (Value::Float(a), Value::Float(b)) => match op {
             BinOp::Add => Value::Float(a + b), BinOp::Sub => Value::Float(a - b),
             BinOp::Mul => Value::Float(a * b), BinOp::Div => Value::Float(a / b),
-            _ => panic!("unsupported float op"),
+            _ => rt_fail!(self, "unsupported float op"),
         },
         (Value::Bool(a), Value::Bool(b)) => match op {
             BinOp::Eq => Value::Bool(a == b), BinOp::Ne => Value::Bool(a != b),
             BinOp::And => Value::Bool(*a && *b), BinOp::Or => Value::Bool(*a || *b),
-            _ => panic!("unsupported bool op"),
+            _ => rt_fail!(self, "unsupported bool op"),
         },
         (Value::Str(a), Value::Str(b)) => match op {
             BinOp::Add => Value::Str(format!("{}{}", a, b)),
             BinOp::Eq => Value::Bool(a == b), BinOp::Ne => Value::Bool(a != b),
-            _ => panic!("unsupported string op"),
+            _ => rt_fail!(self, "unsupported string op"),
         },
         (Value::Str(a), Value::Int(b)) => match op {
             BinOp::Add => Value::Str(format!("{}{}", a, b)),
-            _ => panic!("unsupported string+int op"),
+            _ => rt_fail!(self, "unsupported string+int op"),
         },
         (Value::Int(a), Value::Str(b)) => match op {
             BinOp::Add => Value::Str(format!("{}{}", a, b)),
-            _ => panic!("unsupported int+string op"),
+            _ => rt_fail!(self, "unsupported int+string op"),
         },
-        _ => panic!("type mismatch in binary op"),
+        _ => rt_fail!(self, "type mismatch in binary operation"),
     }
+}
 }
 
 fn values_equal(a: &Value, b: &Value) -> bool {

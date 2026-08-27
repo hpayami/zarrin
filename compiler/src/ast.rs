@@ -1,5 +1,7 @@
 //! Abstract Syntax Tree for the Zarrin language.
 
+use crate::diagnostic::Span;
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum Type {
     Inferred,
@@ -86,8 +88,23 @@ pub enum Expr {
     },
 }
 
+/// A statement together with where it came from. Errors found after parsing —
+/// type errors, and failures at run time — are reported against the statement
+/// being processed, which is the granularity the AST records.
 #[derive(Debug, Clone, PartialEq)]
-pub enum Stmt {
+pub struct Stmt {
+    pub kind: StmtKind,
+    pub span: Span,
+}
+
+impl Stmt {
+    pub fn new(kind: StmtKind, span: Span) -> Self {
+        Stmt { kind, span }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum StmtKind {
     Let {
         name: String,
         ty: Type,

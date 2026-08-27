@@ -306,10 +306,20 @@ fn ambiguous_variant_is_reported_not_guessed() {
 fn variant_resolution_is_deterministic() {
     // The whole point: repeated runs of an identical program must agree.
     // This used to alternate between a type error and a clean pass.
-    let first = common::zarrinc("check", AMBIGUOUS).stderr;
+    // Compare the message, not the whole diagnostic: each run writes the
+    // program to its own scratch file, so the quoted path differs.
+    let message = |src: &str| {
+        common::zarrinc("check", src)
+            .stderr
+            .lines()
+            .next()
+            .unwrap_or_default()
+            .to_string()
+    };
+    let first = message(AMBIGUOUS);
+    assert!(first.contains("declared by"), "unexpected first run: {}", first);
     for i in 0..20 {
-        let again = common::zarrinc("check", AMBIGUOUS).stderr;
-        assert_eq!(first, again, "run {} disagreed with the first run", i);
+        assert_eq!(first, message(AMBIGUOUS), "run {} disagreed with the first run", i);
     }
 }
 

@@ -61,15 +61,16 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_stmt(&mut self) -> Result<Stmt, Diagnostic> {
-        Ok(match self.current.clone() {
-            Token::Let => self.parse_let()?,
-            Token::Fn => self.parse_fn()?,
-            Token::Struct => self.parse_struct()?,
-            Token::Enum => self.parse_enum()?,
-            Token::Trait => self.parse_trait()?,
-            Token::Impl => self.parse_impl()?,
-            Token::Extern => self.parse_extern_fn()?,
-            Token::Macro => self.parse_macro()?,
+        let span = self.span;
+        Ok(Stmt::new(match self.current.clone() {
+            Token::Let => self.parse_let()?.kind,
+            Token::Fn => self.parse_fn()?.kind,
+            Token::Struct => self.parse_struct()?.kind,
+            Token::Enum => self.parse_enum()?.kind,
+            Token::Trait => self.parse_trait()?.kind,
+            Token::Impl => self.parse_impl()?.kind,
+            Token::Extern => self.parse_extern_fn()?.kind,
+            Token::Macro => self.parse_macro()?.kind,
             Token::Import => {
                 self.advance()?;
                 let path = match self.current.clone() {
@@ -77,7 +78,7 @@ impl<'a> Parser<'a> {
                     t => return Err(self.error_at_prev(format!("expected string path after import, found {}", describe(&t)))),
                 };
                 self.expect(Token::Semicolon)?;
-                Stmt::Import(path)
+                StmtKind::Import(path)
             }
             Token::If => {
                 self.advance()?; // if
@@ -106,7 +107,7 @@ impl<'a> Parser<'a> {
                 } else {
                     None
                 };
-                Stmt::If { cond, then_body, else_body }
+                StmtKind::If { cond, then_body, else_body }
             }
             Token::While => {
                 self.advance()?; // while
@@ -117,7 +118,7 @@ impl<'a> Parser<'a> {
                     body.push(self.parse_stmt()?);
                 }
                 self.expect(Token::RBrace)?;
-                Stmt::While { cond, body }
+                StmtKind::While { cond, body }
             }
             Token::For => {
                 self.advance()?; // for
@@ -133,7 +134,7 @@ impl<'a> Parser<'a> {
                     body.push(self.parse_stmt()?);
                 }
                 self.expect(Token::RBrace)?;
-                Stmt::For { var, iter, body }
+                StmtKind::For { var, iter, body }
             }
             Token::Break => {
                 self.advance()?;
@@ -143,7 +144,7 @@ impl<'a> Parser<'a> {
                     Some(self.parse_expr()?)
                 };
                 self.expect(Token::Semicolon)?;
-                Stmt::Break(e)
+                StmtKind::Break(e)
             }
             Token::Continue => {
                 self.advance()?;
@@ -153,7 +154,7 @@ impl<'a> Parser<'a> {
                     Some(self.parse_expr()?)
                 };
                 self.expect(Token::Semicolon)?;
-                Stmt::Continue(e)
+                StmtKind::Continue(e)
             }
             Token::Return => {
                 self.advance()?;
@@ -163,7 +164,7 @@ impl<'a> Parser<'a> {
                     Some(self.parse_expr()?)
                 };
                 self.expect(Token::Semicolon)?;
-                Stmt::Return(e)
+                StmtKind::Return(e)
             }
             _ => {
                 let e = self.parse_expr()?;
@@ -172,18 +173,18 @@ impl<'a> Parser<'a> {
                     let val = self.parse_expr()?;
                     self.expect(Token::Semicolon)?;
                     if let Expr::Ident(name) = e {
-                        Stmt::Assign { name, value: val }
+                        StmtKind::Assign { name, value: val }
                     } else {
                         return Err(self.error("expected identifier on left side of assignment"));
                     }
                 } else if self.current == Token::Semicolon {
                     self.advance()?;
-                    Stmt::Expr(e)
+                    StmtKind::Expr(e)
                 } else if self.current == Token::RBrace || self.current == Token::Eof {
                     // A trailing expression is the value of its block. Allowed
                     // only in the last position: accepting it anywhere turned a
                     // forgotten `;` into a silent early return.
-                    Stmt::Return(Some(e))
+                    StmtKind::Return(Some(e))
                 } else {
                     return Err(self.error(format!(
                         "expected `;`, found {}",
@@ -191,7 +192,7 @@ impl<'a> Parser<'a> {
                     )));
                 }
             }
-        })
+        }, span))
     }
 
     fn parse_generics(&mut self) -> Result<Vec<String>, Diagnostic> {
@@ -214,6 +215,7 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_let(&mut self) -> Result<Stmt, Diagnostic> {
+        let span = self.span;
         self.advance()?;
         let name = match self.advance()? {
             Token::Ident(n) => n,
@@ -228,10 +230,11 @@ impl<'a> Parser<'a> {
         self.expect(Token::Assign)?;
         let value = self.parse_expr()?;
         self.expect(Token::Semicolon)?;
-        Ok(Stmt::Let { name, ty, value })
+        Ok(Stmt::new(StmtKind::Let { name, ty, value }, span))
     }
 
     fn parse_fn(&mut self) -> Result<Stmt, Diagnostic> {
+        let span = self.span;
         self.advance()?;
         let name = match self.advance()? {
             Token::Ident(n) => n,
@@ -278,10 +281,11 @@ impl<'a> Parser<'a> {
             body.push(self.parse_stmt()?);
         }
         self.expect(Token::RBrace)?;
-        Ok(Stmt::Fn { name, generics, params, ret, body })
+        Ok(Stmt::new(StmtKind::Fn { name, generics, params, ret, body }, span))
     }
 
     fn parse_struct(&mut self) -> Result<Stmt, Diagnostic> {
+        let span = self.span;
         self.advance()?;
         let name = match self.advance()? {
             Token::Ident(n) => n,
@@ -303,10 +307,11 @@ impl<'a> Parser<'a> {
             }
         }
         self.expect(Token::RBrace)?;
-        Ok(Stmt::Struct { name, generics, fields })
+        Ok(Stmt::new(StmtKind::Struct { name, generics, fields }, span))
     }
 
     fn parse_enum(&mut self) -> Result<Stmt, Diagnostic> {
+        let span = self.span;
         self.advance()?;
         let name = match self.advance()? {
             Token::Ident(n) => n,
@@ -339,10 +344,11 @@ impl<'a> Parser<'a> {
             }
         }
         self.expect(Token::RBrace)?;
-        Ok(Stmt::Enum { name, variants })
+        Ok(Stmt::new(StmtKind::Enum { name, variants }, span))
     }
 
     fn parse_trait(&mut self) -> Result<Stmt, Diagnostic> {
+        let span = self.span;
         self.advance()?;
         let name = match self.advance()? {
             Token::Ident(n) => n,
@@ -390,16 +396,17 @@ impl<'a> Parser<'a> {
             methods.push(TraitMethod { name: mname, params, ret });
         }
         self.expect(Token::RBrace)?;
-        Ok(Stmt::Trait { name, methods })
+        Ok(Stmt::new(StmtKind::Trait { name, methods }, span))
     }
 
     fn parse_impl(&mut self) -> Result<Stmt, Diagnostic> {
+        let span = self.span;
         self.advance()?;
         let first_name = match self.advance()? {
             Token::Ident(n) => n,
             t => return Err(self.error_at_prev(format!("expected name after impl, found {}", describe(&t)))),
         };
-        Ok(if self.current == Token::For {
+        Ok(Stmt::new(if self.current == Token::For {
             self.advance()?;
             let type_name = match self.advance()? {
                 Token::Ident(n) => n,
@@ -411,7 +418,7 @@ impl<'a> Parser<'a> {
                 methods.push(self.parse_fn()?);
             }
             self.expect(Token::RBrace)?;
-            Stmt::Impl { trait_name: first_name, type_name, methods }
+            StmtKind::Impl { trait_name: first_name, type_name, methods }
         } else {
             self.expect(Token::LBrace)?;
             let mut methods = Vec::new();
@@ -419,11 +426,12 @@ impl<'a> Parser<'a> {
                 methods.push(self.parse_fn()?);
             }
             self.expect(Token::RBrace)?;
-            Stmt::Impl { trait_name: String::new(), type_name: first_name, methods }
-        })
+            StmtKind::Impl { trait_name: String::new(), type_name: first_name, methods }
+        }, span))
     }
 
     fn parse_extern_fn(&mut self) -> Result<Stmt, Diagnostic> {
+        let span = self.span;
         self.advance()?; // extern
         // Expect optional "C" string
         if matches!(self.current, Token::Str(_)) {
@@ -460,10 +468,11 @@ impl<'a> Parser<'a> {
             Type::Unit
         };
         self.expect(Token::Semicolon)?;
-        Ok(Stmt::ExternFn { name, params, ret })
+        Ok(Stmt::new(StmtKind::ExternFn { name, params, ret }, span))
     }
 
     fn parse_macro(&mut self) -> Result<Stmt, Diagnostic> {
+        let span = self.span;
         self.advance()?; // macro
         let name = match self.advance()? {
             Token::Ident(n) => n,
@@ -487,7 +496,7 @@ impl<'a> Parser<'a> {
             body.push(self.parse_stmt()?);
         }
         self.expect(Token::RBrace)?;
-        Ok(Stmt::Macro { name, params, body })
+        Ok(Stmt::new(StmtKind::Macro { name, params, body }, span))
     }
 
     fn parse_type(&mut self) -> Result<Type, Diagnostic> {
@@ -689,8 +698,8 @@ impl<'a> Parser<'a> {
                 }
                 self.expect(Token::RBrace)?;
                 if let Some(last) = stmts.pop() {
-                    match last {
-                        Stmt::Expr(e) | Stmt::Return(Some(e)) => e,
+                    match last.kind {
+                        StmtKind::Expr(e) | StmtKind::Return(Some(e)) => e,
                         _ => Expr::Bool(false),
                     }
                 } else {
@@ -815,9 +824,9 @@ impl<'a> Parser<'a> {
         }
         self.expect(Token::RBrace)?;
         let then_body = if stmts.len() == 1 {
-            match &stmts[0] {
-                Stmt::Expr(e) => e.clone(),
-                Stmt::Return(Some(e)) => e.clone(),
+            match &stmts[0].kind {
+                StmtKind::Expr(e) => e.clone(),
+                StmtKind::Return(Some(e)) => e.clone(),
                 _ => Expr::Int(0),
             }
         } else {
@@ -835,9 +844,9 @@ impl<'a> Parser<'a> {
                 }
                 self.expect(Token::RBrace)?;
                 Some(Box::new(if estmts.len() == 1 {
-                    match &estmts[0] {
-                        Stmt::Expr(e) => e.clone(),
-                        Stmt::Return(Some(e)) => e.clone(),
+                    match &estmts[0].kind {
+                        StmtKind::Expr(e) => e.clone(),
+                        StmtKind::Return(Some(e)) => e.clone(),
                         _ => Expr::Int(0),
                     }
                 } else {

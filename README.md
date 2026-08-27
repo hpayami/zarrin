@@ -13,7 +13,7 @@ Those are goals, not a description of the current compiler. What exists today:
 
 | | |
 |---|---|
-| Lexer and parser | syntax errors report file, line and column |
+| Lexer and parser | errors report file, line and column |
 | Type checker | runs before `run` and `build`, not just under `check` |
 | Interpreter | the default backend, a tree-walk evaluator |
 | LLVM backend | behind the `llvm` Cargo feature, see below |
@@ -22,9 +22,13 @@ The language has functions, `let` bindings with inference, structs, enums with
 payloads, traits and `impl`, `match` with guards and multi-patterns, macros,
 `extern` functions, arrays, string interpolation, and the usual control flow.
 
+Errors — syntax, type, and run time — are reported against the source with a
+line, a column and the offending line quoted. Positions are recorded per
+statement, so a type or run-time error points at the statement it happened in
+rather than the exact subexpression.
+
 Not yet: generics (parsed, then ignored), escape sequences in string literals,
-and source positions on type and runtime errors — only syntax errors carry
-them so far.
+and freeing memory in the native backend.
 
 ## Build
 

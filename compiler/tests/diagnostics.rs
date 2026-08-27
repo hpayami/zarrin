@@ -8,7 +8,11 @@ use common::zarrinc;
 /// Assert the program is rejected with a diagnostic mentioning `needle`,
 /// pointing at `line:col`, and underlining that column.
 fn assert_diagnostic(src: &str, needle: &str, line: u32, col: u32) {
-    let r = zarrinc("run", src);
+    assert_diagnostic_from("run", src, needle, line, col)
+}
+
+fn assert_diagnostic_from(cmd: &str, src: &str, needle: &str, line: u32, col: u32) {
+    let r = zarrinc(cmd, src);
     assert!(!r.success, "expected a syntax error; got:\n{}", r.stdout);
     let err = &r.stderr;
     assert!(err.contains(needle), "message {:?} not in:\n{}", needle, err);
@@ -98,5 +102,86 @@ fn runtime_failures_are_not_rust_panics() {
         !r.stderr.contains("panicked at") && !r.stderr.contains("RUST_BACKTRACE"),
         "Rust panic internals leaked:\n{}",
         r.stderr
+    );
+}
+
+// --- positions on type and run-time errors ----------------------------------
+//
+// Only syntax errors used to carry a location. Statements now record where they
+// came from, so the type checker and the interpreter report against the
+// statement they were working on.
+
+#[test]
+fn type_errors_report_a_position() {
+    assert_diagnostic_from(
+        "check",
+        "fn f(x: int) -> int {\n    return x;\n}\n\nfn main() {\n    let a = 1;\n    let b = f(\"nope\");\n}\n",
+        "type mismatch",
+        7,
+        5,
+    );
+}
+
+#[test]
+fn a_type_error_points_at_the_innermost_statement() {
+    // Not at the enclosing `while`, which is the statement the walk started from.
+    assert_diagnostic_from(
+        "check",
+        "fn main() {\n    let i = 0;\n    while i < 3 {\n        let z = nothing;\n    }\n}\n",
+        "undefined variable",
+        4,
+        9,
+    );
+}
+
+#[test]
+fn run_reports_type_errors_with_a_position_too() {
+    assert_diagnostic(
+        "fn f(x: int) -> int {\n    return x;\n}\nfn main() {\n    let b = f(\"nope\");\n}\n",
+        "type mismatch",
+        5,
+        5,
+    );
+}
+
+#[test]
+fn runtime_failures_report_a_position() {
+    assert_diagnostic(
+        "enum C { R, G }\nfn main() {\n    let c = G;\n    let v = match c { R => 1 };\n}\n",
+        "no matching pattern",
+        4,
+        5,
+    );
+}
+
+#[test]
+fn unwrapping_none_reports_a_position() {
+    assert_diagnostic("fn main() {\n    let o = None;\n    print(o.unwrap());\n}\n", "unwrap() called on None", 3, 5);
+}
+
+#[test]
+fn an_out_of_bounds_index_is_our_error_not_rusts() {
+    // This used to surface Rust's own panic: "index out of bounds: the len is
+    // 3 but the index is 10", with no position and no source line.
+    assert_diagnostic(
+        "fn main() {\n    let a = [1, 2, 3];\n    print(a[10]);\n}\n",
+        "array index 10 is out of bounds for length 3",
+        3,
+        5,
+    );
+}
+
+#[test]
+fn substring_bounds_are_checked() {
+    assert_diagnostic("fn main() {\n    print(substring(\"hello\", 2, 99));\n}\n", "out of bounds", 2, 5);
+}
+
+#[test]
+fn a_failure_inside_a_function_points_into_that_function() {
+    assert_diagnostic(
+        "fn boom(a: int) -> int {\n    let xs = [1];\n    return xs[a];\n}\nfn main() {\n    print(boom(5));\n}\n",
+        "out of bounds",
+        3,
+        5,
     );
 }

@@ -57,7 +57,7 @@ fn install_error_reporter() {
 fn resolve_imports(program: &mut ast::Program, base_dir: &Path, visited: &mut Vec<String>) {
     let mut new_stmts = Vec::new();
     for stmt in &program.stmts {
-        if let ast::Stmt::Import(path) = stmt {
+        if let ast::StmtKind::Import(path) = &stmt.kind {
             if visited.contains(path) {
                 continue;
             }
@@ -84,9 +84,9 @@ fn resolve_imports(program: &mut ast::Program, base_dir: &Path, visited: &mut Ve
 /// Type-check before executing or compiling. The checker used to be reachable
 /// only through `zarrinc check`, so `run` and `build` happily executed programs
 /// it would have rejected.
-fn check_or_exit(program: &ast::Program) {
-    if let Err(e) = typecheck::TypeChecker::check(program) {
-        eprintln!("error: {}", e);
+fn check_or_exit(program: &ast::Program, path: &str, src: &str) {
+    if let Err(d) = typecheck::TypeChecker::check(program) {
+        eprint!("{}", d.render(path, src));
         exit(1);
     }
 }
@@ -126,8 +126,8 @@ fn main() {
 
     match cmd {
         "run" => {
-            check_or_exit(&program);
-            let mut interp = codegen::Interpreter::new(&program);
+            check_or_exit(&program, file, &src);
+            let mut interp = codegen::Interpreter::new(&program, file, &src);
             interp.run(&program);
         }
         "emit-ast" => {
@@ -136,15 +136,15 @@ fn main() {
         "check" => {
             match typecheck::TypeChecker::check(&program) {
                 Ok(()) => println!("OK: all types check out ({} top-level statements)", program.stmts.len()),
-                Err(e) => {
-                    eprintln!("type error: {}", e);
+                Err(d) => {
+                    eprint!("{}", d.render(file, &src));
                     exit(1);
                 }
             }
         }
         #[cfg(feature = "llvm")]
         "build" => {
-            check_or_exit(&program);
+            check_or_exit(&program, file, &src);
             let out = if args.get(3).map(|s| s.as_str()) == Some("-o") {
                 args.get(4).cloned().unwrap_or_else(|| "a.out".into())
             } else {
