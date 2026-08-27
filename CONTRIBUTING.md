@@ -72,6 +72,14 @@ against a `TypeEnv` the backend keeps in step with the locals in scope. Do not
 add a rule that infers a type from the shape of an expression — that is what
 the checker is for, and the two drifted apart every time it was tried.
 
+A block in the native backend is `open_block` / `close_block`: it owns what it
+declares and releases it at the end, and the names it binds go back to what
+they were. Every construct with a body needs the pair — an `if` branch and a
+`match` arm had neither, so a `let` inside one took over the outer variable of
+the same name and a string declared there was never released. A path that
+leaves early (`return`, `break`) has already released through
+`release_all_open`, so it ends its block with `abandon_block` instead.
+
 A string is an address in the native backend, so any question about its
 contents goes through `strcmp` — `==`, the ordering operators, and a string
 pattern in a `match`. Comparing two addresses asks whether both sides are the

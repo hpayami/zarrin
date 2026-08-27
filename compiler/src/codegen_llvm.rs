@@ -93,6 +93,10 @@ pub struct Codegen<'ctx> {
     /// Names bound in each open block, innermost last, so a block can release
     /// what it introduced. The backend had no block scoping before this.
     owned: Vec<Vec<String>>,
+    /// What `named` and `var_struct_type` held when each open block started.
+    /// Without this a `let` inside a block took over the outer variable of the
+    /// same name for good, so `x` was still 2 after the block that shadowed it.
+    shadowed: Vec<(HashMap<String, (PointerValue<'ctx>, Type)>, HashMap<String, String>)>,
     enum_variants: HashMap<String, Vec<(String, Vec<Type>)>>,
     variants: VariantIndex,
     loop_exit: Vec<BasicBlock<'ctx>>,
@@ -132,6 +136,7 @@ impl<'ctx> Codegen<'ctx> {
             current_span: Span::new(1, 1),
             transient: false,
             owned: Vec::new(),
+            shadowed: Vec::new(),
             enum_variants: HashMap::new(),
             variants: VariantIndex::build(program),
             loop_exit: Vec::new(),
@@ -298,8 +303,12 @@ impl<'ctx> Codegen<'ctx> {
         }
     }
 
+    /// Everything a block introduces — what it owns, and the names it binds —
+    /// belongs to the block and goes when it ends.
     fn open_block(&mut self) {
         self.owned.push(Vec::new());
+        self.shadowed.push((self.named.clone(), self.var_struct_type.clone()));
+        self.types.push_scope();
     }
 
     /// The pointer a managed local currently holds.
@@ -341,10 +350,29 @@ impl<'ctx> Codegen<'ctx> {
         }
     }
 
-    /// Release everything the block introduced, innermost first.
+    /// Release everything the block introduced, innermost first, then put the
+    /// names back the way they were.
     fn close_block(&mut self) {
-        let Some(names) = self.owned.pop() else { return };
-        self.release_names(&names);
+        if let Some(names) = self.owned.pop() {
+            self.release_names(&names);
+        }
+        self.restore_names();
+    }
+
+    /// End a block whose code path already left — a `return` or a `break`
+    /// releases every open block on its way out, so there is nothing left to
+    /// release here, only names to put back.
+    fn abandon_block(&mut self) {
+        self.owned.pop();
+        self.restore_names();
+    }
+
+    fn restore_names(&mut self) {
+        if let Some((named, structs)) = self.shadowed.pop() {
+            self.named = named;
+            self.var_struct_type = structs;
+        }
+        self.types.pop_scope();
     }
 
     /// Leaving early: everything every open block introduced goes, but the
@@ -1897,6 +1925,10 @@ ExprKind::Match { scrutinee, arms } => {
                 for (i, (patterns, guard, body)) in arms.iter().enumerate() {
                     self.builder.position_at_end(current_check);
                     let arm_bb = self.context.append_basic_block(parent, &format!("arm_{}", i));
+                    // What a pattern binds belongs to the arm. Without this,
+                    // `Some(v)` left `v` bound to the payload for the rest of
+                    // the function, over whatever `v` was there before.
+                    self.open_block();
                     let is_wildcard = patterns.iter().any(|p| matches!(p, Pattern::Wildcard | Pattern::Variable(_)));
                     // Only a wildcard or a plain binding always matches, and
                     // only when no guard can reject it. Being the last arm does
@@ -2051,6 +2083,7 @@ ExprKind::Match { scrutinee, arms } => {
                     // body ended, not from the block the arm started in.
                     let from = self.builder.get_insert_block().unwrap();
                     arm_values.push((bv_int, from));
+                    self.close_block();
                     self.builder.build_unconditional_branch(merge).unwrap();
                     if let Some(nc) = next_check {
                         current_check = nc;
@@ -2900,20 +2933,30 @@ ExprKind::Match { scrutinee, arms } => {
                     let else_bb = self.context.append_basic_block(fn_val, "else");
                     self.builder.build_conditional_branch(cond_bool, then_bb, else_bb).unwrap();
 
+                    // Each branch is a block of its own: what it declares is
+                    // its own, and what it owns it releases on the way out.
+                    // Neither happened here, so a `let` inside an `if` took
+                    // over the outer variable and never let go of a string.
                     self.builder.position_at_end(then_bb);
                     let mut then_terminated = false;
+                    self.open_block();
                     for s in then_body {
                         self.gen_stmt(s, fn_val, &mut then_terminated);
+                        if then_terminated { break; }
                     }
+                    if !then_terminated { self.close_block(); } else { self.abandon_block(); }
                     if !then_terminated {
                         self.builder.build_unconditional_branch(merge_bb).unwrap();
                     }
 
                     self.builder.position_at_end(else_bb);
                     let mut else_terminated = false;
+                    self.open_block();
                     for s in eb {
                         self.gen_stmt(s, fn_val, &mut else_terminated);
+                        if else_terminated { break; }
                     }
+                    if !else_terminated { self.close_block(); } else { self.abandon_block(); }
                     if !else_terminated {
                         self.builder.build_unconditional_branch(merge_bb).unwrap();
                     }
@@ -2921,9 +2964,12 @@ ExprKind::Match { scrutinee, arms } => {
                     self.builder.build_conditional_branch(cond_bool, then_bb, merge_bb).unwrap();
                     self.builder.position_at_end(then_bb);
                     let mut then_terminated = false;
+                    self.open_block();
                     for s in then_body {
                         self.gen_stmt(s, fn_val, &mut then_terminated);
+                        if then_terminated { break; }
                     }
+                    if !then_terminated { self.close_block(); } else { self.abandon_block(); }
                     if !then_terminated {
                         self.builder.build_unconditional_branch(merge_bb).unwrap();
                     }
@@ -2952,7 +2998,7 @@ ExprKind::Match { scrutinee, arms } => {
                     self.gen_stmt(s, fn_val, &mut body_terminated);
                     if body_terminated { break; }
                 }
-                if !body_terminated { self.close_block(); } else { self.owned.pop(); }
+                if !body_terminated { self.close_block(); } else { self.abandon_block(); }
                 if !body_terminated {
                     self.builder.build_unconditional_branch(loop_bb).unwrap();
                 }
@@ -3013,7 +3059,7 @@ ExprKind::Match { scrutinee, arms } => {
                         self.gen_stmt(s, fn_val, &mut body_terminated);
                         if body_terminated { break; }
                     }
-                    if !body_terminated { self.close_block(); } else { self.owned.pop(); }
+                    if !body_terminated { self.close_block(); } else { self.abandon_block(); }
                     if !body_terminated {
                         self.builder.build_unconditional_branch(cont_bb).unwrap();
                     }
@@ -3374,7 +3420,7 @@ pub fn compile_to_executable(program: &Program, out_path: &str, src_path: &str, 
                     cg.gen_stmt(s, func, &mut terminated);
                 }
                 // falling off the end: let go of the locals before returning
-                if !terminated { cg.close_block(); } else { cg.owned.pop(); }
+                if !terminated { cg.close_block(); } else { cg.abandon_block(); }
                 if !terminated {
                     if matches!(ret, Type::Unit) {
                         cg.builder.build_return(None).unwrap();
@@ -3416,7 +3462,7 @@ pub fn compile_to_executable(program: &Program, out_path: &str, src_path: &str, 
                             cg.gen_stmt(s, func, &mut terminated);
                         }
                         // falling off the end: let go of the locals before returning
-                        if !terminated { cg.close_block(); } else { cg.owned.pop(); }
+                        if !terminated { cg.close_block(); } else { cg.abandon_block(); }
                         if !terminated {
                             if matches!(ret, Type::Unit) {
                                 cg.builder.build_return(None).unwrap();

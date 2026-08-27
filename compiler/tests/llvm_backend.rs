@@ -1485,3 +1485,101 @@ fn main() {
 "#,
     );
 }
+
+// ---------------------------------------------------------------------------
+// Block scope
+//
+// The native backend kept one flat table of locals, so a `let` inside a block
+// took over the outer variable of the same name for good: `x` was still 2
+// after the `if` that shadowed it. `if` bodies had no block at all, so a
+// string declared in one was never released either, and a `match` arm left
+// what its pattern bound in scope for the rest of the function.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_let_inside_a_block_is_the_blocks_own() {
+    assert_agrees_with_interpreter(
+        r#"
+fn main() {
+    let x = 1;
+    if true {
+        let x = 2;
+        if true {
+            let x = 3;
+            print(x);
+        }
+        print(x);
+    }
+    print(x);
+    let s = "outer";
+    while true {
+        let s = "inner";
+        print(s);
+        break;
+    }
+    print(s);
+    for i in 0..2 {
+        let s = "loop";
+        print(s);
+    }
+    print(s);
+}
+"#,
+    );
+}
+
+#[test]
+fn an_else_branch_is_a_block_too() {
+    assert_agrees_with_interpreter(
+        r#"
+fn main() {
+    let tag = "outer";
+    if 1 > 2 {
+        let tag = "then";
+        print(tag);
+    } else {
+        let tag = "else";
+        print(tag);
+    }
+    print(tag);
+}
+"#,
+    );
+}
+
+#[test]
+fn a_match_arm_binding_stays_in_its_arm() {
+    assert_agrees_with_interpreter(
+        r#"
+fn main() {
+    let v = "outer";
+    print(match Some(1) { Some(v) => "bound", None => "no" });
+    print(v);
+    let n = 7;
+    print(match Some(2) { Some(n) => n, None => 0 });
+    print(n);
+}
+"#,
+    );
+}
+
+#[test]
+fn a_string_declared_inside_an_if_is_released() {
+    // No block meant no release: this grew the heap by one string per turn.
+    assert_agrees_with_interpreter(
+        r#"
+fn main() {
+    let n = 0;
+    while n < 500 {
+        if n % 2 == 0 {
+            let s = "x" + to_string(n);
+            n = n + len(s);
+        } else {
+            n = n + 1;
+        }
+    }
+    print(n);
+}
+"#,
+    );
+}
