@@ -1452,3 +1452,36 @@ fn main() {
 "#,
     );
 }
+
+#[test]
+fn break_means_the_same_thing_on_both_backends() {
+    assert_agrees_with_interpreter(
+        r#"
+fn main() {
+    let i = 0;
+    while i < 5 { print(i); i = i + 1; break; }
+    print("after while");
+    for j in 0..5 {
+        if j == 2 { break; }
+        print(j);
+    }
+    print("after for");
+    for a in 0..2 {
+        for b in 0..3 {
+            if b == 1 { break; }
+            print(a * 10 + b);
+        }
+    }
+    print("after nested");
+    for s in ["a", "b", "c"] {
+        if s == "b" { break; }
+        print(s);
+    }
+    let n = 0;
+    let w = while n < 100 { n = n + 1; break n * 2; };
+    print(w);
+    print(n);
+}
+"#,
+    );
+}

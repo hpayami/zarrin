@@ -184,7 +184,9 @@ impl Interpreter {
                         self.eval_stmt(s);
                         if self.returned.is_some() { self.pop_scope(); return; }
                         if self.should_continue { self.should_continue = false; break; }
-                        if self.should_break { self.should_break = false; self.break_value = None; break; }
+                        // Leave the flag set: only the loop itself can act on a
+                        // `break`, and clearing it here made one mean `continue`.
+                        if self.should_break { break; }
                     }
                     self.pop_scope();
                     if self.should_break { self.should_break = false; self.break_value = None; break; }
@@ -202,7 +204,9 @@ impl Interpreter {
                                 self.eval_stmt(s);
                                 if self.returned.is_some() { self.pop_scope(); return; }
                                 if self.should_continue { self.should_continue = false; break; }
-                                if self.should_break { self.should_break = false; self.break_value = None; break; }
+                                // Leave the flag set: only the loop itself can act on a
+                                // `break`, and clearing it here made one mean `continue`.
+                                if self.should_break { break; }
                             }
                             self.pop_scope();
                             if self.should_break { self.should_break = false; self.break_value = None; break; }
@@ -218,7 +222,9 @@ impl Interpreter {
                                 self.eval_stmt(s);
                                 if self.returned.is_some() { self.pop_scope(); return; }
                                 if self.should_continue { self.should_continue = false; break; }
-                                if self.should_break { self.should_break = false; self.break_value = None; break; }
+                                // Leave the flag set: only the loop itself can act on a
+                                // `break`, and clearing it here made one mean `continue`.
+                                if self.should_break { break; }
                             }
                             self.pop_scope();
                             if self.should_break { self.should_break = false; self.break_value = None; break; }
@@ -236,7 +242,9 @@ impl Interpreter {
                                 self.eval_stmt(s);
                                 if self.returned.is_some() { self.pop_scope(); return; }
                                 if self.should_continue { self.should_continue = false; break; }
-                                if self.should_break { self.should_break = false; self.break_value = None; break; }
+                                // Leave the flag set: only the loop itself can act on a
+                                // `break`, and clearing it here made one mean `continue`.
+                                if self.should_break { break; }
                             }
                             self.pop_scope();
                             if self.should_break { self.should_break = false; self.break_value = None; break; }
@@ -470,13 +478,9 @@ impl Interpreter {
                     self.push_scope();
                     for s in body {
                         self.eval_stmt(s);
-                        if self.should_break {
-                            if let Some(bv) = self.break_value.take() {
-                                result = bv;
-                            }
-                            self.should_break = false;
-                            break;
-                        }
+                        // The value and the flag are both the enclosing loop's
+                        // to take; clearing the flag here left it running.
+                        if self.should_break { break; }
                         if self.should_continue { self.should_continue = false; break; }
                         if self.returned.is_some() { self.pop_scope(); return self.returned.take().unwrap(); }
                     }

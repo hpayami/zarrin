@@ -569,3 +569,98 @@ fn strings_can_be_ordered() {
         &["true", "false", "true"],
     );
 }
+
+// ---------------------------------------------------------------------------
+// break
+//
+// The interpreter cleared `should_break` in the loop that walks a body's
+// statements and then asked, outside it, whether a break had happened — by
+// which point the flag was false. So `break` skipped the rest of the body and
+// carried on: it meant `continue`. Where the loop variable was updated after
+// the `break`, the program ran forever.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn break_ends_a_while_loop() {
+    assert_output(
+        "fn main() {\n\
+         \x20   let i = 0;\n\
+         \x20   while i < 5 {\n\
+         \x20       print(i);\n\
+         \x20       i = i + 1;\n\
+         \x20       break;\n\
+         \x20   }\n\
+         \x20   print(\"after\");\n}\n",
+        &["0", "after"],
+    );
+}
+
+#[test]
+fn break_ends_a_for_loop() {
+    assert_output(
+        "fn main() {\n\
+         \x20   for j in 0..5 {\n\
+         \x20       if j == 2 { break; }\n\
+         \x20       print(j);\n\
+         \x20   }\n\
+         \x20   print(\"after\");\n}\n",
+        &["0", "1", "after"],
+    );
+}
+
+#[test]
+fn break_ends_only_the_loop_it_is_in() {
+    assert_output(
+        "fn main() {\n\
+         \x20   for a in 0..2 {\n\
+         \x20       for b in 0..3 {\n\
+         \x20           if b == 1 { break; }\n\
+         \x20           print(a * 10 + b);\n\
+         \x20       }\n\
+         \x20   }\n\
+         \x20   print(\"after\");\n}\n",
+        &["0", "10", "after"],
+    );
+}
+
+#[test]
+fn break_ends_a_loop_over_an_array() {
+    assert_output(
+        "fn main() {\n\
+         \x20   for s in [\"a\", \"b\", \"c\"] {\n\
+         \x20       if s == \"b\" { break; }\n\
+         \x20       print(s);\n\
+         \x20   }\n\
+         \x20   print(\"after\");\n}\n",
+        &["a", "after"],
+    );
+}
+
+#[test]
+fn a_while_expression_takes_the_first_break_value() {
+    // Bounded so it terminates either way: with `break` behaving as `continue`
+    // the loop ran to its condition and the last turn's value won.
+    assert_output(
+        "fn main() {\n\
+         \x20   let n = 0;\n\
+         \x20   let w = while n < 100 {\n\
+         \x20       n = n + 1;\n\
+         \x20       break n * 2;\n\
+         \x20   };\n\
+         \x20   print(w);\n\
+         \x20   print(n);\n}\n",
+        &["2", "1"],
+    );
+}
+
+#[test]
+fn continue_still_skips_the_rest_of_the_body() {
+    assert_output(
+        "fn main() {\n\
+         \x20   for i in 0..5 {\n\
+         \x20       if i % 2 == 0 { continue; }\n\
+         \x20       print(i);\n\
+         \x20   }\n}\n",
+        &["1", "3"],
+    );
+}
