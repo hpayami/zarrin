@@ -37,7 +37,12 @@ literal brace — an unescaped `{` starts an interpolation. There is no `\0`: th
 native backend uses NUL-terminated strings, so an embedded NUL would behave
 differently there.
 
-Not yet: generics, which are parsed and then ignored.
+Generic functions — `fn id<T>(x: T) -> T` — work on both backends. The checker
+works out what each type parameter stands for at every call, and a pass before
+code generation gives each set of type arguments its own copy of the function,
+so neither backend ever meets a `T`. A function that recurses at a *growing*
+type has no finite set of copies and is rejected with a diagnostic rather than
+expanded until memory runs out. Generic structs parse but are not supported.
 
 Memory in the native backend is reference counted. A value that cannot outlive
 the expression building it goes on the frame instead and is released when the

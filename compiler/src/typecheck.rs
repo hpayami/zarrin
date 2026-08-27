@@ -2,7 +2,7 @@
 
 use crate::ast::*;
 use crate::builtins;
-use crate::diagnostic::Diagnostic;
+use crate::diagnostic::{Diagnostic, Span};
 use crate::variants::{Lookup, VariantIndex};
 use std::collections::HashMap;
 
@@ -19,6 +19,7 @@ pub enum TypeError {
     MissingImpl { trait_name: String, type_name: String, method: String },
     AmbiguousVariant { name: String, candidates: Vec<String> },
     NonExhaustiveMatch { ty: String, missing: Vec<String> },
+    UnresolvedTypeParam { func: String, param: String },
     /// Raised inside a nested statement, which already knows where it is.
     Located(Box<Diagnostic>),
 }
@@ -42,6 +43,11 @@ impl std::fmt::Display for TypeError {
             TypeError::UnknownField { ty, field } => write!(f, "type `{}` has no field `{}`", ty, field),
             TypeError::MissingImpl { trait_name, type_name, method } => write!(f, "trait `{}` for `{}` missing method `{}`", trait_name, type_name, method),
             TypeError::Located(d) => write!(f, "{}", d.message),
+            TypeError::UnresolvedTypeParam { func, param } => write!(
+                f,
+                "cannot tell what `{}` is in this call to `{}`; it appears only in the return type",
+                param, func
+            ),
             TypeError::NonExhaustiveMatch { ty, missing } if missing.is_empty() => write!(
                 f,
                 "match on `{}` is not exhaustive; add a `_` arm",
@@ -69,6 +75,16 @@ impl std::fmt::Display for TypeError {
 pub struct TypeEnv {
     scopes: Vec<HashMap<String, Type>>,
     functions: HashMap<String, (Vec<Type>, Type)>,
+    /// Type parameters each function declares, so a call can work out what
+    /// they stand for instead of reading `T` as the name of a real type.
+    pub fn_generics: HashMap<String, Vec<String>>,
+    /// Every call to a generic function: which function it appears in, where
+    /// it is written, what is called, and what its type parameters turned out
+    /// to be. A span alone is not enough to name a call site, because
+    /// specialising a function copies its body spans and all; the enclosing
+    /// name is what keeps `id(x)` inside `twice$int` apart from the same line
+    /// inside `twice$string`.
+    pub instantiations: Vec<(String, Span, String, Vec<Type>)>,
     structs: HashMap<String, Vec<(String, Type)>>,
     variants: VariantIndex,
     traits: HashMap<String, Vec<TraitMethod>>,
@@ -76,6 +92,8 @@ pub struct TypeEnv {
     extern_fns: HashMap<String, (Vec<Type>, Type)>,
     macros: HashMap<String, usize>,
     current_return: Option<Type>,
+    /// The function whose body is being checked, for attributing calls.
+    current_fn: String,
 }
 
 impl TypeEnv {
@@ -83,6 +101,8 @@ impl TypeEnv {
         TypeEnv {
             scopes: vec![HashMap::new()],
             functions: HashMap::new(),
+            fn_generics: HashMap::new(),
+            instantiations: Vec::new(),
             structs: HashMap::new(),
             variants: VariantIndex::build(program),
             traits: HashMap::new(),
@@ -90,6 +110,7 @@ impl TypeEnv {
             extern_fns: HashMap::new(),
             macros: HashMap::new(),
             current_return: None,
+            current_fn: String::new(),
         }
     }
 
@@ -131,6 +152,39 @@ fn compatible(a: &Type, b: &Type) -> bool {
     a == b || *a == Type::Inferred || *b == Type::Inferred
 }
 
+/// Work out what a function's type parameters stand for at one call, by
+/// lining its declared parameter types up against the arguments given.
+fn unify(declared: &Type, actual: &Type, params: &[String], subst: &mut HashMap<String, Type>) -> bool {
+    match declared {
+        Type::Named(n) if params.contains(n) => match subst.get(n) {
+            // Every mention of a parameter has to agree.
+            Some(bound) => compatible(bound, actual),
+            None => {
+                subst.insert(n.clone(), actual.clone());
+                true
+            }
+        },
+        Type::Array(d) => match actual {
+            Type::Array(a) => unify(d, a, params, subst),
+            _ => compatible(declared, actual),
+        },
+        _ => compatible(declared, actual),
+    }
+}
+
+/// Replace type parameters with what they were found to stand for.
+pub fn substitute(ty: &Type, subst: &HashMap<String, Type>) -> Type {
+    match ty {
+        Type::Named(n) => subst.get(n).cloned().unwrap_or_else(|| ty.clone()),
+        Type::Array(el) => Type::Array(Box::new(substitute(el, subst))),
+        Type::Fn(args, ret) => Type::Fn(
+            args.iter().map(|a| substitute(a, subst)).collect(),
+            Box::new(substitute(ret, subst)),
+        ),
+        other => other.clone(),
+    }
+}
+
 pub struct TypeChecker;
 
 impl TypeChecker {
@@ -141,9 +195,12 @@ impl TypeChecker {
         let mut env = TypeEnv::new(program);
         for s in &program.stmts {
             match &s.kind {
-                StmtKind::Fn { name, params, ret, .. } => {
+                StmtKind::Fn { name, generics, params, ret, .. } => {
                     let param_tys: Vec<Type> = params.iter().map(|(_, t)| t.clone()).collect();
                     env.functions.insert(name.clone(), (param_tys, ret.clone()));
+                    if !generics.is_empty() {
+                        env.fn_generics.insert(name.clone(), generics.clone());
+                    }
                 }
                 StmtKind::Struct { name, fields, .. } => {
                     env.structs.insert(name.clone(), fields.clone());
@@ -173,6 +230,12 @@ impl TypeChecker {
     }
 
     pub fn check(program: &Program) -> Result<(), Diagnostic> {
+        Self::check_collecting(program).map(|_| ())
+    }
+
+    /// Type-check, and hand back the environment so a caller can read the
+    /// generic instantiations it discovered.
+    pub fn check_collecting(program: &Program) -> Result<TypeEnv, Diagnostic> {
         let mut env = Self::env_for(program);
 
         for s in &program.stmts {
@@ -206,7 +269,7 @@ impl TypeChecker {
         for s in &program.stmts {
             Self::check_stmt(s, &mut env)?;
         }
-        Ok(())
+        Ok(env)
     }
 
     /// Statements are the granularity the AST records positions at, so this is
@@ -229,13 +292,15 @@ impl TypeChecker {
                 }
                 env.define(name, val_ty);
             }
-            StmtKind::Fn { params, ret, body, .. } => {
+            StmtKind::Fn { name, params, ret, body, .. } => {
                 env.push_scope();
                 let prev = env.current_return.clone();
+                let prev_fn = std::mem::replace(&mut env.current_fn, name.clone());
                 env.current_return = Some(ret.clone());
                 for (pname, pty) in params { env.define(pname, pty.clone()); }
                 for s in body { Self::check_stmt(s, env)?; }
                 env.current_return = prev;
+                env.current_fn = prev_fn;
                 env.pop_scope();
             }
             StmtKind::Struct { .. } | StmtKind::Enum { .. } | StmtKind::Trait { .. } | StmtKind::Macro { .. } | StmtKind::ExternFn { .. } | StmtKind::Impl { .. } | StmtKind::Import(_) => {}
@@ -390,11 +455,36 @@ impl TypeChecker {
                 }
                 if let Some((param_tys, ret_ty)) = env.functions.get(func_name).cloned().or_else(|| env.extern_fns.get(func_name).cloned()) {
                     if param_tys.len() != args.len() { return Err(TypeError::WrongArity { name: func_name.clone(), expected: param_tys.len(), found: args.len() }); }
+                    let generics = env.fn_generics.get(func_name).cloned().unwrap_or_default();
+                    // What each type parameter stands for at this call, read off
+                    // the arguments. Every mention of one has to agree.
+                    let mut subst: HashMap<String, Type> = HashMap::new();
                     for (arg, expected) in args.iter().zip(param_tys.iter()) {
                         let arg_ty = Self::check_expr(arg, env)?;
-                        if !compatible(&arg_ty, expected) { return Err(Self::mismatch_at(expected, &arg_ty, arg)); }
+                        if !generics.is_empty() {
+                            if !unify(expected, &arg_ty, &generics, &mut subst) {
+                                return Err(Self::mismatch_at(&substitute(expected, &subst), &arg_ty, arg));
+                            }
+                        } else if !compatible(&arg_ty, expected) {
+                            return Err(Self::mismatch_at(expected, &arg_ty, arg));
+                        }
                     }
-                    return Ok(ret_ty);
+                    if let Some(missing) = generics.iter().find(|g| !subst.contains_key(*g)) {
+                        return Err(TypeError::UnresolvedTypeParam {
+                            func: func_name.clone(),
+                            param: missing.clone(),
+                        });
+                    }
+                    if !generics.is_empty() {
+                        let args: Vec<Type> = generics.iter().map(|g| subst[g].clone()).collect();
+                        env.instantiations.push((
+                            env.current_fn.clone(),
+                            expr.span,
+                            func_name.clone(),
+                            args,
+                        ));
+                    }
+                    return Ok(substitute(&ret_ty, &subst));
                 }
                 Err(TypeError::UndefinedFunction(func_name.clone()))
             }

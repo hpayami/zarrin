@@ -1,0 +1,52 @@
+// Zarrin: generic functions
+//
+// One `fn` serves every type its parameters are used at. The compiler works
+// out what `T` stands for at each call and compiles a separate copy, so
+// nothing is decided at run time.
+
+fn id<T>(x: T) -> T {
+    return x;
+}
+
+fn fst<A, B>(a: A, b: B) -> A {
+    return a;
+}
+
+// A generic function may call another one; the inner call is specialised for
+// each copy of the outer.
+fn twice<T>(x: T) -> T {
+    let once: T = id(x);
+    return id(once);
+}
+
+// Recursion is fine as long as the type does not change on the way down.
+fn repeat<T>(x: T, n: int) -> T {
+    if n == 0 {
+        return x;
+    }
+    return repeat(x, n - 1);
+}
+
+struct Point {
+    x: int,
+    y: int
+}
+
+fn main() {
+    print(id(42));
+    print(id("a string"));
+    print(id(3.5));
+    print(id(true));
+
+    print(fst(1, "ignored"));
+    print(fst("kept", 2));
+
+    print(twice("through twice"));
+    print(twice(7));
+
+    print(repeat("unchanged", 5));
+
+    let p = Point { x: 3, y: 4 };
+    print(id(p).y);
+    print(id(Some(9)));
+}

@@ -10,6 +10,7 @@ mod builtins;
 mod diagnostic;
 mod codegen;
 mod lexer;
+mod monomorphize;
 mod parser;
 mod typecheck;
 mod variants;
@@ -91,6 +92,19 @@ fn check_or_exit(program: &ast::Program, path: &str, src: &str) {
     }
 }
 
+/// Give every backend the same generic-free program. Specialising here rather
+/// than inside a backend keeps the interpreter and the native compiler running
+/// literally the same code, which is what the cross-backend tests check.
+fn expand_or_exit(program: &ast::Program, path: &str, src: &str) -> ast::Program {
+    match monomorphize::expand(program) {
+        Ok(expanded) => expanded,
+        Err(d) => {
+            eprint!("{}", d.render(path, src));
+            exit(1);
+        }
+    }
+}
+
 fn main() {
     install_error_reporter();
     let args: Vec<String> = std::env::args().collect();
@@ -127,6 +141,7 @@ fn main() {
     match cmd {
         "run" => {
             check_or_exit(&program, file, &src);
+            let program = expand_or_exit(&program, file, &src);
             let mut interp = codegen::Interpreter::new(&program, file, &src);
             interp.run(&program);
         }
@@ -145,6 +160,7 @@ fn main() {
         #[cfg(feature = "llvm")]
         "build" => {
             check_or_exit(&program, file, &src);
+            let program = expand_or_exit(&program, file, &src);
             let out = if args.get(3).map(|s| s.as_str()) == Some("-o") {
                 args.get(4).cloned().unwrap_or_else(|| "a.out".into())
             } else {

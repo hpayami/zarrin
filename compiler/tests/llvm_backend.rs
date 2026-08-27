@@ -1052,3 +1052,65 @@ fn every_example_agrees_across_backends() {
         failures.join("\n")
     );
 }
+
+// ---------------------------------------------------------------------------
+// Generics
+//
+// The native backend erases values to i64 and asks the checker what each one
+// is. A generic function has no answer to give — its parameter is `T` — so
+// `id("hi")` printed a pointer as a number and `id(2.5)` printed the bits of
+// the double. Specialising before codegen means the backend only ever sees
+// concrete types.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_generic_function_prints_the_same_from_either_backend() {
+    assert_agrees_with_interpreter(
+        r#"
+fn id<T>(x: T) -> T { return x; }
+fn main() {
+    print(id(5));
+    print(id("hi"));
+    print(id(2.5));
+    print(id(true));
+}
+"#,
+    );
+}
+
+#[test]
+fn specialised_copies_do_not_share_a_call_site() {
+    assert_agrees_with_interpreter(
+        r#"
+fn id<T>(x: T) -> T { return x; }
+fn twice<T>(x: T) -> T { let a: T = id(x); return id(a); }
+fn main() {
+    print(twice("deep"));
+    print(twice(4));
+    print(twice(1.5));
+}
+"#,
+    );
+}
+
+#[test]
+fn generic_values_are_released_like_any_other() {
+    // A specialised copy takes ownership of a heap value the same way a
+    // hand-written one does; if it did not, this loop would grow without bound
+    // or free something twice. Guard Malloc in `build_and_run` catches the
+    // second, and agreement with the interpreter catches the first.
+    assert_agrees_with_interpreter(
+        r#"
+fn id<T>(x: T) -> T { return x; }
+fn main() {
+    let i = 0;
+    let last = "";
+    while i < 200 {
+        last = id(id("value") + to_string(i));
+        i = i + 1;
+    }
+    print(last);
+}
+"#,
+    );
+}

@@ -22,6 +22,7 @@ build native executables.
 - `compiler/src/typecheck.rs` — type checker
 - `compiler/src/builtins.rs` — signatures of the built-in functions
 - `compiler/src/variants.rs` — enum-variant name resolution
+- `compiler/src/monomorphize.rs` — replaces generic functions with concrete copies
 - `compiler/src/codegen.rs` — default backend (tree-walk interpreter)
 - `compiler/src/codegen_llvm.rs` — LLVM backend (`llvm` feature)
 - `compiler/tests/` — integration tests
@@ -70,6 +71,15 @@ type to emit the right code. It asks the type checker: `TypeChecker::type_of`,
 against a `TypeEnv` the backend keeps in step with the locals in scope. Do not
 add a rule that infers a type from the shape of an expression — that is what
 the checker is for, and the two drifted apart every time it was tried.
+
+Generics are gone by the time either backend runs: `monomorphize::expand`
+rewrites the program into one with no generic call left in it, so a backend
+never has to reason about a type parameter. Two things about that pass are easy
+to get wrong. Specialising copies a body, spans and all, so a call site is
+identified by the function it sits in *and* its span — a span alone names the
+same `id(x)` in every copy of `twice`. And the generic originals stay in the
+program: trait `impl` bodies are not walked by the checker, so calls in them are
+never rewritten, and removing the originals would break programs that run today.
 
 `every_example_agrees_across_backends` in `llvm_backend.rs` runs every program
 in `examples/` through the interpreter and as a native executable and requires
