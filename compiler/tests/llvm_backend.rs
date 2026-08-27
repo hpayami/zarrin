@@ -1967,3 +1967,74 @@ fn main() {
 "#,
     );
 }
+
+// ---------------------------------------------------------------------------
+// A value built for an argument
+//
+// It belongs to nobody: the callee retains it if it keeps it, so the caller
+// still holds the reference it made. Nothing gave that up, so every
+// `to_string([1, 2])` in a loop left an array behind — 11 MB over 200k turns,
+// against a 1.5 MB baseline. Rendering leaked too: the text of a payload or a
+// field was built on the heap and only the finished string was returned.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn an_argument_built_for_a_call_is_released() {
+    for (src, released) in [
+        (
+            "struct P { a: int }\nfn main() { let i = 0; while i < 3 { let s = to_string(P { a: i }); i = i + 1; } }\n",
+            "zarrin.release.t.P",
+        ),
+        (
+            "fn main() { let i = 0; while i < 3 { let s = to_string([1, 2]); i = i + 1; } }\n",
+            "zarrin.release.arr.Int",
+        ),
+        (
+            "fn main() { let i = 0; while i < 3 { let n = len(\"a\" + to_string(i)); i = i + 1; } }\n",
+            "zarrin.release.str",
+        ),
+        (
+            "fn main() { let i = 0; while i < 3 { let n = array_len(split(\"a,b\", \",\")); i = i + 1; } }\n",
+            "zarrin.release.arr.str",
+        ),
+        (
+            "fn keep(s: string) -> string { return s; }\nfn main() { let i = 0; while i < 3 { let s = keep(\"v\" + to_string(i)); i = i + 1; } }\n",
+            "zarrin.release.str",
+        ),
+    ] {
+        let Some(ir) = emitted_ir(src) else { return };
+        assert!(
+            ir.contains(&format!("call void @{}", released)),
+            "the argument is never released ({} missing):\n{}",
+            released,
+            src
+        );
+    }
+}
+
+#[test]
+fn rendering_a_value_leaves_only_the_answer() {
+    // Everything the rendering needed along the way is built on the frame, so
+    // the loop holds flat; releasing what it should not would fault under
+    // Guard Malloc, which `build_and_run` runs everything through.
+    assert_agrees_with_interpreter(
+        r#"
+struct P { a: int, s: string }
+fn keep(s: string) -> string { return s; }
+fn main() {
+    let i = 0;
+    let last = "";
+    while i < 300 {
+        last = keep("v" + to_string(i));
+        last = to_string(Some(i));
+        last = to_string(P { a: i, s: "x" + to_string(i) });
+        last = to_string([1, 2]);
+        last = to_string(0..i);
+        last = last + to_string(len(char_at("abcd", 1)) + array_len(split("a,b", ",")));
+        i = i + 1;
+    }
+    print(last);
+}
+"#,
+    );
+}

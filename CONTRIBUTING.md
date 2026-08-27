@@ -66,6 +66,15 @@ Ownership follows one rule: an expression that builds something new hands over
 the reference it already has, and one that merely names something existing does
 not, so whoever records it takes its own. `produces_owned` answers which.
 
+An argument is nobody's: the callee retains it if it keeps it, so a value built
+for a call is still the caller's to give up once the call has returned.
+`gen_arg` and `release_arg` do that. A builtin that hands part of its argument
+back must not — `to_string` of a string returns the string it was given.
+
+Rendering goes through `gen_owned_str`, which builds every intermediate on the
+frame and copies out only the answer. A payload's text, a field's, a bound of a
+range: each was a heap allocation nobody released.
+
 The LLVM backend erases every value to i64, so it has to know an expression's
 type to emit the right code. It asks the type checker: `TypeChecker::type_of`,
 against a `TypeEnv` the backend keeps in step with the locals in scope. Do not

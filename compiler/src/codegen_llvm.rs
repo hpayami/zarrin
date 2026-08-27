@@ -1612,9 +1612,13 @@ impl<'ctx> Codegen<'ctx> {
                 if name == "len" {
                     let v = self.gen_expr(&args[0]);
                     if let CgValue::Str(ptr) = v {
-                        return CgValue::Int(self.gen_char_len(ptr));
+                        let n = self.gen_char_len(ptr);
+                        // The answer is a number; nothing of the argument is
+                        // kept, so one built for this call can go.
+                        self.release_arg(&args[0], &v);
+                        return CgValue::Int(n);
                     }
-                    return match v {
+                    let counted = match v {
                         CgValue::Str(ptr) => {
                             let strlen_type = self.i64.fn_type(&[self.context.ptr_type(AddressSpace::default()).into()], false);
                             let strlen_fn = self.module.get_function("strlen").unwrap_or_else(|| self.module.add_function("strlen", strlen_type, None));
@@ -1628,6 +1632,8 @@ impl<'ctx> Codegen<'ctx> {
                         }
                         _ => panic!("len supports strings and arrays"),
                     };
+                    self.release_arg(&args[0], &v);
+                    return counted;
                 }
                 if name == "int_to_str" {
                     let val = self.gen_expr(&args[0]);
@@ -1644,12 +1650,16 @@ impl<'ctx> Codegen<'ctx> {
                     if let Some((en, targs)) = self.infer_enum_type(&args[0]) {
                         let v = self.gen_expr(&args[0]);
                         let iv = self.value_to_int(&v);
-                        return CgValue::Str(self.gen_enum_to_str(iv, &en, &targs, 0));
+                        let text = self.gen_owned_str(iv, &Type::Named(en, targs));
+                        self.release_arg(&args[0], &v);
+                        return CgValue::Str(text);
                     }
                     if let Some(ty) = self.compound_type(&args[0]) {
                         let v = self.gen_expr(&args[0]);
                         let iv = self.value_to_int(&v);
-                        return CgValue::Str(self.gen_to_str(iv, &ty, 0));
+                        let text = self.gen_owned_str(iv, &ty);
+                        self.release_arg(&args[0], &v);
+                        return CgValue::Str(text);
                     }
                     let val = self.gen_expr(&args[0]);
                     match &val {
@@ -1690,6 +1700,7 @@ impl<'ctx> Codegen<'ctx> {
                     let arr_ptr_val = self.value_to_int(&arr_val);
                     let arr_ptr = self.builder.build_int_to_ptr(arr_ptr_val, self.i64.ptr_type(AddressSpace::default()), "arr_ptr").unwrap();
                     let len = self.builder.build_load(self.i64, arr_ptr, "arr_len").unwrap().into_int_value();
+                    self.release_arg(&args[0], &arr_val);
                     return CgValue::Int(len);
                 }
                 if name == "array_get" {
@@ -2010,14 +2021,17 @@ impl<'ctx> Codegen<'ctx> {
                 let func = self.functions.get(name).copied()
                     .unwrap_or_else(|| panic!("undefined function: {}", name));
                 let mut meta_args: Vec<BasicMetadataValueEnum> = Vec::new();
+                let mut spent = Vec::new();
                 for a in args {
                     // Every parameter is an i64, so pack the argument the same
                     // way the callee unpacks it. Passing a float or a string
                     // through unchanged was rejected outright.
-                    let a_val = self.gen_expr(a);
+                    let (a_val, held) = self.gen_arg(a);
+                    spent.push(held);
                     meta_args.push(self.value_to_int(&a_val).into());
                 }
                 let call = self.builder.build_call(func, &meta_args, name).unwrap();
+                self.release_spent(spent);
                 match call.try_as_basic_value() {
                     Either::Left(v) => {
                         let ret_type = self.fn_ret_types.get(name);
@@ -2159,11 +2173,13 @@ impl<'ctx> Codegen<'ctx> {
                     CgValue::Int(v) => meta_args.push((*v).into()),
                     _ => panic!("method call on non-struct"),
                 }
+                let mut spent = Vec::new();
                 for a in args {
                     // Every parameter is an i64, so pack the argument the same
                     // way the callee unpacks it. Passing a float or a string
                     // through unchanged was rejected outright.
-                    let a_val = self.gen_expr(a);
+                    let (a_val, held) = self.gen_arg(a);
+                    spent.push(held);
                     meta_args.push(self.value_to_int(&a_val).into());
                 }
                 // Which type's method this is comes from the receiver, not
@@ -2177,6 +2193,7 @@ impl<'ctx> Codegen<'ctx> {
                     .copied()
                     .unwrap_or_else(|| panic!("undefined method: {}", method));
                 let call = self.builder.build_call(func, &meta_args, method).unwrap();
+                self.release_spent(spent);
                 match call.try_as_basic_value() {
                     Either::Left(v) => {
                         let ret_type = key
@@ -3100,6 +3117,90 @@ ExprKind::Match { scrutinee, arms } => {
                 self.named.insert(var.to_string(), (slot, el.clone()));
                 self.types.define(var, el.clone());
             }
+        }
+    }
+
+    /// Build a call's argument, and say what the call has to let go of once it
+    /// returns. A value built on the spot for an argument belongs to nobody:
+    /// the callee retains it if it keeps it, so the caller still holds the
+    /// reference it made and has to give it up. Without this every
+    /// `to_string([1, 2])` in a loop left an array behind.
+    fn gen_arg(&mut self, e: &Expr) -> (CgValue<'ctx>, Option<(PointerValue<'ctx>, Type)>) {
+        let owned = self.produces_owned(e);
+        let ty = self.type_of(e);
+        let v = self.gen_expr(e);
+        let spent = match ty {
+            Some(t) if owned && self.is_managed(&t) => {
+                let p = match &v {
+                    CgValue::Str(p) => *p,
+                    other => {
+                        let raw = self.value_to_int(other);
+                        self.builder
+                            .build_int_to_ptr(raw, self.context.ptr_type(AddressSpace::default()), "arg_ptr")
+                            .unwrap()
+                    }
+                };
+                Some((p, t))
+            }
+            _ => None,
+        };
+        (v, spent)
+    }
+
+    /// Render a value into a string the caller can keep. Everything the
+    /// rendering needs along the way — a payload's text, a field's, a bound of
+    /// a range — is built on the frame and unwound, so only the answer is left
+    /// on the heap. Those intermediates used to be heap allocations nobody
+    /// released.
+    fn gen_owned_str(&mut self, raw: IntValue<'ctx>, ty: &Type) -> PointerValue<'ctx> {
+        // Already inside a consumed expression: the caller's own mark reclaims
+        // all of it, and there is nothing to keep.
+        if self.transient {
+            return self.gen_to_str(raw, ty, 0);
+        }
+        let mark = self.stack_mark();
+        self.transient = true;
+        let text = self.gen_to_str(raw, ty, 0);
+        let n = self.strlen_of(text);
+        let size = self.builder.build_int_add(n, self.i64.const_int(1, false), "text_size").unwrap();
+        self.transient = false;
+        // On the heap, so the frame going away below does not take it.
+        let out = self.heap_bytes(size, "text");
+        let ptr_ty = self.context.ptr_type(AddressSpace::default());
+        let memcpy = self.module.get_function("memcpy").unwrap_or_else(|| {
+            let t = self.context.void_type().fn_type(&[ptr_ty.into(), ptr_ty.into(), self.i64.into()], false);
+            self.module.add_function("memcpy", t, None)
+        });
+        self.builder.build_call(memcpy, &[out.into(), text.into(), size.into()], "").unwrap();
+        self.stack_release(mark);
+        out
+    }
+
+    /// Let go of an argument built on the spot, once whatever was going to
+    /// read it has. Only for a builtin that answers with something new: one
+    /// that hands part of its argument back must not release it.
+    fn release_arg(&mut self, e: &Expr, v: &CgValue<'ctx>) {
+        let owned = self.produces_owned(e);
+        let Some(t) = self.type_of(e) else { return };
+        if !owned || !self.is_managed(&t) {
+            return;
+        }
+        let p = match v {
+            CgValue::Str(p) => *p,
+            other => {
+                let raw = self.value_to_int(other);
+                self.builder
+                    .build_int_to_ptr(raw, self.context.ptr_type(AddressSpace::default()), "arg_ptr")
+                    .unwrap()
+            }
+        };
+        self.gen_release(p, &t);
+    }
+
+    /// Let go of everything the arguments were holding.
+    fn release_spent(&mut self, spent: Vec<Option<(PointerValue<'ctx>, Type)>>) {
+        for held in spent.into_iter().flatten() {
+            self.gen_release(held.0, &held.1);
         }
     }
 
