@@ -674,7 +674,7 @@ impl<'ctx> Codegen<'ctx> {
 
     /// Render an enum value the way the interpreter does: the variant name, and
     /// for a variant with a payload, its fields in parentheses.
-    fn gen_enum_to_str(&self, val: IntValue<'ctx>, enum_name: &str, depth: u32) -> PointerValue<'ctx> {
+    fn gen_enum_to_str(&mut self, val: IntValue<'ctx>, enum_name: &str, depth: u32) -> PointerValue<'ctx> {
         let ptr_ty = self.context.ptr_type(AddressSpace::default());
         let i32_ty = self.context.i32_type();
         let snprintf = self.module.get_function("snprintf").unwrap_or_else(|| {
@@ -713,19 +713,9 @@ impl<'ctx> Codegen<'ctx> {
                         self.builder.build_gep(self.i64, base.unwrap(), &[self.i64.const_int((j + 1) as u64, false)], "payload").unwrap()
                     };
                     let raw = self.builder.build_load(self.i64, fp, "payload_v").unwrap().into_int_value();
-                    parts.push(match ty {
-                        Type::Float => {
-                            // Several payload strings are live at once while the
-                            // variant text is assembled, so each needs its own.
-                            let fv = self.builder.build_bit_cast(raw, self.f64, "i2f").unwrap().into_float_value();
-                            self.gen_float_to_owned(fv)
-                        }
-                        Type::String => self.builder.build_int_to_ptr(raw, ptr_ty, "payload_s").unwrap(),
-                        Type::Named(n) if self.is_enum(n) && depth < 3 => {
-                            self.gen_enum_to_str(raw, n, depth + 1)
-                        }
-                        _ => self.gen_int_to_str(raw),
-                    });
+                    // Several payload strings are live at once while the
+                    // variant text is assembled, so each needs its own.
+                    parts.push(self.gen_to_str(raw, ty, depth + 1));
                 }
                 let holes = vec!["%s"; parts.len()].join(", ");
                 let fmt = self.builder.build_global_string_ptr(&format!("{}({})", vname, holes), "variant_fmt").unwrap().as_pointer_value();
@@ -753,6 +743,235 @@ impl<'ctx> Codegen<'ctx> {
 
         self.builder.position_at_end(done);
         self.builder.build_load(ptr_ty, slot, "enum_text").unwrap().into_pointer_value()
+    }
+
+    /// The text a value prints as — the same text the interpreter's
+    /// `value_to_string` produces, which is what makes the two backends
+    /// comparable. Values reach here as raw words, so the type is the only
+    /// thing that says how to read one.
+    ///
+    /// `depth` stops a type that contains itself from expanding forever, the
+    /// same cap enum payloads have always had.
+    fn gen_to_str(&mut self, raw: IntValue<'ctx>, ty: &Type, depth: u32) -> PointerValue<'ctx> {
+        let ptr_ty = self.context.ptr_type(AddressSpace::default());
+        if depth >= 4 {
+            return self.gen_int_to_str(raw);
+        }
+        match ty {
+            Type::Bool => self.gen_bool_to_str(raw),
+            Type::Float => {
+                let f = self.builder.build_bit_cast(raw, self.f64, "i2f").unwrap().into_float_value();
+                self.gen_float_to_owned(f)
+            }
+            Type::String => self.builder.build_int_to_ptr(raw, ptr_ty, "as_str").unwrap(),
+            Type::Array(el) => {
+                let el = (**el).clone();
+                self.gen_array_to_str(raw, &el, depth)
+            }
+            Type::Named(n) if self.is_enum(n) => {
+                let n = n.clone();
+                self.gen_enum_to_str(raw, &n, depth)
+            }
+            Type::Named(n) if self.struct_fields.contains_key(n) => {
+                let n = n.clone();
+                self.gen_struct_to_str(raw, &n, depth)
+            }
+            _ => self.gen_int_to_str(raw),
+        }
+    }
+
+    /// Copy `len` bytes of `src` into `dst` at `at`, and answer where the next
+    /// piece goes. Assembling text is all this shape.
+    fn append_bytes(
+        &self,
+        dst: PointerValue<'ctx>,
+        at: IntValue<'ctx>,
+        src: PointerValue<'ctx>,
+        len: IntValue<'ctx>,
+    ) -> IntValue<'ctx> {
+        let ptr_ty = self.context.ptr_type(AddressSpace::default());
+        let memcpy = self.module.get_function("memcpy").unwrap_or_else(|| {
+            let ty = self.context.void_type().fn_type(&[ptr_ty.into(), ptr_ty.into(), self.i64.into()], false);
+            self.module.add_function("memcpy", ty, None)
+        });
+        let at_ptr = unsafe { self.builder.build_gep(self.i8, dst, &[at], "at").unwrap() };
+        self.builder.build_call(memcpy, &[at_ptr.into(), src.into(), len.into()], "").unwrap();
+        self.builder.build_int_add(at, len, "next_at").unwrap()
+    }
+
+    fn strlen_of(&self, p: PointerValue<'ctx>) -> IntValue<'ctx> {
+        let ptr_ty = self.context.ptr_type(AddressSpace::default());
+        let strlen = self.module.get_function("strlen").unwrap_or_else(|| {
+            self.module.add_function("strlen", self.i64.fn_type(&[ptr_ty.into()], false), None)
+        });
+        self.builder.build_call(strlen, &[p.into()], "slen").unwrap()
+            .try_as_basic_value().left().unwrap().into_int_value()
+    }
+
+    fn append_literal(&self, dst: PointerValue<'ctx>, at: IntValue<'ctx>, text: &str) -> IntValue<'ctx> {
+        let src = self.string_global(text);
+        self.append_bytes(dst, at, src, self.i64.const_int(text.len() as u64, false))
+    }
+
+    /// `[a, b, c]`, however many elements there turn out to be.
+    ///
+    /// The length is only known at run time, so the text is measured in one
+    /// pass and written in a second. Each element's text is built on the stack
+    /// and the frame is unwound per element, because a loop that allocates
+    /// without unwinding grows without bound — the same trap several earlier
+    /// leaks fell into.
+    fn gen_array_to_str(&mut self, raw: IntValue<'ctx>, el: &Type, depth: u32) -> PointerValue<'ctx> {
+        let ptr_ty = self.context.ptr_type(AddressSpace::default());
+        let p = self.builder.build_int_to_ptr(raw, ptr_ty, "arr_p").unwrap();
+        let len = self.builder.build_load(self.i64, p, "arr_len").unwrap().into_int_value();
+
+        // "[" and "]" and the NUL, plus ", " between elements.
+        let seps = self.builder.build_int_sub(len, self.i64.const_int(1, false), "seps").unwrap();
+        let has_gaps = self.builder
+            .build_int_compare(inkwell::IntPredicate::SGT, len, self.i64.const_int(0, false), "has_gaps")
+            .unwrap();
+        let gaps = self.builder.build_select(has_gaps, seps, self.i64.const_zero(), "gaps").unwrap().into_int_value();
+        let base = self.builder.build_int_add(
+            self.i64.const_int(3, false),
+            self.builder.build_int_mul(gaps, self.i64.const_int(2, false), "gap_bytes").unwrap(),
+            "base_len",
+        ).unwrap();
+
+        let total = self.entry_alloca(self.i64.into(), "arr_total");
+        self.builder.build_store(total, base).unwrap();
+        self.each_element(p, len, "measure", |cg, elem| {
+            let text = cg.gen_to_str(elem, el, depth + 1);
+            let n = cg.strlen_of(text);
+            let sofar = cg.builder.build_load(cg.i64, total, "sofar").unwrap().into_int_value();
+            let grown = cg.builder.build_int_add(sofar, n, "grown").unwrap();
+            cg.builder.build_store(total, grown).unwrap();
+        });
+
+        let size = self.builder.build_load(self.i64, total, "arr_size").unwrap().into_int_value();
+        let buf = self.scratch_bytes(size, "arr_text");
+        let at = self.entry_alloca(self.i64.into(), "arr_at");
+        let opened = self.append_literal(buf, self.i64.const_zero(), "[");
+        self.builder.build_store(at, opened).unwrap();
+
+        let first = self.entry_alloca(self.i64.into(), "arr_first");
+        self.builder.build_store(first, self.i64.const_int(1, false)).unwrap();
+        self.each_element(p, len, "write", |cg, elem| {
+            let f = cg.builder.get_insert_block().unwrap().get_parent().unwrap();
+            let sep_bb = cg.context.append_basic_block(f, "arr_sep");
+            let no_sep = cg.context.append_basic_block(f, "arr_no_sep");
+            let is_first = cg.builder.build_load(cg.i64, first, "is_first").unwrap().into_int_value();
+            let cmp = cg.builder
+                .build_int_compare(inkwell::IntPredicate::NE, is_first, cg.i64.const_int(1, false), "not_first")
+                .unwrap();
+            cg.builder.build_conditional_branch(cmp, sep_bb, no_sep).unwrap();
+            cg.builder.position_at_end(sep_bb);
+            let here = cg.builder.build_load(cg.i64, at, "at_v").unwrap().into_int_value();
+            let after = cg.append_literal(buf, here, ", ");
+            cg.builder.build_store(at, after).unwrap();
+            cg.builder.build_unconditional_branch(no_sep).unwrap();
+            cg.builder.position_at_end(no_sep);
+            cg.builder.build_store(first, cg.i64.const_zero()).unwrap();
+
+            let text = cg.gen_to_str(elem, el, depth + 1);
+            let n = cg.strlen_of(text);
+            let here = cg.builder.build_load(cg.i64, at, "at_v").unwrap().into_int_value();
+            let after = cg.append_bytes(buf, here, text, n);
+            cg.builder.build_store(at, after).unwrap();
+        });
+
+        let here = self.builder.build_load(self.i64, at, "at_v").unwrap().into_int_value();
+        let after = self.append_literal(buf, here, "]");
+        let end = unsafe { self.builder.build_gep(self.i8, buf, &[after], "arr_end").unwrap() };
+        self.builder.build_store(end, self.i8.const_zero()).unwrap();
+        buf
+    }
+
+    /// Run `body` for every element of an array, with the stack unwound between
+    /// iterations so whatever the body allocates does not accumulate.
+    fn each_element(
+        &mut self,
+        p: PointerValue<'ctx>,
+        len: IntValue<'ctx>,
+        tag: &str,
+        body: impl FnOnce(&mut Self, IntValue<'ctx>) + Copy,
+    ) {
+        let f = self.builder.get_insert_block().unwrap().get_parent().unwrap();
+        let head = self.context.append_basic_block(f, &format!("arr_{}_head", tag));
+        let step = self.context.append_basic_block(f, &format!("arr_{}_step", tag));
+        let out = self.context.append_basic_block(f, &format!("arr_{}_done", tag));
+        let i = self.entry_alloca(self.i64.into(), &format!("arr_{}_i", tag));
+        self.builder.build_store(i, self.i64.const_int(1, false)).unwrap();
+        self.builder.build_unconditional_branch(head).unwrap();
+
+        self.builder.position_at_end(head);
+        let iv = self.builder.build_load(self.i64, i, "iv").unwrap().into_int_value();
+        let limit = self.builder.build_int_add(len, self.i64.const_int(1, false), "limit").unwrap();
+        let more = self.builder.build_int_compare(inkwell::IntPredicate::SLT, iv, limit, "more").unwrap();
+        self.builder.build_conditional_branch(more, step, out).unwrap();
+
+        self.builder.position_at_end(step);
+        let slot = unsafe { self.builder.build_gep(self.i64, p, &[iv], "slot").unwrap() };
+        let elem = self.builder.build_load(self.i64, slot, "elem").unwrap().into_int_value();
+        // Element text is scratch: built here, copied out, gone by the next
+        // iteration. Forcing that even when the caller is holding on to the
+        // result keeps the loop from allocating per element on the heap.
+        let outer = self.transient;
+        let mark = self.stack_mark();
+        self.transient = true;
+        body(self, elem);
+        self.transient = outer;
+        self.stack_release(mark);
+        let next = self.builder.build_int_add(iv, self.i64.const_int(1, false), "next_i").unwrap();
+        self.builder.build_store(i, next).unwrap();
+        self.builder.build_unconditional_branch(head).unwrap();
+
+        self.builder.position_at_end(out);
+    }
+
+    /// `Name { field: value, .. }`, with the fields in declaration order.
+    fn gen_struct_to_str(&mut self, raw: IntValue<'ctx>, name: &str, depth: u32) -> PointerValue<'ctx> {
+        let ptr_ty = self.context.ptr_type(AddressSpace::default());
+        let p = self.builder.build_int_to_ptr(raw, ptr_ty, "struct_p").unwrap();
+        let fields = self.struct_fields.get(name).cloned().unwrap_or_default();
+
+        // Every field's text is live at once, so unlike array elements these
+        // cannot share one scratch buffer.
+        let mut parts: Vec<(String, PointerValue<'ctx>)> = Vec::new();
+        for (i, (fname, fty)) in fields.iter().enumerate() {
+            let slot = unsafe {
+                self.builder.build_gep(self.i64, p, &[self.i64.const_int(i as u64, false)], "field").unwrap()
+            };
+            let word = self.builder.build_load(self.i64, slot, "field_v").unwrap().into_int_value();
+            let fty = fty.clone();
+            parts.push((fname.clone(), self.gen_to_str(word, &fty, depth + 1)));
+        }
+
+        let literal = |i: usize| -> String {
+            if i == 0 { format!("{} {{ ", name) } else { ", ".to_string() }
+        };
+        let mut size = self.i64.const_int((name.len() + 5) as u64, false); // "N { " + " }" + NUL
+        for (i, (fname, text)) in parts.iter().enumerate() {
+            let n = self.strlen_of(*text);
+            let fixed = self.i64.const_int((literal(i).len() + fname.len() + 2) as u64, false);
+            size = self.builder.build_int_add(size, n, "field_len").unwrap();
+            size = self.builder.build_int_add(size, fixed, "field_fixed").unwrap();
+        }
+        let buf = self.scratch_bytes(size, "struct_text");
+
+        let mut at = self.i64.const_zero();
+        if parts.is_empty() {
+            at = self.append_literal(buf, at, &format!("{} {{", name));
+        }
+        for (i, (fname, text)) in parts.iter().enumerate() {
+            at = self.append_literal(buf, at, &literal(i));
+            at = self.append_literal(buf, at, &format!("{}: ", fname));
+            let n = self.strlen_of(*text);
+            at = self.append_bytes(buf, at, *text, n);
+        }
+        at = self.append_literal(buf, at, " }");
+        let end = unsafe { self.builder.build_gep(self.i8, buf, &[at], "struct_end").unwrap() };
+        self.builder.build_store(end, self.i8.const_zero()).unwrap();
+        buf
     }
 
     /// Resolve a variant name to its enum. An ambiguous name is a hard error
@@ -1011,6 +1230,11 @@ impl<'ctx> Codegen<'ctx> {
                         let v = self.gen_expr(&args[0]);
                         let iv = self.value_to_int(&v);
                         return CgValue::Str(self.gen_enum_to_str(iv, &en, 0));
+                    }
+                    if let Some(ty) = self.compound_type(&args[0]) {
+                        let v = self.gen_expr(&args[0]);
+                        let iv = self.value_to_int(&v);
+                        return CgValue::Str(self.gen_to_str(iv, &ty, 0));
                     }
                     let val = self.gen_expr(&args[0]);
                     match &val {
@@ -1398,7 +1622,12 @@ impl<'ctx> Codegen<'ctx> {
                 let array_ty = self.i64.array_type(num_fields as u32);
                 let alloca = self.scratch_slots(num_fields, &format!("{}_struct", name));
                 let base_ptr = self.builder.build_bit_cast(alloca, self.context.ptr_type(AddressSpace::default()), "base_ptr").unwrap().into_pointer_value();
-                for (i, (fname, fexpr)) in fields.iter().enumerate() {
+                for (fname, fexpr) in fields.iter() {
+                    // By declaration index, not the order the literal happens
+                    // to list them in: field access reads by declaration index,
+                    // so `P { y: 2, x: 1 }` used to swap the two.
+                    let i = field_defs.iter().position(|n| n == fname)
+                        .unwrap_or_else(|| panic!("struct `{}` has no field `{}`", name, fname));
                     let fv = self.gen_expr(fexpr);
                     let fv_int = match fv {
                         CgValue::Int(v) => v,
@@ -2271,6 +2500,17 @@ ExprKind::Match { scrutinee, arms } => {
 
     /// Print one value. Booleans and enums need their text built first; the
     /// caller runs this inside `consumed`, so those buffers live on the frame.
+    /// Values `print` and `to_string` cannot render from their shape alone: an
+    /// array or a struct is a bare address, and printing it as one is what made
+    /// `print([1, 2, 3])` say `4336281184`.
+    fn compound_type(&mut self, e: &Expr) -> Option<Type> {
+        match self.type_of(e)? {
+            Type::Array(el) => Some(Type::Array(el)),
+            Type::Named(n) if self.struct_fields.contains_key(&n) => Some(Type::Named(n)),
+            _ => None,
+        }
+    }
+
     fn gen_print_arg(&mut self, arg: &Expr) -> CgValue<'ctx> {
         if self.is_bool_expr(arg) {
             let v = self.gen_expr(arg);
@@ -2282,6 +2522,12 @@ ExprKind::Match { scrutinee, arms } => {
             let v = self.gen_expr(arg);
             let iv = self.value_to_int(&v);
             let text = self.gen_enum_to_str(iv, &en, 0);
+            let fmt = self.string_global("%s\n");
+            self.builder.build_call(self.printf, &[fmt.into(), text.into()], "call_printf").unwrap();
+        } else if let Some(ty) = self.compound_type(arg) {
+            let v = self.gen_expr(arg);
+            let iv = self.value_to_int(&v);
+            let text = self.gen_to_str(iv, &ty, 0);
             let fmt = self.string_global("%s\n");
             self.builder.build_call(self.printf, &[fmt.into(), text.into()], "call_printf").unwrap();
         } else {

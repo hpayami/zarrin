@@ -14,7 +14,10 @@ enum Value {
     Unit,
     #[allow(dead_code)]
     Fn(String),
-    Struct { name: String, fields: HashMap<String, Value> },
+    /// Fields in declaration order. A map lost that order, and since it was a
+    /// `HashMap`, printing a struct gave a different field order from one run
+    /// to the next.
+    Struct { name: String, fields: Vec<(String, Value)> },
     EnumVariant { enum_name: String, variant: String, args: Vec<Value> },
     Range(i64, i64),
     Array(Vec<Value>),
@@ -381,14 +384,29 @@ impl Interpreter {
             }
             ExprKind::FieldAccess(obj, field) => {
                 match self.eval_expr(obj) {
-                    Value::Struct { fields, .. } => fields.get(field).cloned().unwrap_or_else(|| rt_fail!(self, "field `{}` not found", field)),
+                    Value::Struct { fields, .. } => fields.iter()
+                        .find(|(n, _)| n == field)
+                        .map(|(_, v)| v.clone())
+                        .unwrap_or_else(|| rt_fail!(self, "field `{}` not found", field)),
                     _ => rt_fail!(self, "cannot access field on non-struct"),
                 }
             }
             ExprKind::StructLit { name, fields } => {
-                let mut field_map = HashMap::new();
-                for (fname, fexpr) in fields { field_map.insert(fname.clone(), self.eval_expr(fexpr)); }
-                Value::Struct { name: name.clone(), fields: field_map }
+                // In the order the struct declares, not the order the literal
+                // lists, so two literals of the same struct print alike.
+                let declared = self.structs.get(name).cloned().unwrap_or_default();
+                let mut built: Vec<(String, Value)> = Vec::new();
+                for (fname, fexpr) in fields {
+                    built.push((fname.clone(), self.eval_expr(fexpr)));
+                }
+                let mut ordered: Vec<(String, Value)> = Vec::new();
+                for (dname, _) in &declared {
+                    if let Some(i) = built.iter().position(|(n, _)| n == dname) {
+                        ordered.push(built.remove(i));
+                    }
+                }
+                ordered.extend(built);
+                Value::Struct { name: name.clone(), fields: ordered }
             }
             ExprKind::Match { scrutinee, arms } => {
                 let sv = self.eval_expr(scrutinee);

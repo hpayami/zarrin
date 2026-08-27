@@ -1114,3 +1114,97 @@ fn main() {
 "#,
     );
 }
+
+// ---------------------------------------------------------------------------
+// Printing a compound value
+//
+// An array and a struct are bare addresses in the native backend, and `print`
+// had nothing to say about either: `print([1, 2, 3])` printed the address as a
+// number, and so did `to_string` and string interpolation. Rendering one needs
+// its type, since the value itself is only a word.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn arrays_print_their_elements() {
+    assert_agrees_with_interpreter(
+        r#"
+fn main() {
+    print([1, 2, 3]);
+    print([true, false]);
+    print([1.5, 2.0]);
+    print(["a", "b"]);
+    print([0]);
+    print([-1, -22]);
+    print([[1, 2], [3, 4]]);
+}
+"#,
+    );
+}
+
+#[test]
+fn an_array_reaches_to_string_and_interpolation_too() {
+    assert_agrees_with_interpreter(
+        r#"
+fn main() {
+    let xs = [10, 20];
+    print(to_string(xs));
+    print("xs = {xs}");
+    print(to_string(xs) + "!");
+}
+"#,
+    );
+}
+
+#[test]
+fn structs_print_their_fields_in_declaration_order() {
+    assert_agrees_with_interpreter(
+        r#"
+struct Inner { a: int, b: string }
+struct Outer { name: string, inner: Inner }
+fn main() {
+    let o = Outer { name: "o", inner: Inner { a: 1, b: "two" } };
+    print(o);
+    print(to_string(o));
+    print([o, o]);
+}
+"#,
+    );
+}
+
+#[test]
+fn a_struct_literal_may_list_its_fields_in_any_order() {
+    // Fields were stored in the order the literal wrote them but read back by
+    // declaration index, so an out-of-order literal swapped them.
+    assert_agrees_with_interpreter(
+        r#"
+struct P { x: int, y: int }
+fn main() {
+    let p = P { y: 20, x: 10 };
+    print(p.x);
+    print(p.y);
+    print(p);
+}
+"#,
+    );
+}
+
+#[test]
+fn printing_an_array_in_a_loop_does_not_accumulate() {
+    // The text is built per element, so a loop that never unwinds what it built
+    // would grow the stack or the heap by the length of the array each time
+    // round.
+    assert_agrees_with_interpreter(
+        r#"
+fn main() {
+    let xs = [1.5, 2.5, 3.5];
+    let i = 0;
+    let last = "";
+    while i < 500 {
+        last = to_string(xs);
+        i = i + 1;
+    }
+    print(last);
+}
+"#,
+    );
+}

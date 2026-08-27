@@ -529,3 +529,28 @@ fn braces_can_be_escaped_in_an_interpolated_string() {
 fn a_carriage_return_escape_works() {
     assert_output("fn main() { print(len(\"a\\rb\")); }\n", &["3"]);
 }
+
+// ---------------------------------------------------------------------------
+// Struct field order
+//
+// The interpreter held a struct's fields in a `HashMap`, so printing one gave
+// whatever order that run's hash seed produced — the same program printed
+// `P { x: 1, y: 2 }` and `P { y: 2, x: 1 }` on consecutive runs.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_struct_prints_its_fields_in_declaration_order() {
+    let src = "struct P { x: int, y: int, z: int }\n\
+               fn main() { print(P { z: 3, x: 1, y: 2 }); }\n";
+    assert_output(src, &["P { x: 1, y: 2, z: 3 }"]);
+}
+
+#[test]
+fn the_field_order_is_the_same_every_run() {
+    let src = "struct Wide { alpha: int, beta: int, gamma: int, delta: int }\n\
+               fn main() { print(Wide { alpha: 1, beta: 2, gamma: 3, delta: 4 }); }\n";
+    let want = &["Wide { alpha: 1, beta: 2, gamma: 3, delta: 4 }"];
+    for _ in 0..8 {
+        assert_output(src, want);
+    }
+}

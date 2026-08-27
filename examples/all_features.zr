@@ -109,6 +109,10 @@ fn main() {
     let xs = [10, 20, 30];
     print(xs[1]);
     print(len(xs));
+    // a whole array, and a whole struct, print like the value they are
+    print(xs);
+    print("xs = {xs}");
+    print(p);
 
     // Option, and a match with a guard and a qualified pattern
     let maybe = Some(41);

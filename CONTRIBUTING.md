@@ -72,6 +72,14 @@ against a `TypeEnv` the backend keeps in step with the locals in scope. Do not
 add a rule that infers a type from the shape of an expression — that is what
 the checker is for, and the two drifted apart every time it was tried.
 
+Anything printable renders through `gen_to_str`, which takes a raw word and
+the type that says how to read it. Adding a new printable type means a case
+there, not a new branch in `print` — `print`, `to_string` and interpolation all
+go through it, and they used to disagree. Text for the elements of an array is
+built one element at a time with the stack unwound in between, because a loop
+that allocates per element and never unwinds is how several earlier leaks
+started.
+
 Generics are gone by the time either backend runs: `monomorphize::expand`
 rewrites the program into one with no generic call left in it, so a backend
 never has to reason about a type parameter. Two things about that pass are easy

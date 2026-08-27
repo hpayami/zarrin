@@ -26,6 +26,13 @@ A `match` must cover its scrutinee: every variant of an enum, both booleans, or
 a `_` arm. An arm carrying a guard covers nothing, since the guard can turn it
 down.
 
+`print` and `to_string` render a value the way it is written: an array as
+`[1, 2, 3]`, a struct as `Point { x: 1, y: 2 }` with its fields in declaration
+order, an enum as its variant name and payload. An `Option` or `Result` payload
+still prints as an integer on the native backend, since a built-in variant does
+not record what type it carries; a range prints as `0` there for the same
+reason.
+
 Errors — syntax, type, and run time — are reported against the source with a
 line, a column and the offending line quoted. A type error points at the
 subexpression that caused it, down to the individual argument. Run-time

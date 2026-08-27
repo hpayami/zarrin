@@ -18,6 +18,9 @@ tab	sep
 a brace { stays put }
 20
 3
+[10, 20, 30]
+xs = [10, 20, 30]
+Point { x: 10, y: 20 }
 42
 lucky
 blue
