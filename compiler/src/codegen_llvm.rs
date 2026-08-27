@@ -45,7 +45,10 @@ pub struct Codegen<'ctx> {
     printf: FunctionValue<'ctx>,
     functions: HashMap<String, FunctionValue<'ctx>>,
     fn_ret_types: HashMap<String, Type>,
-    named: HashMap<String, (PointerValue<'ctx>, String)>,
+    /// Locals: where the value lives, and the type that says how to read it
+    /// back. This used to be tagged with a string, always "int" for
+    /// parameters, so a `float` or `string` parameter was read as an integer.
+    named: HashMap<String, (PointerValue<'ctx>, Type)>,
     struct_fields: HashMap<String, Vec<(String, Type)>>,
     var_struct_type: HashMap<String, String>,
     /// The type checker's view of the program, kept in step with the locals in
@@ -234,6 +237,63 @@ impl<'ctx> Codegen<'ctx> {
         }
     }
 
+    /// Read a value as a double, whatever shape it arrived in.
+    fn as_float(&self, v: &CgValue<'ctx>) -> FloatValue<'ctx> {
+        match v {
+            CgValue::Float(f) => *f,
+            other => self
+                .builder
+                .build_bit_cast(self.value_to_int(other), self.f64, "i2f")
+                .unwrap()
+                .into_float_value(),
+        }
+    }
+
+    /// Put a value into a local's slot, in the representation its type calls
+    /// for: an f64 for a float, a pointer for a string, an i64 otherwise.
+    fn store_into(&self, ptr: PointerValue<'ctx>, ty: &Type, v: &CgValue<'ctx>) {
+        let stored: BasicValueEnum = match ty {
+            Type::Float => self.as_float(v).into(),
+            Type::String => match v {
+                CgValue::Str(p) => (*p).into(),
+                other => self
+                    .builder
+                    .build_int_to_ptr(self.value_to_int(other), self.context.ptr_type(AddressSpace::default()), "s2p")
+                    .unwrap()
+                    .into(),
+            },
+            _ => self.value_to_int(v).into(),
+        };
+        self.builder.build_store(ptr, stored).unwrap();
+    }
+
+    /// Declare a local of type `ty` and give it `v`.
+    fn bind_local(&mut self, name: &str, ty: &Type, v: &CgValue<'ctx>) {
+        let slot_ty: inkwell::types::BasicTypeEnum = match ty {
+            Type::Float => self.f64.into(),
+            Type::String => self.context.ptr_type(AddressSpace::default()).into(),
+            _ => self.i64.into(),
+        };
+        let ptr = self.builder.build_alloca(slot_ty, name).unwrap();
+        self.store_into(ptr, ty, v);
+        self.named.insert(name.to_string(), (ptr, ty.clone()));
+        self.types.define(name, ty.clone());
+    }
+
+    fn load_local(&self, name: &str) -> Option<CgValue<'ctx>> {
+        let (ptr, ty) = self.named.get(name)?;
+        Some(match ty {
+            Type::Float => CgValue::Float(self.builder.build_load(self.f64, *ptr, name).unwrap().into_float_value()),
+            Type::String => CgValue::Str(
+                self.builder
+                    .build_load(self.context.ptr_type(AddressSpace::default()), *ptr, name)
+                    .unwrap()
+                    .into_pointer_value(),
+            ),
+            _ => CgValue::Int(self.builder.build_load(self.i64, *ptr, name).unwrap().into_int_value()),
+        })
+    }
+
     fn is_bool_expr(&mut self, e: &Expr) -> bool {
         self.type_of(e) == Some(Type::Bool)
     }
@@ -373,19 +433,8 @@ impl<'ctx> Codegen<'ctx> {
             }
             Expr::Str(s) => CgValue::Str(self.string_global(s)),
             Expr::Ident(name) => {
-                if let Some((ptr, ty_name)) = self.named.get(name) {
-                    match ty_name.as_str() {
-                        "float" => CgValue::Float(self.builder.build_load(self.f64, *ptr, name).unwrap().into_float_value()),
-                        "string" => CgValue::Str(*ptr),
-                        "bool" => {
-                            let bval = self.builder.build_load(self.i1, *ptr, name).unwrap().into_int_value();
-                            CgValue::Int(self.builder.build_int_z_extend(bval, self.i64, "bool_ext").unwrap())
-                        }
-                        _ => {
-                            let v = self.builder.build_load(self.i64, *ptr, name).unwrap();
-                            CgValue::Int(v.into_int_value())
-                        }
-                    }
+                if let Some(v) = self.load_local(name) {
+                    v
                 } else if let Some(variant) = self.resolve_variant(name) {
                     let tag = variant.tag;
                     if variant.enum_has_payload {
@@ -895,11 +944,11 @@ impl<'ctx> Codegen<'ctx> {
                     .unwrap_or_else(|| panic!("undefined function: {}", name));
                 let mut meta_args: Vec<BasicMetadataValueEnum> = Vec::new();
                 for a in args {
-                    match self.gen_expr(a) {
-                        CgValue::Int(v) => meta_args.push(v.into()),
-                        CgValue::Float(v) => meta_args.push(v.into()),
-                        _ => panic!("only int/float args supported"),
-                    }
+                    // Every parameter is an i64, so pack the argument the same
+                    // way the callee unpacks it. Passing a float or a string
+                    // through unchanged was rejected outright.
+                    let a_val = self.gen_expr(a);
+                    meta_args.push(self.value_to_int(&a_val).into());
                 }
                 let call = self.builder.build_call(func, &meta_args, name).unwrap();
                 match call.try_as_basic_value() {
@@ -1017,11 +1066,11 @@ impl<'ctx> Codegen<'ctx> {
                     _ => panic!("method call on non-struct"),
                 }
                 for a in args {
-                    match self.gen_expr(a) {
-                        CgValue::Int(v) => meta_args.push(v.into()),
-                        CgValue::Float(v) => meta_args.push(v.into()),
-                        _ => panic!("only int/float args supported"),
-                    }
+                    // Every parameter is an i64, so pack the argument the same
+                    // way the callee unpacks it. Passing a float or a string
+                    // through unchanged was rejected outright.
+                    let a_val = self.gen_expr(a);
+                    meta_args.push(self.value_to_int(&a_val).into());
                 }
                 let func = self.functions.get(method)
                     .copied()
@@ -1157,11 +1206,9 @@ Expr::Match { scrutinee, arms } => {
                                             let field_val = self.builder.build_load(self.i64, field_ptr, vname).unwrap().into_int_value();
                                             let ptr = self.builder.build_alloca(self.i64, vname).unwrap();
                                             self.builder.build_store(ptr, field_val).unwrap();
-                                            if matches!(payload_types.get(j), Some(Type::Float)) {
-                                                self.named.insert(vname.clone(), (ptr, "float".to_string()));
-                                            } else {
-                                                self.named.insert(vname.clone(), (ptr, "int".to_string()));
-                                            }
+                                            let pty = payload_types.get(j).cloned().unwrap_or(Type::Int);
+                                            self.named.insert(vname.clone(), (ptr, pty.clone()));
+                                            self.types.define(vname, pty);
                                         }
                                     }
                                 }
@@ -1176,7 +1223,8 @@ Expr::Match { scrutinee, arms } => {
                         if let Pattern::Variable(name) = first_pat {
                             let ptr = self.builder.build_alloca(self.i64, name).unwrap();
                             self.builder.build_store(ptr, sv_tag).unwrap();
-                            self.named.insert(name.clone(), (ptr, "int".to_string()));
+                            self.named.insert(name.clone(), (ptr, Type::Int));
+                            self.types.define(name, Type::Int);
                         }
                     }
                     // With a guard the body needs its own block, so the guard
@@ -1349,7 +1397,8 @@ Expr::Match { scrutinee, arms } => {
                 let elem = cur_idx;
                 let var_ptr = self.builder.build_alloca(self.i64, var).unwrap();
                 self.builder.build_store(var_ptr, elem).unwrap();
-                self.named.insert(var.clone(), (var_ptr, "int".to_string()));
+                self.named.insert(var.clone(), (var_ptr, Type::Int));
+                self.types.define(var, Type::Int);
 
                 let mut terminated = false;
                 for s in body {
@@ -1778,33 +1827,23 @@ Expr::Match { scrutinee, arms } => {
                 if let Some(sn) = self.infer_struct_type(value) {
                     self.var_struct_type.insert(name.clone(), sn);
                 }
-                // Record the binding for the checker, so later expressions
-                // that mention it can be typed.
-                if let Some(t) = self.type_of(value) {
-                    self.types.define(name, t);
-                }
+                let declared = self.type_of(value).filter(|t| *t != Type::Inferred);
                 let v = self.gen_expr(value);
-                let (ptr, ty_name) = match &v {
-                    CgValue::Str(p) => {
-                        (p.clone(), "string".to_string())
-                    }
-                    CgValue::Float(_) => {
-                        let p = self.builder.build_alloca(self.f64, name).unwrap();
-                        self.builder.build_store(p, v.as_basic()).unwrap();
-                        (p, "float".to_string())
-                    }
-                    CgValue::Int(_) => {
-                        let p = self.builder.build_alloca(self.i64, name).unwrap();
-                        self.builder.build_store(p, v.as_basic()).unwrap();
-                        (p, "int".to_string())
-                    }
-                };
-                self.named.insert(name.clone(), (ptr, ty_name));
+                // The checker's type decides how the local is held; where it
+                // cannot say, fall back to the shape of the value.
+                let ty = declared.unwrap_or(match &v {
+                    CgValue::Str(_) => Type::String,
+                    CgValue::Float(_) => Type::Float,
+                    CgValue::Int(_) => Type::Int,
+                });
+                self.bind_local(name, &ty, &v);
             }
             StmtKind::Assign { name, value } => {
                 let v = self.gen_expr(value);
-                if let Some((ptr, _)) = self.named.get(name) {
-                    self.builder.build_store(*ptr, v.as_basic()).unwrap();
+                if let Some((ptr, ty)) = self.named.get(name).map(|(p, t)| (*p, t.clone())) {
+                    // Convert to the slot's representation; storing the value
+                    // raw would put a float's bits into an integer slot.
+                    self.store_into(ptr, &ty, &v);
                 } else {
                     panic!("undefined variable for assign: {}", name);
                 }
@@ -1944,7 +1983,8 @@ Expr::Match { scrutinee, arms } => {
                     let cmp = self.builder.build_int_compare(inkwell::IntPredicate::SLT, cur, end_int, "for_cmp").unwrap();
                     self.builder.build_conditional_branch(cmp, body_bb, exit_bb).unwrap();
 
-                    self.named.insert(var.clone(), (counter_ptr, "int".to_string()));
+                    self.named.insert(var.clone(), (counter_ptr, Type::Int));
+                    self.types.define(var, Type::Int);
                     self.loop_exit.push(exit_bb);
                     self.loop_continue.push(cont_bb);
                     self.builder.position_at_end(body_bb);
@@ -2296,11 +2336,11 @@ pub fn compile_to_executable(program: &Program, out_path: &str, src_path: &str, 
 
                 let mut terminated = false;
                 for (i, (pname, pty)) in params.iter().enumerate() {
-                    let ptr = cg.builder.build_alloca(cg.i64, pname).unwrap();
+                    // Every parameter arrives as an i64; its declared type says
+                    // how to unpack it. Tagging them all "int" meant a `float`
+                    // or `string` parameter was read back as an integer.
                     let arg = func.get_nth_param(i as u32).unwrap().into_int_value();
-                    cg.builder.build_store(ptr, arg).unwrap();
-                    cg.named.insert(pname.clone(), (ptr, "int".to_string()));
-                    cg.types.define(pname, pty.clone());
+                    cg.bind_local(pname, pty, &CgValue::Int(arg));
                     if let Type::Named(t) = pty {
                         if cg.struct_fields.contains_key(t) {
                             cg.var_struct_type.insert(pname.clone(), t.clone());
@@ -2332,19 +2372,14 @@ pub fn compile_to_executable(program: &Program, out_path: &str, src_path: &str, 
                         cg.types.push_scope();
                         let mut terminated = false;
                         for (i, (pname, pty)) in params.iter().enumerate() {
-                            let ptr = cg.builder.build_alloca(cg.i64, pname).unwrap();
-                            let arg = func.get_nth_param(i as u32).unwrap().into_int_value();
-                            cg.builder.build_store(ptr, arg).unwrap();
-                            cg.named.insert(pname.clone(), (ptr, "int".to_string()));
-                            // The parser types a `self` parameter as `Self`;
-                            // the impl block is what says which type that is.
                             // The parser types a `self` parameter as `Self`;
                             // the impl block is what says which type that is.
                             let declared = match pname.as_str() {
                                 "self" | "&self" | "&mut" => Type::Named(type_name.clone()),
                                 _ => pty.clone(),
                             };
-                            cg.types.define(pname, declared.clone());
+                            let arg = func.get_nth_param(i as u32).unwrap().into_int_value();
+                            cg.bind_local(pname, &declared, &CgValue::Int(arg));
                             if let Type::Named(t) = declared {
                                 if cg.struct_fields.contains_key(&t) {
                                     cg.var_struct_type.insert(pname.clone(), t);

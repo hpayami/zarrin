@@ -723,6 +723,54 @@ fn main() {
     );
 }
 
+// --- locals and parameters carry their type ---------------------------------
+
+#[test]
+fn parameters_of_every_type() {
+    // Locals were tagged with a string, and a parameter was always tagged
+    // "int": `fn twice(x: float)` failed to compile with "expected int
+    // operand", and a string parameter with "only int/float args supported".
+    assert_agrees_with_interpreter(
+        r#"
+struct P { x: int }
+fn twice(x: float) -> float { return x * 2.0; }
+fn label(s: string) -> string { return s + "!"; }
+fn mix(a: int, b: float, c: string, d: bool) -> string {
+    if d { return c + to_string(a) + to_string(b); }
+    return "off";
+}
+impl P { fn scaled(self, by: float) -> float { return by * 3.0; } }
+fn main() {
+    print(twice(1.25));
+    print(label("hi"));
+    print(mix(1, 2.5, "v=", true));
+    print(mix(1, 2.5, "v=", false));
+    let p = P { x: 1 };
+    print(p.scaled(1.5));
+}
+"#,
+    );
+}
+
+#[test]
+fn reassigning_a_string_or_float_local() {
+    // A string local held the string pointer as its slot, so assigning to it
+    // wrote into the string data rather than rebinding the variable.
+    assert_agrees_with_interpreter(
+        r#"
+fn main() {
+    let s = "one";
+    print(s);
+    s = "two";
+    print(s);
+    let f = 1.5;
+    f = 2.5;
+    print(f);
+}
+"#,
+    );
+}
+
 // --- every example, both backends -------------------------------------------
 
 /// Walk `examples/` and require the native executable to behave exactly like
