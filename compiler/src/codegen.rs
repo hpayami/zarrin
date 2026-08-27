@@ -225,7 +225,24 @@ impl Interpreter {
                             i += 1;
                         }
                     }
-                    _ => rt_fail!(self, "for loop requires int or range"),
+                    // `for` as an expression walked an array; as a statement it
+                    // refused to, which is not a distinction a reader would
+                    // guess at.
+                    Value::Array(elems) => {
+                        for elem in elems {
+                            self.push_scope();
+                            self.declare(var, elem);
+                            for s in body {
+                                self.eval_stmt(s);
+                                if self.returned.is_some() { self.pop_scope(); return; }
+                                if self.should_continue { self.should_continue = false; break; }
+                                if self.should_break { self.should_break = false; self.break_value = None; break; }
+                            }
+                            self.pop_scope();
+                            if self.should_break { self.should_break = false; self.break_value = None; break; }
+                        }
+                    }
+                    _ => rt_fail!(self, "for loop requires an int, a range or an array"),
                 }
             }
             StmtKind::Break(val) => {

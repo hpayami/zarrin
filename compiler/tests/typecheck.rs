@@ -284,3 +284,32 @@ fn a_type_error_names_types_the_way_they_are_written() {
     assert_check_error("fn main() { let x: int = \"s\"; }\n", "expected `int`, found `string`");
     assert_check_error("fn main() { let x: int = [1]; }\n", "expected `int`, found `[int]`");
 }
+
+// ---------------------------------------------------------------------------
+// Ranges
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_range_is_not_an_integer() {
+    // `1..4` was typed as `int`, so arithmetic on one type-checked and then did
+    // whatever each backend happened to do with it.
+    assert_check_error("fn main() { let n: int = 1..4; print(n); }\n", "expected `int`, found `range`");
+    assert_checks("fn span(n: int) -> range {\n    return 0..n;\n}\nfn main() { print(span(2)); }\n");
+}
+
+#[test]
+fn a_for_loop_says_what_it_can_walk() {
+    assert_check_error(
+        "fn main() { for x in \"nope\" { print(x); } }\n",
+        "expected `range, array or int`, found `string`",
+    );
+    assert_checks("fn main() { for x in 0..3 { print(x); } for y in [1, 2] { print(y); } for z in 3 { print(z); } }\n");
+}
+
+#[test]
+fn a_loop_variable_has_the_element_type() {
+    assert_check_error(
+        "fn main() { for s in [\"a\"] { let n: int = s; print(n); } }\n",
+        "expected `int`, found `string`",
+    );
+}

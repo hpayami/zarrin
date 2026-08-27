@@ -1285,3 +1285,84 @@ fn main() {
 "#,
     );
 }
+
+// ---------------------------------------------------------------------------
+// Ranges, and what a `for` can walk
+//
+// A range evaluated to the constant 0, so `print(1..4)` printed `0`; and the
+// loop insisted on a range written out in its own header, so a range held in a
+// variable, or handed back by a function, was a compile-time refusal.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_range_is_a_value_that_prints() {
+    assert_agrees_with_interpreter(
+        r#"
+fn main() {
+    let r = 1..4;
+    print(r);
+    print(1..4);
+    print(to_string(2..5));
+    print("r = {r}");
+    print([1..2, 3..9]);
+}
+"#,
+    );
+}
+
+#[test]
+fn a_loop_walks_a_range_it_was_handed() {
+    assert_agrees_with_interpreter(
+        r#"
+fn span(n: int) -> range { return 0..n; }
+fn main() {
+    let r = 1..4;
+    for i in r { print(i); }
+    for j in 0..3 { print(j); }
+    for k in 3 { print(k); }
+    for m in span(2) { print(m); }
+}
+"#,
+    );
+}
+
+#[test]
+fn a_loop_walks_an_array() {
+    assert_agrees_with_interpreter(
+        r#"
+fn main() {
+    for x in [10, 20, 30] { print(x); }
+    let xs = ["a", "b"];
+    for y in xs { print(y); }
+    for f in [1.5, 2.5] { print(f); }
+    let total = for i in 0..5 {
+        if i == 3 { break i * 10; }
+    };
+    print(total);
+}
+"#,
+    );
+}
+
+#[test]
+fn a_loop_lets_go_of_what_it_walked() {
+    // The array and the range are built for the loop and belong to it. Left
+    // unreleased, this grew by one allocation per turn; released twice, Guard
+    // Malloc in `build_and_run` would fault.
+    assert_agrees_with_interpreter(
+        r#"
+fn span(n: int) -> range { return 0..n; }
+fn main() {
+    let total = 0;
+    let i = 0;
+    while i < 300 {
+        for m in span(2) { total = total + m; }
+        for n in [1, 2, 3] { total = total + n; }
+        for s in ["a" + to_string(i), "c"] { total = total + len(s); }
+        i = i + 1;
+    }
+    print(total);
+}
+"#,
+    );
+}

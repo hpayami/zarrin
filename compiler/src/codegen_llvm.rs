@@ -21,6 +21,17 @@ use inkwell::AddressSpace;
 use std::collections::HashMap;
 use std::process::Command;
 
+/// What one `for` loop walks over.
+struct ForSource<'ctx> {
+    start: IntValue<'ctx>,
+    end: IntValue<'ctx>,
+    /// An array's base pointer and element type; `None` counts the numbers
+    /// between the bounds instead.
+    elements: Option<(PointerValue<'ctx>, Type)>,
+    /// A value the loop itself owns and must let go of once it is done.
+    owned: Option<(PointerValue<'ctx>, Type)>,
+}
+
 #[derive(Clone)]
 enum CgValue<'ctx> {
     Int(IntValue<'ctx>),
@@ -339,7 +350,7 @@ impl<'ctx> Codegen<'ctx> {
 
     fn is_managed(&self, ty: &Type) -> bool {
         match ty {
-            Type::String | Type::Array(_) => true,
+            Type::String | Type::Array(_) | Type::Range => true,
             Type::Named(n, _) => self.struct_fields.contains_key(n) || self.enum_has_body(n),
             _ => false,
         }
@@ -384,6 +395,7 @@ impl<'ctx> Codegen<'ctx> {
             Type::String => "str".into(),
             Type::Array(el) => format!("arr.{}", self.release_key(el)),
             Type::Named(n, _) => format!("t.{}", n),
+            Type::Range => "range".into(),
             other => format!("{:?}", other),
         }
     }
@@ -441,7 +453,7 @@ impl<'ctx> Codegen<'ctx> {
     /// Release whatever a value of this type holds on to.
     fn gen_release_children(&mut self, p: PointerValue<'ctx>, ty: &Type) {
         match ty {
-            Type::String => {}
+            Type::String | Type::Range => {}
             Type::Array(el) => {
                 if !self.is_managed(el) {
                     return;
@@ -787,6 +799,7 @@ impl<'ctx> Codegen<'ctx> {
                 let el = (**el).clone();
                 self.gen_array_to_str(raw, &el, depth)
             }
+            Type::Range => self.gen_range_to_str(raw),
             Type::Named(n, args) if self.is_enum(n) => {
                 let (n, args) = (n.clone(), args.clone());
                 self.gen_enum_to_str(raw, &n, &args, depth)
@@ -903,6 +916,39 @@ impl<'ctx> Codegen<'ctx> {
         let end = unsafe { self.builder.build_gep(self.i8, buf, &[after], "arr_end").unwrap() };
         self.builder.build_store(end, self.i8.const_zero()).unwrap();
         buf
+    }
+
+    /// `a..b`.
+    fn gen_range_to_str(&mut self, raw: IntValue<'ctx>) -> PointerValue<'ctx> {
+        let ptr_ty = self.context.ptr_type(AddressSpace::default());
+        let p = self.builder.build_int_to_ptr(raw, ptr_ty, "range_p").unwrap();
+        let (start, end) = self.range_bounds(p);
+        // Both ends' text is live while the range's is assembled, so neither
+        // can be unwound first — the buffer they are copied into is allocated
+        // alongside them and outlives them by the caller's reckoning.
+        let a = self.gen_int_to_str(start);
+        let b = self.gen_int_to_str(end);
+        let na = self.strlen_of(a);
+        let nb = self.strlen_of(b);
+        let size = self.builder.build_int_add(na, nb, "range_len").unwrap();
+        let size = self.builder.build_int_add(size, self.i64.const_int(3, false), "range_size").unwrap();
+        let buf = self.scratch_bytes(size, "range_text");
+        let at = self.append_bytes(buf, self.i64.const_zero(), a, na);
+        let at = self.append_literal(buf, at, "..");
+        let at = self.append_bytes(buf, at, b, nb);
+        let done = unsafe { self.builder.build_gep(self.i8, buf, &[at], "range_end_str").unwrap() };
+        self.builder.build_store(done, self.i8.const_zero()).unwrap();
+        buf
+    }
+
+    /// The two words a range is made of.
+    fn range_bounds(&self, p: PointerValue<'ctx>) -> (IntValue<'ctx>, IntValue<'ctx>) {
+        let start = self.builder.build_load(self.i64, p, "range_start").unwrap().into_int_value();
+        let end_ptr = unsafe {
+            self.builder.build_gep(self.i64, p, &[self.i64.const_int(1, false)], "range_end_p").unwrap()
+        };
+        let end = self.builder.build_load(self.i64, end_ptr, "range_end").unwrap().into_int_value();
+        (start, end)
     }
 
     /// Run `body` for every element of an array, with the stack unwound between
@@ -2046,12 +2092,12 @@ ExprKind::Match { scrutinee, arms } => {
                 CgValue::Int(result)
             }
             ExprKind::For { var, iter, body } => {
+                // The same loop the statement form runs. This one used to
+                // ignore what it was given and count up to the iterator's raw
+                // word, with a dead branch that tested a flag it never set.
                 let fn_val = self.builder.get_insert_block().unwrap().get_parent().unwrap();
-                let iter_val = self.gen_expr(iter);
-                let iter_int = self.value_to_int(&iter_val);
-
-                let arr_ptr_val = self.entry_alloca(self.i64.into(), "for_arr_ptr");
-                let is_array = self.entry_alloca(self.i64.into(), "for_is_array");
+                let src = self.for_source(iter);
+                let (start_int, end_int) = (src.start, src.end);
 
                 let loop_bb = self.context.append_basic_block(fn_val, "for_loop");
                 let body_bb = self.context.append_basic_block(fn_val, "for_body");
@@ -2060,23 +2106,14 @@ ExprKind::Match { scrutinee, arms } => {
 
                 let result_ptr = self.entry_alloca(self.i64.into(), "for_result");
                 self.builder.build_store(result_ptr, self.i64.const_int(0, false)).unwrap();
-                self.builder.build_store(is_array, self.i64.const_int(0, false)).unwrap();
-                self.builder.build_store(arr_ptr_val, self.i64.const_int(0, false)).unwrap();
-
-                let idx_ptr = self.entry_alloca(self.i64.into(), "for_idx");
-                self.builder.build_store(idx_ptr, self.i64.const_int(0, false)).unwrap();
+                let counter_ptr = self.entry_alloca(self.i64.into(), "for_counter");
+                let var_ptr = self.entry_alloca(self.i64.into(), var);
+                self.builder.build_store(counter_ptr, start_int).unwrap();
 
                 self.builder.build_unconditional_branch(loop_bb).unwrap();
                 self.builder.position_at_end(loop_bb);
-                let cur_idx = self.builder.build_load(self.i64, idx_ptr, "for_cur_idx").unwrap().into_int_value();
-                let is_arr = self.builder.build_load(self.i64, is_array, "for_is_arr").unwrap().into_int_value();
-                let is_arr_bool = self.builder.build_int_compare(inkwell::IntPredicate::NE, is_arr, self.i64.const_int(0, false), "is_arr_i1").unwrap();
-
-                let range_check_bb = self.context.append_basic_block(fn_val, "for_range_check");
-                self.builder.build_conditional_branch(is_arr_bool, range_check_bb, range_check_bb).unwrap();
-
-                self.builder.position_at_end(range_check_bb);
-                let has_more = self.builder.build_int_compare(inkwell::IntPredicate::SLT, cur_idx, iter_int, "has_more").unwrap();
+                let cur = self.builder.build_load(self.i64, counter_ptr, "for_cur").unwrap().into_int_value();
+                let has_more = self.builder.build_int_compare(inkwell::IntPredicate::SLT, cur, end_int, "has_more").unwrap();
                 self.builder.build_conditional_branch(has_more, body_bb, after_bb).unwrap();
 
                 self.loop_exit.push(after_bb);
@@ -2084,11 +2121,7 @@ ExprKind::Match { scrutinee, arms } => {
                 self.loop_result_ptr.push(result_ptr);
 
                 self.builder.position_at_end(body_bb);
-                let elem = cur_idx;
-                let var_ptr = self.entry_alloca(self.i64.into(), var);
-                self.builder.build_store(var_ptr, elem).unwrap();
-                self.named.insert(var.clone(), (var_ptr, Type::Int));
-                self.types.define(var, Type::Int);
+                self.bind_loop_var(var, var_ptr, cur, &src.elements);
 
                 let mut terminated = false;
                 for s in body {
@@ -2104,16 +2137,32 @@ ExprKind::Match { scrutinee, arms } => {
                 self.loop_result_ptr.pop();
 
                 self.builder.position_at_end(inc_bb);
-                let next_idx = self.builder.build_int_add(cur_idx, self.i64.const_int(1, false), "next_idx").unwrap();
-                self.builder.build_store(idx_ptr, next_idx).unwrap();
+                let next_idx = self.builder.build_int_add(cur, self.i64.const_int(1, false), "next_idx").unwrap();
+                self.builder.build_store(counter_ptr, next_idx).unwrap();
                 self.builder.build_unconditional_branch(loop_bb).unwrap();
 
                 self.builder.position_at_end(after_bb);
+                if let Some((p, ty)) = src.owned {
+                    self.gen_release(p, &ty);
+                }
                 let result = self.builder.build_load(self.i64, result_ptr, "for_result").unwrap().into_int_value();
                 CgValue::Int(result)
             }
-            ExprKind::Range(_, _) => {
-                CgValue::Int(self.i64.const_int(0, false))
+            ExprKind::Range(start, end) => {
+                // A pair of words, so a range can be bound to a variable,
+                // printed and iterated. It used to evaluate to the constant 0,
+                // which is what `print(1..4)` printed.
+                let s = self.gen_expr(start);
+                let e = self.gen_expr(end);
+                let s_int = self.value_to_int(&s);
+                let e_int = self.value_to_int(&e);
+                let buf = self.scratch_slots(2, "range");
+                self.builder.build_store(buf, s_int).unwrap();
+                let end_ptr = unsafe {
+                    self.builder.build_gep(self.i64, buf, &[self.i64.const_int(1, false)], "range_end").unwrap()
+                };
+                self.builder.build_store(end_ptr, e_int).unwrap();
+                CgValue::Int(self.builder.build_ptr_to_int(buf, self.i64, "range_p").unwrap())
             }
             ExprKind::ArrayLit(elems) => {
                 let len = elems.len() as u64;
@@ -2553,7 +2602,97 @@ ExprKind::Match { scrutinee, arms } => {
         match self.type_of(e)? {
             Type::Array(el) => Some(Type::Array(el)),
             Type::Named(n, args) if self.struct_fields.contains_key(&n) => Some(Type::Named(n, args)),
+            Type::Range => Some(Type::Range),
             _ => None,
+        }
+    }
+
+    /// What a `for` walks: bounds to count between, and — when it is an array —
+    /// the pointer whose slots the counter indexes. One place, because the
+    /// statement and the expression form of `for` must agree.
+    fn for_source(&mut self, iter: &Expr) -> ForSource<'ctx> {
+        // Written out in place, a range's bounds are just two values and no
+        // range needs building.
+        if let ExprKind::Range(start_expr, end_expr) = &*iter.kind {
+            let s = self.gen_expr(start_expr);
+            let e = self.gen_expr(end_expr);
+            return ForSource {
+                start: self.value_to_int(&s),
+                end: self.value_to_int(&e),
+                elements: None,
+                owned: None,
+            };
+        }
+        let ty = self.type_of(iter);
+        // A value built for the loop belongs to the loop: an array literal
+        // written in the header, or a range a function handed back, is nobody
+        // else's to let go of.
+        let mine = self.produces_owned(iter);
+        let ptr_ty = self.context.ptr_type(AddressSpace::default());
+        match ty {
+            Some(Type::Array(el)) => {
+                let el = (*el).clone();
+                let v = self.gen_expr(iter);
+                let raw = self.value_to_int(&v);
+                let p = self.builder.build_int_to_ptr(raw, ptr_ty, "iter_arr").unwrap();
+                let len = self.builder.build_load(self.i64, p, "iter_len").unwrap().into_int_value();
+                ForSource {
+                    start: self.i64.const_zero(),
+                    end: len,
+                    elements: Some((p, el.clone())),
+                    // Released after the loop: its slots are read all the way
+                    // through it.
+                    owned: mine.then(|| (p, Type::Array(Box::new(el)))),
+                }
+            }
+            Some(Type::Range) => {
+                let v = self.gen_expr(iter);
+                let raw = self.value_to_int(&v);
+                let p = self.builder.build_int_to_ptr(raw, ptr_ty, "iter_p").unwrap();
+                let (start, end) = self.range_bounds(p);
+                // Both ends are in hand now, so a range built for the loop has
+                // no reason to outlive the header.
+                if mine {
+                    self.gen_release(p, &Type::Range);
+                }
+                ForSource { start, end, elements: None, owned: None }
+            }
+            // An integer counts from zero.
+            _ => {
+                let v = self.gen_expr(iter);
+                ForSource {
+                    start: self.i64.const_zero(),
+                    end: self.value_to_int(&v),
+                    elements: None,
+                    owned: None,
+                }
+            }
+        }
+    }
+
+    /// Bind the loop variable for this turn: the counter itself, or the array
+    /// element it indexes.
+    fn bind_loop_var(
+        &mut self,
+        var: &str,
+        slot: PointerValue<'ctx>,
+        counter: IntValue<'ctx>,
+        source: &Option<(PointerValue<'ctx>, Type)>,
+    ) {
+        match source {
+            None => {
+                self.builder.build_store(slot, counter).unwrap();
+                self.named.insert(var.to_string(), (slot, Type::Int));
+                self.types.define(var, Type::Int);
+            }
+            Some((p, el)) => {
+                let at = self.builder.build_int_add(counter, self.i64.const_int(1, false), "elem_at").unwrap();
+                let ep = unsafe { self.builder.build_gep(self.i64, *p, &[at], "elem_p").unwrap() };
+                let e = self.builder.build_load(self.i64, ep, var).unwrap().into_int_value();
+                self.builder.build_store(slot, e).unwrap();
+                self.named.insert(var.to_string(), (slot, el.clone()));
+                self.types.define(var, el.clone());
+            }
         }
     }
 
@@ -2789,18 +2928,18 @@ ExprKind::Match { scrutinee, arms } => {
                 }
             }
             StmtKind::For { var, iter, body } => {
-                if let ExprKind::Range(start_expr, end_expr) = &*iter.kind {
-                    let start_val = self.gen_expr(start_expr);
-                    let end_val = self.gen_expr(end_expr);
-                    let end_int = match end_val { CgValue::Int(v) => v, _ => panic!("for range end must be int") };
+                {
+                    let src = self.for_source(iter);
+                    let (start_int, end_int) = (src.start, src.end);
 
                     let entry_bb = self.context.append_basic_block(fn_val, "for_entry");
                     let body_bb = self.context.append_basic_block(fn_val, "for_body");
                     let cont_bb = self.context.append_basic_block(fn_val, "for_cont");
                     let exit_bb = self.context.append_basic_block(fn_val, "for_exit");
 
-                    let counter_ptr = self.entry_alloca(self.i64.into(), var);
-                    self.builder.build_store(counter_ptr, start_val.as_basic()).unwrap();
+                    let counter_ptr = self.entry_alloca(self.i64.into(), "for_counter");
+                    let var_ptr = self.entry_alloca(self.i64.into(), var);
+                    self.builder.build_store(counter_ptr, start_int).unwrap();
 
                     self.builder.build_unconditional_branch(entry_bb).unwrap();
                     self.builder.position_at_end(entry_bb);
@@ -2808,11 +2947,10 @@ ExprKind::Match { scrutinee, arms } => {
                     let cmp = self.builder.build_int_compare(inkwell::IntPredicate::SLT, cur, end_int, "for_cmp").unwrap();
                     self.builder.build_conditional_branch(cmp, body_bb, exit_bb).unwrap();
 
-                    self.named.insert(var.clone(), (counter_ptr, Type::Int));
-                    self.types.define(var, Type::Int);
                     self.loop_exit.push(exit_bb);
                     self.loop_continue.push(cont_bb);
                     self.builder.position_at_end(body_bb);
+                    self.bind_loop_var(var, var_ptr, cur, &src.elements);
                     let mut body_terminated = false;
                     self.open_block();
                     for s in body {
@@ -2834,8 +2972,9 @@ ExprKind::Match { scrutinee, arms } => {
                     self.builder.build_unconditional_branch(entry_bb).unwrap();
 
                     self.builder.position_at_end(exit_bb);
-                } else {
-                    panic!("LLVM backend: for loop requires range expression");
+                    if let Some((p, ty)) = src.owned {
+                        self.gen_release(p, &ty);
+                    }
                 }
             }
             StmtKind::Fn { .. } | StmtKind::Struct { .. } | StmtKind::Enum { .. } | StmtKind::Trait { .. }

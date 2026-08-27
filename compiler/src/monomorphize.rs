@@ -31,6 +31,7 @@ fn type_tag(t: &Type) -> String {
         Type::Bool => "bool".into(),
         Type::String => "string".into(),
         Type::Unit => "unit".into(),
+        Type::Range => "range".into(),
         Type::Inferred => "any".into(),
         Type::Named(n, args) if args.is_empty() => n.clone(),
         Type::Named(n, args) => {

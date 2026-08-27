@@ -1,4 +1,4 @@
-// Zarrin: for loops, continue, break, ranges, type annotations
+// Zarrin: for loops, continue, break, ranges, arrays, type annotations
 fn sum_to(n: int) -> int {
     let total = 0;
     for i in 1..n + 1 {
@@ -29,6 +29,18 @@ fn main() {
 
     // For loop with range
     print(sum_to(100));
+
+    // A range is a value: it can be held, printed, and walked later.
+    let window = 3..6;
+    print(window);
+    for w in window {
+        print(w);
+    }
+
+    // A loop walks an array as readily as a range.
+    for name in ["ada", "grace"] {
+        print(name);
+    }
 
     // While + break + modulo
     let i = 2;

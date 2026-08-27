@@ -20,7 +20,8 @@ Those are goals, not a description of the current compiler. What exists today:
 
 The language has functions, `let` bindings with inference, structs, enums with
 payloads, traits and `impl`, `match` with guards and multi-patterns, macros,
-`extern` functions, arrays, string interpolation, and the usual control flow.
+`extern` functions, arrays, ranges, string interpolation, and the usual control
+flow.
 
 A `match` must cover its scrutinee: every variant of an enum, both booleans, or
 a `_` arm. An arm carrying a guard covers nothing, since the guard can turn it
@@ -30,13 +31,18 @@ down.
 `[1, 2, 3]`, a struct as `Point { x: 1, y: 2 }` with its fields in declaration
 order, an enum as its variant name and payload.
 
+A range is a value of its own type, `range`: it can be bound, passed, returned,
+printed as `1..4`, and walked later. A `for` walks a range, an array, or an
+integer — counting from zero — and the loop variable takes the element's type.
+Anything else is a type error rather than something each backend decides for
+itself.
+
 `Option` and `Result` carry the type of what they hold: `Some(1.5)` is an
 `Option<float>`, and that is what makes it print as `Some(1.5)` rather than as
 the bits of a float. Write the argument where a signature needs it —
 `Option<float>`, `Result<int, string>` — or leave it off, and a plain `Option`
 accepts any payload but cannot say what it holds. `unwrap` and a `match` arm
-both hand back the payload at that type. A range printed as a value still comes
-out as `0` on the native backend, since a range has no type to render from.
+both hand back the payload at that type.
 
 Errors — syntax, type, and run time — are reported against the source with a
 line, a column and the offending line quoted. A type error points at the

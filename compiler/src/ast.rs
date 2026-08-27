@@ -14,6 +14,10 @@ pub enum Type {
     /// for it. `Option` on its own carries none — its payload is unknown —
     /// while `Some(1.5)` produces `Option<float>`.
     Named(String, Vec<Type>),
+    /// `a..b`. A value in its own right: it can be bound, printed and iterated,
+    /// so it needs a type of its own rather than passing for the integers it
+    /// is made of.
+    Range,
     Fn(Vec<Type>, Box<Type>),
     Array(Box<Type>),
 }
@@ -30,6 +34,7 @@ impl std::fmt::Display for Type {
             Type::Bool => write!(f, "bool"),
             Type::String => write!(f, "string"),
             Type::Unit => write!(f, "()"),
+            Type::Range => write!(f, "range"),
             Type::Named(n, args) if args.is_empty() => write!(f, "{}", n),
             Type::Named(n, args) => {
                 let parts: Vec<String> = args.iter().map(|a| a.to_string()).collect();

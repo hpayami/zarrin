@@ -529,6 +529,7 @@ impl<'a> Parser<'a> {
                     "float" => Type::Float,
                     "bool" => Type::Bool,
                     "string" => Type::String,
+                    "range" => Type::Range,
                     other => Type::Named(other.to_string(), self.parse_type_args()?),
                 }
             }

@@ -72,6 +72,13 @@ against a `TypeEnv` the backend keeps in step with the locals in scope. Do not
 add a rule that infers a type from the shape of an expression — that is what
 the checker is for, and the two drifted apart every time it was tried.
 
+A `for` loop's iterator goes through `for_source`, which answers with bounds,
+an array to index if there is one, and whatever the loop itself has to release
+afterwards. Both the statement and the expression form of `for` use it, because
+they used to disagree — the expression one counted up to the iterator's raw
+word. A value built in the loop header belongs to the loop: releasing it is
+what keeps `for n in [1, 2, 3]` inside another loop from allocating per turn.
+
 `Type::Named` carries type arguments: `Option<float>` is
 `Named("Option", [Float])`. Two named types with the same name are compatible
 when one of them has no arguments, which is what lets a signature written

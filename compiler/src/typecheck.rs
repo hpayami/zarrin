@@ -298,6 +298,27 @@ impl TypeChecker {
         Ok(env)
     }
 
+    /// What a `for` can walk: a range, an array, or an integer, which counts
+    /// from zero. Anything else was a run-time failure the interpreter reported
+    /// only once the loop was reached, and a compile-time panic natively.
+    fn check_iterable(ty: &Type) -> Result<(), TypeError> {
+        match ty {
+            Type::Range | Type::Int | Type::Array(_) | Type::Inferred => Ok(()),
+            other => Err(TypeError::TypeMismatch {
+                expected: "range, array or int".into(),
+                found: other.to_string(),
+            }),
+        }
+    }
+
+    /// What the loop variable is bound to on each turn.
+    fn element_of(ty: &Type) -> Type {
+        match ty {
+            Type::Array(el) => (**el).clone(),
+            _ => Type::Int,
+        }
+    }
+
     /// Statements are the granularity the AST records positions at, so this is
     /// where a type error picks up the location it is reported against. An error
     /// coming back from a nested statement already carries one.
@@ -337,9 +358,10 @@ impl TypeChecker {
                 env.pop_scope();
             }
             StmtKind::For { var, iter, body } => {
-                Self::check_expr(iter, env)?;
+                let iter_ty = Self::check_expr(iter, env)?;
+                Self::check_iterable(&iter_ty)?;
                 env.push_scope();
-                env.define(var, Type::Int);
+                env.define(var, Self::element_of(&iter_ty));
                 for s in body { Self::check_stmt(s, env)?; }
                 env.pop_scope();
             }
@@ -623,9 +645,10 @@ impl TypeChecker {
                 Ok(Type::Int)
             }
             ExprKind::For { var, iter, body } => {
-                Self::check_expr(iter, env)?;
+                let iter_ty = Self::check_expr(iter, env)?;
+                Self::check_iterable(&iter_ty)?;
                 env.push_scope();
-                env.define(var, Type::Int);
+                env.define(var, Self::element_of(&iter_ty));
                 for s in body { Self::check_stmt(s, env)?; }
                 env.pop_scope();
                 Ok(Type::Int)
@@ -636,7 +659,7 @@ impl TypeChecker {
                 if at != Type::Int || bt != Type::Int {
                     return Err(TypeError::TypeMismatch { expected: "int".into(), found: format!("{}", if at != Type::Int { at } else { bt }) });
                 }
-                Ok(Type::Int)
+                Ok(Type::Range)
             }
             ExprKind::ArrayLit(elems) => {
                 if elems.is_empty() {
