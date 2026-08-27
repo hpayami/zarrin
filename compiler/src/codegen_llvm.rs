@@ -1860,6 +1860,22 @@ impl<'ctx> Codegen<'ctx> {
                     let is_variant0 = self.builder.build_int_compare(inkwell::IntPredicate::EQ, tag, self.i64.const_int(0, false), "is_v0").unwrap();
                     match method.as_str() {
                         "unwrap" => {
+                            // The variant without a payload has no word to
+                            // hand back; this read the slot anyway and
+                            // returned whatever sat there — 0, usually. The
+                            // interpreter stops, and so does this now.
+                            let empty = self
+                                .infer_enum_type(obj)
+                                .map(|(en, _)| en)
+                                .and_then(|en| self.variants_of(&en).get(1).map(|(n, _)| n.clone()))
+                                .unwrap_or_else(|| "None".to_string());
+                            let f = self.builder.get_insert_block().unwrap().get_parent().unwrap();
+                            let bad = self.context.append_basic_block(f, "unwrap_empty");
+                            let ok = self.context.append_basic_block(f, "unwrap_ok");
+                            self.builder.build_conditional_branch(is_variant0, ok, bad).unwrap();
+                            self.builder.position_at_end(bad);
+                            self.gen_abort(&format!("unwrap() called on {}", empty), &[]);
+                            self.builder.position_at_end(ok);
                             let data_ptr = unsafe {
                                 self.builder.build_gep(self.i64, sv_ptr, &[self.i64.const_int(1, false)], "data_ptr").unwrap()
                             };

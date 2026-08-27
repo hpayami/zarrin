@@ -1686,3 +1686,55 @@ fn main() {
 "#,
     );
 }
+
+// ---------------------------------------------------------------------------
+// unwrap on a variant with no payload
+//
+// The native backend read the payload slot without looking at the tag, so
+// `None.unwrap()` handed back whatever word sat there — 0 — and the program
+// carried on with a value that was never there.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn unwrap_on_none_stops_the_program() {
+    assert_fails_like_the_interpreter(
+        r#"
+fn main() {
+    print("before");
+    let o = None;
+    print(o.unwrap());
+}
+"#,
+    );
+}
+
+#[test]
+fn unwrap_on_err_says_so() {
+    assert_fails_like_the_interpreter(
+        r#"
+fn f(n: int) -> Result<int, string> {
+    if n > 0 { return Ok(n); }
+    return Err("bad");
+}
+fn main() {
+    print("before");
+    print(f(0).unwrap());
+}
+"#,
+    );
+}
+
+#[test]
+fn unwrap_on_a_value_still_hands_it_over() {
+    assert_agrees_with_interpreter(
+        r#"
+fn main() {
+    print(Some(5).unwrap());
+    print(Ok(2.5).unwrap());
+    print(Some("s").unwrap());
+    let o = Some(1.5);
+    if o.is_some() { print(o.unwrap()); }
+}
+"#,
+    );
+}
