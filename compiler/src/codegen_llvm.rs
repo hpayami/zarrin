@@ -936,7 +936,20 @@ Expr::Match { scrutinee, arms } => {
                 let parent = self.builder.get_insert_block().unwrap().get_parent().unwrap();
                 let merge = self.context.append_basic_block(parent, "match_merge");
                 let sv_int_raw = self.value_to_int(&sv);
-                let has_data_variants = self.enum_variants.values().flat_map(|v| v.iter()).any(|(_, pt)| !pt.is_empty());
+                // Whether the scrutinee is a pointer to [tag, payload..] or a
+                // bare tag depends on *its* enum. This was a single flag over
+                // every enum in the program, so declaring one payload variant
+                // anywhere made `match` on an integer dereference it.
+                let has_data_variants = match self.infer_enum_type(scrutinee) {
+                    Some(en) => self.variants_of(&en).iter().any(|(_, pt)| !pt.is_empty()),
+                    None => match scrutinee.as_ref() {
+                        // A local or parameter that is not a known enum, or a
+                        // plain arithmetic value, is its own tag.
+                        Expr::Ident(n) if self.named.contains_key(n) => false,
+                        Expr::Int(_) | Expr::Binary(..) => false,
+                        _ => self.enum_variants.values().flat_map(|v| v.iter()).any(|(_, pt)| !pt.is_empty()),
+                    },
+                };
                 let (sv_tag, sv_ptr) = if has_data_variants {
                     let sv_ptr = self.builder.build_int_to_ptr(sv_int_raw, self.context.ptr_type(AddressSpace::default()), "enum_ptr").unwrap();
                     let tag_ptr = unsafe {
@@ -989,15 +1002,15 @@ Expr::Match { scrutinee, arms } => {
                                 }
                             }
                             Pattern::EnumVariant { name, inner } => {
-                                let mut tag_val: u64 = 0;
-                                let mut payload_types: Vec<Type> = Vec::new();
-                                for (_, variants) in &self.enum_variants {
-                                    if let Some(pos) = variants.iter().position(|(vn, _)| vn == name) {
-                                        tag_val = pos as u64;
-                                        payload_types = variants[pos].1.clone();
-                                        break;
-                                    }
-                                }
+                                // Scanning `enum_variants` missed the predeclared
+                                // Option/Result entirely, so `Some(v)` bound nothing
+                                // and every variant compared against tag 0; and it
+                                // never matched a qualified name like `Color::Red`,
+                                // which is what the pattern parser produces.
+                                let (tag_val, payload_types) = match self.resolve_variant(name) {
+                                    Some(v) => (v.tag as u64, v.payload),
+                                    None => (0, Vec::new()),
+                                };
                                 let pv_int = self.i64.const_int(tag_val, false);
                                 let cmp = self.builder.build_int_compare(inkwell::IntPredicate::EQ, sv_tag, pv_int, "match_cmp").unwrap();
                                 if pi < patterns.len() - 1 {

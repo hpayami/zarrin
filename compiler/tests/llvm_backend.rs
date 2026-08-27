@@ -374,3 +374,51 @@ fn main() { print(f(A)); print(f(B)); print(f(C)); print(A); }
 "#,
     );
 }
+
+// --- match on the predeclared enums, and representation per scrutinee -------
+
+#[test]
+fn matching_option_and_result_binds_payloads() {
+    // The pattern's tag and payload came from a scan of the program's own enum
+    // table, which does not contain Option or Result: `Some(v)` bound nothing
+    // ("undefined var: v") and every variant compared against tag 0.
+    assert_agrees_with_interpreter(
+        r#"
+fn describe(o: Option) -> int { return match o { Some(v) => v, None => 0 - 1 }; }
+fn check(r: Result) -> int { return match r { Ok(v) => v, Err(e) => 0 - e }; }
+fn main() {
+    print(describe(Some(42)));
+    print(describe(None));
+    print(check(Ok(7)));
+    print(check(Err(3)));
+}
+"#,
+    );
+}
+
+#[test]
+fn matching_an_integer_works_alongside_a_payload_enum() {
+    // Whether a scrutinee is a pointer or a bare tag was decided by one flag
+    // over every enum in the program, so declaring a payload variant anywhere
+    // made this dereference an integer. The program printed nothing at all.
+    assert_agrees_with_interpreter(
+        r#"
+enum Shape { Circle(int), Square(int) }
+fn classify(n: int) -> int { return match n { 0 => 10, 1 => 20, _ => 30 }; }
+fn main() { print(classify(0)); print(classify(1)); print(classify(5)); }
+"#,
+    );
+}
+
+#[test]
+fn qualified_patterns_match_natively() {
+    // `C::G` fell through to the wildcard: the scan compared against the whole
+    // string "C::G" and never found it.
+    assert_agrees_with_interpreter(
+        r#"
+enum C { R, G }
+fn f(c: C) -> int { return match c { C::R => 1, C::G => 2, _ => 9 }; }
+fn main() { print(f(R)); print(f(G)); }
+"#,
+    );
+}
