@@ -52,6 +52,10 @@ rather than wrapping, the same way an index out of range or a zero divisor
 does. Dividing an integer by zero stops it too. Float arithmetic follows IEEE:
 `1.0 / 0.0` is `inf`, and nothing about it is checked.
 
+`panic` is a failure like any other: the message, the position, stderr, exit
+status 1. An `extern fn` may be declared but not yet called — no backend
+implements one, and calling it is a type error rather than a surprise later.
+
 Errors — syntax, type, and run time — are reported against the source with a
 line, a column and the offending line quoted. A type error points at the
 subexpression that caused it, down to the individual argument. Run-time

@@ -313,3 +313,16 @@ fn a_loop_variable_has_the_element_type() {
         "expected `int`, found `string`",
     );
 }
+
+#[test]
+fn an_extern_function_cannot_be_called_yet() {
+    // Neither backend implements one, and they used to say so at different
+    // moments: the interpreter when the call was reached, the native compiler
+    // when the program was built.
+    assert_check_error(
+        "extern fn abs(n: int) -> int;\nfn main() { print(abs(0 - 5)); }\n",
+        "declared `extern`",
+    );
+    // declaring one is still fine
+    assert_checks("extern fn abs(n: int) -> int;\nfn main() { print(1); }\n");
+}

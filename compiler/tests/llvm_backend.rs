@@ -1920,3 +1920,50 @@ fn main() {
 "#,
     );
 }
+
+// ---------------------------------------------------------------------------
+// Failing, and the value of a loop
+//
+// `panic` wrote its message to stdout — into the program's own output, where
+// whatever reads it takes it for data — while the interpreter reported it like
+// any other failure. And a loop that finished without `break value` was `0` on
+// one side and `()` on the other.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn panic_reports_like_every_other_failure() {
+    assert_fails_like_the_interpreter(
+        r#"
+fn main() {
+    print("before");
+    panic("boom");
+}
+"#,
+    );
+    assert_fails_like_the_interpreter(
+        r#"
+fn main() {
+    let n = 7;
+    panic("bad value: " + to_string(n));
+}
+"#,
+    );
+    assert_fails_like_the_interpreter("fn main() { panic(42); }\n");
+}
+
+#[test]
+fn a_loop_that_never_breaks_has_the_same_value_on_both() {
+    assert_agrees_with_interpreter(
+        r#"
+fn main() {
+    let v = for i in 0..3 { print(i); };
+    print(v);
+    let n = 0;
+    let w = while n < 3 { n = n + 1; };
+    print(w);
+    let found = for i in 0..10 { if i * i > 20 { break i; } };
+    print(found);
+}
+"#,
+    );
+}

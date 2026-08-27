@@ -189,7 +189,7 @@ impl<'ctx> Codegen<'ctx> {
         g.as_pointer_value()
     }
 
-    fn gen_abort(&self, message: &str, args: &[IntValue<'ctx>]) {
+    fn gen_abort(&self, message: &str, args: &[BasicMetadataValueEnum<'ctx>]) {
         let ptr_ty = self.context.ptr_type(AddressSpace::default());
         let i32_ty = self.context.i32_type();
         let snprintf = self.module.get_function("snprintf").unwrap_or_else(|| {
@@ -211,7 +211,8 @@ impl<'ctx> Codegen<'ctx> {
 
         let rendered = Diagnostic::new(message, self.current_span).render(&self.path, &self.src);
         // the source line may itself contain a percent sign
-        let text = rendered.replace('%', "%%").replace('\x01', "%ld");
+        // \x01 stands for a number the program computed, \x02 for a string.
+        let text = rendered.replace('%', "%%").replace('\x01', "%ld").replace('\x02', "%s");
         let fmt = self.builder.build_global_string_ptr(&text, "abort_fmt").unwrap().as_pointer_value();
 
         let cap = self.i64.const_int(Self::ABORT_CAP, false);
@@ -220,7 +221,7 @@ impl<'ctx> Codegen<'ctx> {
         // including inside loops, where every arithmetic check now sits.
         let buf = self.abort_buffer();
         let mut call_args: Vec<BasicMetadataValueEnum> = vec![buf.into(), cap.into(), fmt.into()];
-        for a in args { call_args.push((*a).into()); }
+        for a in args { call_args.push(*a); }
         let n = self.builder.build_call(snprintf, &call_args, "abort_len").unwrap()
             .try_as_basic_value().left().unwrap().into_int_value();
         let n64 = self.builder.build_int_s_extend(n, self.i64, "abort_len64").unwrap();
@@ -457,7 +458,7 @@ impl<'ctx> Codegen<'ctx> {
         let bad = self.builder.build_or(neg, past, "out_of_range").unwrap();
         self.builder.build_conditional_branch(bad, fail, ok).unwrap();
         self.builder.position_at_end(fail);
-        self.gen_abort(&format!("{} index \x01 is out of bounds for length \x01", what), &[idx, len]);
+        self.gen_abort(&format!("{} index \x01 is out of bounds for length \x01", what), &[idx.into(), len.into()]);
         self.builder.position_at_end(ok);
     }
 
@@ -1664,17 +1665,24 @@ impl<'ctx> Codegen<'ctx> {
                     }
                 }
                 if name == "panic" {
+                    // This wrote the bare message to stdout — into the
+                    // program's own output, where whatever reads it takes it
+                    // for data. It is a failure like any other: the message,
+                    // the position, and stderr.
+                    let ty = self.type_of(&args[0]);
                     let val = self.gen_expr(&args[0]);
-                    let str_ptr = match &val {
-                        CgValue::Str(s) => *s,
-                        _ => {
-                            let int_val = self.value_to_int(&val);
-                            self.gen_int_to_str(int_val)
+                    let str_ptr = match (&val, ty) {
+                        (CgValue::Str(s), _) => *s,
+                        (other, Some(t)) => {
+                            let raw = self.value_to_int(other);
+                            self.gen_to_str(raw, &t, 0)
+                        }
+                        (other, None) => {
+                            let raw = self.value_to_int(other);
+                            self.gen_int_to_str(raw)
                         }
                     };
-                    let fmt = self.builder.build_global_string_ptr("%s\n", "panic_fmt").unwrap().as_pointer_value();
-                    self.builder.build_call(self.printf, &[fmt.into(), str_ptr.into()], "panic_str").unwrap();
-                    self.builder.build_call(self.exit_fn(), &[self.context.i32_type().const_int(1, false).into()], "panic_exit").unwrap();
+                    self.gen_abort("\x02", &[str_ptr.into()]);
                     return CgValue::Int(self.i64.const_int(0, false));
                 }
                 if name == "array_len" {
@@ -1751,7 +1759,7 @@ impl<'ctx> Codegen<'ctx> {
                         let inverted = self.builder.build_int_compare(inkwell::IntPredicate::SGT, start, end, "inverted").unwrap();
                         self.builder.build_conditional_branch(inverted, bad, good).unwrap();
                         self.builder.position_at_end(bad);
-                        self.gen_abort("substring start \x01 is past end \x01", &[start, end]);
+                        self.gen_abort("substring start \x01 is past end \x01", &[start.into(), end.into()]);
                         self.builder.position_at_end(good);
                     }
                     let malloc_type = self.context.ptr_type(AddressSpace::default()).fn_type(&[self.i64.into()], false);

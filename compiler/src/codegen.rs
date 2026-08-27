@@ -486,7 +486,10 @@ impl Interpreter {
                 }
             }
             ExprKind::While { cond, body } => {
-                let mut result = Value::Unit;
+                // A loop that finishes without `break value` still has to
+                // answer something, and the checker says a loop is an int. The
+                // native backend answered 0 while this answered `()`.
+                let mut result = Value::Int(0);
                 loop {
                     let cv = self.eval_expr(cond);
                     let truthy = match cv { Value::Bool(b) => b, Value::Int(n) => n != 0, _ => true };
@@ -513,7 +516,10 @@ impl Interpreter {
             }
             ExprKind::For { var, iter, body } => {
                 let iter_val = self.eval_expr(iter);
-                let mut result = Value::Unit;
+                // A loop that finishes without `break value` still has to
+                // answer something, and the checker says a loop is an int. The
+                // native backend answered 0 while this answered `()`.
+                let mut result = Value::Int(0);
                 match iter_val {
                     Value::Range(start, end) => {
                         'outer: for i in start..end {

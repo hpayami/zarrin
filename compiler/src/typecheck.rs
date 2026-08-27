@@ -20,6 +20,7 @@ pub enum TypeError {
     AmbiguousVariant { name: String, candidates: Vec<String> },
     NonExhaustiveMatch { ty: String, missing: Vec<String> },
     UnresolvedTypeParam { func: String, param: String },
+    ExternNotCallable(String),
     /// Raised inside a nested statement, which already knows where it is.
     Located(Box<Diagnostic>),
 }
@@ -35,6 +36,11 @@ impl std::fmt::Display for TypeError {
         match self {
             TypeError::UndefinedVariable(n) => write!(f, "undefined variable: `{}`", n),
             TypeError::UndefinedFunction(n) => write!(f, "undefined function: `{}`", n),
+            TypeError::ExternNotCallable(n) => write!(
+                f,
+                "`{}` is declared `extern`, and no backend can call one yet",
+                n
+            ),
             TypeError::UndefinedType(n) => write!(f, "undefined type: `{}`", n),
             TypeError::UndefinedTrait(n) => write!(f, "undefined trait: `{}`", n),
             TypeError::TypeMismatch { expected, found } => write!(f, "type mismatch: expected `{}`, found `{}`", expected, found),
@@ -528,6 +534,12 @@ impl TypeChecker {
                         return Err(TypeError::AmbiguousVariant { name: func_name.clone(), candidates })
                     }
                     Lookup::Unknown => {}
+                }
+                // Neither backend implements one: the interpreter said so when
+                // the call was reached, and the native one when it was
+                // compiled, so the same program failed at different moments.
+                if !env.functions.contains_key(func_name) && env.extern_fns.contains_key(func_name) {
+                    return Err(TypeError::ExternNotCallable(func_name.clone()));
                 }
                 if let Some((param_tys, ret_ty)) = env.functions.get(func_name).cloned().or_else(|| env.extern_fns.get(func_name).cloned()) {
                     if param_tys.len() != args.len() { return Err(TypeError::WrongArity { name: func_name.clone(), expected: param_tys.len(), found: args.len() }); }
