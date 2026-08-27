@@ -27,6 +27,10 @@ A `match` must cover its scrutinee: every variant of an enum, both booleans, or
 a `_` arm. An arm carrying a guard covers nothing, since the guard can turn it
 down.
 
+A struct literal names its fields, and may list them in any order. Leaving one
+out, giving one twice, or naming one the struct does not have is a type error
+that says which field it means.
+
 `print` and `to_string` render a value the way it is written: an array as
 `[1, 2, 3]`, a struct as `Point { x: 1, y: 2 }` with its fields in declaration
 order, an enum as its variant name and payload.

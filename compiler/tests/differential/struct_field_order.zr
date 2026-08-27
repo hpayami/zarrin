@@ -1,0 +1,13 @@
+// A struct literal may list its fields in any order. The checker used to line
+// them up with the declaration by position, so this was a type error even
+// though every field is right, and the native backend stored them by position
+// too, so where the types happened to match it swapped them instead.
+struct P { x: int, y: float, tag: string }
+fn main() {
+    let q = P { tag: "u", y: 0.5, x: 9 };
+    print(q);
+    print(q.x);
+    print(q.tag);
+    let r = P { x: 1, y: 2.0, tag: "t" };
+    print(r);
+}

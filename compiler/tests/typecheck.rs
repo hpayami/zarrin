@@ -326,3 +326,54 @@ fn an_extern_function_cannot_be_called_yet() {
     // declaring one is still fine
     assert_checks("extern fn abs(n: int) -> int;\nfn main() { print(1); }\n");
 }
+
+// ---------------------------------------------------------------------------
+// Struct literal fields
+//
+// The checker lined a literal's fields up with the declaration by position, so
+// `P { y: 2, x: 1 }` was checked against `x`'s type for `y`: a type error on a
+// literal with every field right, and where the types happened to match, a
+// value whose fields were swapped.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_struct_literal_may_list_its_fields_in_any_order() {
+    assert_checks(
+        "struct P { x: int, y: float, tag: string }\n\
+         fn main() { print(P { tag: \"u\", y: 0.5, x: 9 }); }\n",
+    );
+}
+
+#[test]
+fn a_missing_field_says_which_one() {
+    assert_check_error(
+        "struct P { x: int, y: int }\nfn main() { print(P { x: 1 }); }\n",
+        "`P` is missing field `y`",
+    );
+}
+
+#[test]
+fn a_field_the_struct_does_not_have_says_so() {
+    assert_check_error(
+        "struct P { x: int, y: int }\nfn main() { print(P { x: 1, y: 2, z: 3 }); }\n",
+        "type `P` has no field `z`",
+    );
+}
+
+#[test]
+fn the_same_field_twice_is_an_error() {
+    assert_check_error(
+        "struct P { x: int, y: int }\nfn main() { print(P { x: 1, x: 2 }); }\n",
+        "field `x` of `P` is given twice",
+    );
+}
+
+#[test]
+fn a_field_of_the_wrong_type_is_named_by_its_own_type() {
+    // A real mismatch is still a mismatch, and it is now the field's own type
+    // being reported rather than whichever one sat in that position.
+    assert_check_error(
+        "struct P { x: int, y: string }\nfn main() { print(P { y: 1, x: 2 }); }\n",
+        "expected `string`, found `int`",
+    );
+}

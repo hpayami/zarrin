@@ -11,7 +11,7 @@ non-ASCII strings, loops that break out of the middle. Every case here found
 something once.
 
 A case does not have to succeed, and it does not have to be accepted: a program
-both backends refuse in the same words is a program they agree on. The five
+both backends refuse in the same words is a program they agree on. The
 `rejected_*` cases are exactly that — each one is a bug both backends share,
 kept here so that whichever way it is settled, they settle it together.
 

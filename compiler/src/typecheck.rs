@@ -16,6 +16,8 @@ pub enum TypeError {
     NotAFunction(String),
     WrongArity { name: String, expected: usize, found: usize },
     UnknownField { ty: String, field: String },
+    MissingField { ty: String, field: String },
+    DuplicateField { ty: String, field: String },
     MissingImpl { trait_name: String, type_name: String, method: String },
     AmbiguousVariant { name: String, candidates: Vec<String> },
     NonExhaustiveMatch { ty: String, missing: Vec<String> },
@@ -47,6 +49,8 @@ impl std::fmt::Display for TypeError {
             TypeError::NotAFunction(n) => write!(f, "`{}` is not a function", n),
             TypeError::WrongArity { name, expected, found } => write!(f, "`{}` expects {} args, found {}", name, expected, found),
             TypeError::UnknownField { ty, field } => write!(f, "type `{}` has no field `{}`", ty, field),
+            TypeError::MissingField { ty, field } => write!(f, "`{}` is missing field `{}`", ty, field),
+            TypeError::DuplicateField { ty, field } => write!(f, "field `{}` of `{}` is given twice", field, ty),
             TypeError::MissingImpl { trait_name, type_name, method } => write!(f, "trait `{}` for `{}` missing method `{}`", trait_name, type_name, method),
             TypeError::Located(d) => write!(f, "{}", d.message),
             TypeError::UnresolvedTypeParam { func, param } => write!(
@@ -619,10 +623,24 @@ impl TypeChecker {
             ExprKind::StructLit { name, fields } => {
                 let sdef = env.structs.get(name).cloned()
                     .ok_or_else(|| TypeError::UndefinedType(name.clone()))?;
-                if sdef.len() != fields.len() { return Err(TypeError::WrongArity { name: name.clone(), expected: sdef.len(), found: fields.len() }); }
-                for ((_, fty), (_, expr)) in sdef.iter().zip(fields.iter()) {
+                // By name. Lining the literal's fields up with the declaration
+                // in order meant `P { y: 2, x: 1 }` was checked against `x`'s
+                // type for `y` — a type error on a literal with every field
+                // right, and a swap when the types happened to match.
+                let mut seen: Vec<&str> = Vec::new();
+                for (fname, expr) in fields.iter() {
+                    let Some((_, fty)) = sdef.iter().find(|(n, _)| n == fname) else {
+                        return Err(TypeError::UnknownField { ty: name.clone(), field: fname.clone() });
+                    };
+                    if seen.contains(&fname.as_str()) {
+                        return Err(TypeError::DuplicateField { ty: name.clone(), field: fname.clone() });
+                    }
+                    seen.push(fname);
                     let expr_ty = Self::check_expr(expr, env)?;
                     if !compatible(fty, &expr_ty) { return Err(Self::mismatch_at(fty, &expr_ty, expr)); }
+                }
+                if let Some((missing, _)) = sdef.iter().find(|(n, _)| !seen.contains(&n.as_str())) {
+                    return Err(TypeError::MissingField { ty: name.clone(), field: missing.clone() });
                 }
                 Ok(Type::Named(name.clone(), Vec::new()))
             }
