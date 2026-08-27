@@ -592,3 +592,47 @@ fn main() {
 "#,
     );
 }
+
+// --- a match that matches nothing -------------------------------------------
+//
+// The final arm was treated as always matching, whatever its pattern. Its body
+// ran for values nothing covered, so an unmatched value produced a plausible
+// wrong answer instead of the interpreter's error.
+
+#[test]
+fn an_unmatched_enum_value_stops_the_program() {
+    assert_fails_like_the_interpreter(
+        "enum C { R, G, B }\nfn f(c: C) -> int { return match c { R => 1 }; }\nfn main() { print(f(R)); print(f(G)); }\n",
+    );
+}
+
+#[test]
+fn an_unmatched_literal_stops_the_program() {
+    // This answered 20 for f(99): the last arm ran regardless of its pattern.
+    assert_fails_like_the_interpreter(
+        "fn f(n: int) -> int { return match n { 0 => 10, 1 => 20 }; }\nfn main() { print(f(0)); print(f(99)); }\n",
+    );
+}
+
+#[test]
+fn a_match_covering_every_variant_needs_no_wildcard() {
+    assert_agrees_with_interpreter(
+        r#"
+enum S { C(int), R(int, int) }
+fn area(s: S) -> int { return match s { C(r) => r * r, R(w, h) => w * h }; }
+fn main() { print(area(C(5))); print(area(R(3, 4))); }
+"#,
+    );
+}
+
+#[test]
+fn a_wildcard_last_arm_still_catches_everything() {
+    assert_agrees_with_interpreter(
+        r#"
+enum C { R, G, B }
+fn f(c: C) -> int { return match c { R => 1, _ => 9 }; }
+fn g(n: int) -> int { return match n { 0 => 10, x => x * 2 }; }
+fn main() { print(f(R)); print(f(B)); print(g(0)); print(g(21)); }
+"#,
+    );
+}

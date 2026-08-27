@@ -1104,14 +1104,16 @@ Expr::Match { scrutinee, arms } => {
                     self.builder.position_at_end(current_check);
                     let arm_bb = self.context.append_basic_block(parent, &format!("arm_{}", i));
                     let is_wildcard = patterns.iter().any(|p| matches!(p, Pattern::Wildcard | Pattern::Variable(_)));
-                    // An irrefutable pattern is not the end of the road when it
-                    // carries a guard: the arm can still fail and control has to
-                    // reach the next one.
-                    let is_last = (is_wildcard && guard.is_none()) || i == arms.len() - 1;
+                    // Only a wildcard or a plain binding always matches, and
+                    // only when no guard can reject it. Being the last arm does
+                    // not make a pattern irrefutable: treating it that way ran
+                    // the final body for values nothing matched, so
+                    // `match n { 0 => 10, 1 => 20 }` answered 20 for 99.
+                    let irrefutable = is_wildcard && guard.is_none();
                     // One block for every way this arm can fail. The pattern test
                     // and the guard each used to append their own, leaving one of
                     // them branched to but never terminated.
-                    let next_check = if is_last {
+                    let next_check = if irrefutable {
                         None
                     } else {
                         Some(self.context.append_basic_block(parent, &format!("match_check_{}", i + 1)))
@@ -1227,11 +1229,11 @@ Expr::Match { scrutinee, arms } => {
                     }
                 }
                 if current_check.get_terminator().is_none() {
+                    // No arm matched. There is no exhaustiveness check yet, so
+                    // this is only detectable here; the interpreter stops with
+                    // the same message.
                     self.builder.position_at_end(current_check);
-                    // Nothing matched. There is no exhaustiveness check yet, so
-                    // this edge still has to give the phi a value.
-                    arm_values.push((self.i64.const_int(0, false), current_check));
-                    self.builder.build_unconditional_branch(merge).unwrap();
+                    self.gen_abort("no matching pattern", &[]);
                 }
                 self.builder.position_at_end(merge);
                 let phi = self.builder.build_phi(self.i64, "match_result").unwrap();
