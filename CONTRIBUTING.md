@@ -72,6 +72,12 @@ against a `TypeEnv` the backend keeps in step with the locals in scope. Do not
 add a rule that infers a type from the shape of an expression — that is what
 the checker is for, and the two drifted apart every time it was tried.
 
+Every value carries the 16-byte header, wherever it lives. A frame allocation
+gets one too, with the immortal count, so retain and release are no-ops on it.
+The header is not optional: a function compiled once cannot know whether its
+caller built the argument on the frame or on the heap, and one that retains a
+parameter reads the count 16 bytes before the pointer either way.
+
 A method is registered under its type and its name, `method_key`, not its name
 alone — two `impl` blocks may declare the same method and only the type tells
 them apart. The call site works out which by asking the checker what the

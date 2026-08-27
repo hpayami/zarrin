@@ -278,7 +278,7 @@ impl<'ctx> Codegen<'ctx> {
 
     fn scratch_bytes(&self, bytes: IntValue<'ctx>, name: &str) -> PointerValue<'ctx> {
         if self.transient {
-            self.builder.build_array_alloca(self.i8, bytes, name).unwrap()
+            self.frame_bytes(bytes, name)
         } else {
             self.heap_bytes(bytes, name)
         }
@@ -286,9 +286,35 @@ impl<'ctx> Codegen<'ctx> {
 
     fn scratch_slots(&self, slots: u64, name: &str) -> PointerValue<'ctx> {
         if self.transient {
-            self.builder.build_alloca(self.i64.array_type(slots as u32), name).unwrap()
+            self.frame_bytes(self.i64.const_int(slots * 8, false), name)
         } else {
             self.heap_slots(slots, name)
+        }
+    }
+
+    /// Room on the frame, laid out like a heap value: the same 16-byte header,
+    /// with a count that never moves.
+    ///
+    /// Without the header a value built on the frame and handed to a function
+    /// that retains it — anything that returns its own parameter — had its
+    /// count read and written 16 bytes *before* an `alloca`, which is the
+    /// caller's stack. Sometimes nothing came of it; sometimes SIGBUS.
+    fn frame_bytes(&self, bytes: IntValue<'ctx>, name: &str) -> PointerValue<'ctx> {
+        let total = self.builder
+            .build_int_add(bytes, self.i64.const_int(Self::HEADER, false), "frame_size")
+            .unwrap();
+        let base = self.builder.build_array_alloca(self.i8, total, name).unwrap();
+        // The header is read as an i64, so the block has to be aligned for one.
+        if let Some(i) = base.as_instruction() {
+            let _ = i.set_alignment(8);
+        }
+        self.builder
+            .build_store(base, self.i64.const_int(Self::IMMORTAL, false))
+            .unwrap();
+        unsafe {
+            self.builder
+                .build_in_bounds_gep(self.i8, base, &[self.i64.const_int(Self::HEADER, false)], name)
+                .unwrap()
         }
     }
 

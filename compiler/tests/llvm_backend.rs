@@ -1643,3 +1643,46 @@ fn main() {
 "#,
     );
 }
+
+// ---------------------------------------------------------------------------
+// The header on a frame value
+//
+// A value built inside a consumed expression goes on the frame, and had no
+// reference-count header. A function that retains what it is given — anything
+// that returns its own parameter — then read and wrote a count 16 bytes before
+// an `alloca`, which is the caller's stack. Sometimes nothing came of it;
+// `print(id([1, 2])); print(id(Some(1.5)));` faulted with SIGBUS.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_frame_value_survives_a_function_that_retains_it() {
+    assert_agrees_with_interpreter(
+        r#"
+fn id<T>(x: T) -> T { return x; }
+fn main() {
+    print(id([1, 2]));
+    print(id(Some(1.5)));
+    print(id("s"));
+    print(id(1..3));
+}
+"#,
+    );
+}
+
+#[test]
+fn a_returned_parameter_is_the_same_value_going_in() {
+    assert_agrees_with_interpreter(
+        r#"
+struct P { x: int, y: int }
+fn keep(s: string) -> string { return s; }
+fn hold(o: Option<float>) -> Option<float> { return o; }
+fn same(p: P) -> P { return p; }
+fn main() {
+    print(keep("a" + "b"));
+    print(hold(Some(2.5)));
+    print(same(P { x: 1, y: 2 }));
+    print(keep(keep(keep("through three"))));
+}
+"#,
+    );
+}
